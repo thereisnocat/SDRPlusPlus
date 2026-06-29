@@ -164,6 +164,7 @@ private:
         err = fobos_rx_get_samplerates(dev, srList, &srCount);
         if (err) {
             flog::error("Failed to get samplerate list: {}", err);
+            fobos_rx_close(dev);
             return;
         }
 
