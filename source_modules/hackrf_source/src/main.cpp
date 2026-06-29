@@ -83,7 +83,16 @@ public:
     HackRFSourceModule(std::string name) {
         this->name = name;
 
-        hackrf_init();
+        int initErr = hackrf_init();
+        if (initErr != HACKRF_SUCCESS) {
+            // This can happen when another module (e.g. FobosSDR) has already
+            // initialized and torn down a libusb context, leaving the macOS
+            // IOKit backend in a state where re-initialization fails. Proceeding
+            // to refresh() with a NULL libusb context would crash the process.
+            flog::error("HackRFSourceModule '{}': hackrf_init failed ({}). No HackRF devices will be available. Try loading hackrf_source before other SDR modules.", name, hackrf_error_name((hackrf_error)initErr));
+            sigpath::sourceManager.registerSource("HackRF", &handler);
+            return;
+        }
 
         // Select the last samplerate option
         sampleRate = 2000000;
