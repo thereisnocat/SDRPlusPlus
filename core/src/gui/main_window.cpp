@@ -2,6 +2,7 @@
 #include <gui/gui.h>
 #include "imgui.h"
 #include <stdio.h>
+#include <ctime>
 #include <thread>
 #include <complex>
 #include <gui/widgets/waterfall.h>
@@ -543,11 +544,85 @@ void MainWindow::draw() {
     ImGui::NextColumn();
     ImGui::PopStyleVar();
 
-    ImGui::BeginChild("Waterfall");
+    const float pbBarH = 12.0f * style::uiScale;
+    const float pbPad = 4.0f * style::uiScale;
+    bool hasRecTime = gui::playbackBar.active && (gui::playbackBar.recordingStartEpoch != 0);
+    float numTextLines = hasRecTime ? 2.0f : 1.0f;
+    const float pbTotalH = (hasRecTime ? 4.0f : 3.0f) * pbPad + pbBarH + numTextLines * ImGui::GetTextLineHeight();
+    float pbReserve = gui::playbackBar.active ? pbTotalH : 0.0f;
+
+    ImGui::BeginChild("Waterfall", ImVec2(0, ImGui::GetContentRegionAvail().y - pbReserve));
 
     gui::waterfall.draw();
 
     ImGui::EndChild();
+
+    if (gui::playbackBar.active) {
+        float barWidth = ImGui::GetContentRegionAvail().x;
+
+        ImGui::Dummy(ImVec2(barWidth, pbPad));
+
+        ImGui::InvisibleButton("##playback_seek", ImVec2(barWidth, pbBarH));
+        ImVec2 barTL = ImGui::GetItemRectMin();
+        ImVec2 barBR = ImGui::GetItemRectMax();
+
+        if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float frac = (ImGui::GetMousePos().x - barTL.x) / (barBR.x - barTL.x);
+            frac = std::clamp(frac, 0.0f, 1.0f);
+            if (gui::playbackBar.seekCallback) {
+                gui::playbackBar.seekCallback(frac, gui::playbackBar.seekCtx);
+            }
+        }
+
+        float progress = std::clamp(gui::playbackBar.progress, 0.0f, 1.0f);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        dl->AddRectFilled(barTL, barBR, ImGui::GetColorU32(ImGuiCol_FrameBg), 2.0f * style::uiScale);
+        ImVec2 fillBR(barTL.x + (barBR.x - barTL.x) * progress, barBR.y);
+        if (fillBR.x > barTL.x) {
+            dl->AddRectFilled(barTL, fillBR, ImGui::GetColorU32(ImGuiCol_PlotHistogram), 2.0f * style::uiScale);
+        }
+
+        auto fmtTime = [](float sec) -> std::string {
+            int s = (int)sec; int m = s / 60; s %= 60; int h = m / 60; m %= 60;
+            char buf[32];
+            if (h > 0) { snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s); }
+            else { snprintf(buf, sizeof(buf), "%d:%02d", m, s); }
+            return buf;
+        };
+
+        float textY = barBR.y + pbPad;
+
+        if (hasRecTime) {
+            // Line 1: recording start date and time (fixed label)
+            const std::string& startStr = gui::playbackBar.recordingStartStr;
+            ImVec2 startSz = ImGui::CalcTextSize(startStr.c_str());
+            dl->AddText(ImVec2(barTL.x + ((barBR.x - barTL.x) - startSz.x) * 0.5f, textY),
+                        ImGui::GetColorU32(ImGuiCol_Text), startStr.c_str());
+            textY += ImGui::GetTextLineHeight() + pbPad;
+
+            // Line 2: absolute current time / absolute end time (local clock)
+            auto fmtAbsTime = [](int64_t epochSec) -> std::string {
+                time_t t = (time_t)epochSec;
+                tm* ltm = localtime(&t);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ltm->tm_hour, ltm->tm_min, ltm->tm_sec);
+                return buf;
+            };
+            int64_t curAbs = gui::playbackBar.recordingStartEpoch + (int64_t)gui::playbackBar.currentTimeSec;
+            int64_t endAbs = gui::playbackBar.recordingStartEpoch + (int64_t)gui::playbackBar.totalTimeSec;
+            std::string timeStr = fmtAbsTime(curAbs) + " / " + fmtAbsTime(endAbs);
+            ImVec2 textSz = ImGui::CalcTextSize(timeStr.c_str());
+            dl->AddText(ImVec2(barTL.x + ((barBR.x - barTL.x) - textSz.x) * 0.5f, textY),
+                        ImGui::GetColorU32(ImGuiCol_Text), timeStr.c_str());
+        }
+        else {
+            std::string timeStr = fmtTime(gui::playbackBar.currentTimeSec) + " / " + fmtTime(gui::playbackBar.totalTimeSec);
+            ImVec2 textSz = ImGui::CalcTextSize(timeStr.c_str());
+            dl->AddText(ImVec2(barTL.x + ((barBR.x - barTL.x) - textSz.x) * 0.5f, textY),
+                        ImGui::GetColorU32(ImGuiCol_Text), timeStr.c_str());
+        }
+    }
 
     if (!lockWaterfallControls) {
         // Handle arrow keys

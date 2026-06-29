@@ -1,37 +1,75 @@
 #pragma once
 
-#pragma once
 #include <stdint.h>
 #include <string.h>
+#include <algorithm>
 #include <fstream>
-
-#define WAV_SIGNATURE       "RIFF"
-#define WAV_TYPE            "WAVE"
-#define WAV_FORMAT_MARK     "fmt "
-#define WAV_DATA_MARK       "data"
-#define WAV_SAMPLE_TYPE_PCM 1
 
 class WavReader {
 public:
     WavReader(std::string path) {
         file = std::ifstream(path.c_str(), std::ios::binary);
-        file.read((char*)&hdr, sizeof(WavHeader_t));
         valid = false;
-        if (memcmp(hdr.signature, "RIFF", 4) != 0) { return; }
-        if (memcmp(hdr.fileType, "WAVE", 4) != 0) { return; }
-        valid = true;
+
+        // Validate RIFF/WAVE header
+        char riffSig[4], waveType[4];
+        uint32_t riffSize;
+        file.read(riffSig, 4);
+        file.read((char*)&riffSize, 4);
+        file.read(waveType, 4);
+        if (memcmp(riffSig, "RIFF", 4) != 0) { return; }
+        if (memcmp(waveType, "WAVE", 4) != 0) { return; }
+
+        // Scan chunks to find "fmt " and "data"
+        bool foundFmt = false, foundData = false;
+        while (!file.eof()) {
+            char chunkId[4];
+            uint32_t chunkSize;
+            file.read(chunkId, 4);
+            if (file.gcount() < 4) { break; }
+            file.read((char*)&chunkSize, 4);
+            if (file.gcount() < 4) { break; }
+            std::streampos chunkDataPos = file.tellg();
+
+            if (memcmp(chunkId, "fmt ", 4) == 0 && !foundFmt) {
+                if (chunkSize >= sizeof(FormatHeader)) {
+                    file.read((char*)&fmt, sizeof(FormatHeader));
+                    foundFmt = true;
+                }
+            }
+            else if (memcmp(chunkId, "data", 4) == 0) {
+                _dataOffset = static_cast<size_t>(chunkDataPos);
+                // Use actual file size to handle >4GB files where the 32-bit
+                // chunkSize has wrapped around due to overflow in the writer
+                std::streampos savedPos = file.tellg();
+                file.seekg(0, std::ios::end);
+                uint64_t fileSize = static_cast<uint64_t>(file.tellg());
+                file.seekg(savedPos);
+                uint64_t actualSize = fileSize - _dataOffset;
+                _dataSize = (actualSize > static_cast<uint64_t>(chunkSize)) ? actualSize : static_cast<uint64_t>(chunkSize);
+                foundData = true;
+                file.seekg(static_cast<std::streamoff>(_dataOffset));
+                break;
+            }
+
+            // Advance past this chunk; RIFF aligns chunks to 2-byte boundaries
+            uint32_t advance = chunkSize + (chunkSize & 1u);
+            file.seekg(static_cast<std::streamoff>(static_cast<size_t>(chunkDataPos) + advance));
+        }
+
+        valid = foundFmt && foundData;
     }
 
     uint16_t getBitDepth() {
-        return hdr.bitDepth;
+        return fmt.bitDepth;
     }
 
     uint16_t getChannelCount() {
-        return hdr.channelCount;
+        return fmt.channelCount;
     }
 
     uint32_t getSampleRate() {
-        return hdr.sampleRate;
+        return fmt.sampleRate;
     }
 
     bool isValid() {
@@ -42,16 +80,40 @@ public:
         char* _data = (char*)data;
         file.read(_data, size);
         int read = file.gcount();
-        if (read < size) {
+        if (read < (int)size) {
             file.clear();
-            file.seekg(sizeof(WavHeader_t));
+            file.seekg(static_cast<std::streamoff>(_dataOffset));
             file.read(&_data[read], size - read);
         }
         bytesRead += size;
     }
 
+    uint64_t getDataSize() {
+        return _dataSize;
+    }
+
+    size_t getCurrentByteOffset() {
+        std::streampos pos = file.tellg();
+        size_t posVal = static_cast<size_t>(pos);
+        if (posVal < _dataOffset) { return 0; }
+        return posVal - _dataOffset;
+    }
+
+    uint32_t getBytesPerSecond() {
+        return std::max(fmt.bytesPerSecond, (uint32_t)1);
+    }
+
+    void seekToFraction(float fraction) {
+        fraction = std::max(0.0f, std::min(1.0f, fraction));
+        uint64_t targetByte = static_cast<uint64_t>(static_cast<double>(fraction) * static_cast<double>(_dataSize));
+        if (fmt.bytesPerSample > 0) {
+            targetByte -= targetByte % fmt.bytesPerSample;
+        }
+        file.seekg(static_cast<std::streamoff>(_dataOffset + targetByte));
+    }
+
     void rewind() {
-        file.seekg(sizeof(WavHeader_t));
+        file.seekg(static_cast<std::streamoff>(_dataOffset));
     }
 
     void close() {
@@ -59,24 +121,21 @@ public:
     }
 
 private:
-    struct WavHeader_t {
-        char signature[4];           // "RIFF"
-        uint32_t fileSize;           // data bytes + sizeof(WavHeader_t) - 8
-        char fileType[4];            // "WAVE"
-        char formatMarker[4];        // "fmt "
-        uint32_t formatHeaderLength; // Always 16
-        uint16_t sampleType;         // PCM (1)
+#pragma pack(push, 1)
+    struct FormatHeader {
+        uint16_t codec;
         uint16_t channelCount;
         uint32_t sampleRate;
         uint32_t bytesPerSecond;
         uint16_t bytesPerSample;
         uint16_t bitDepth;
-        char dataMarker[4]; // "data"
-        uint32_t dataSize;
     };
+#pragma pack(pop)
 
     bool valid = false;
     std::ifstream file;
     size_t bytesRead = 0;
-    WavHeader_t hdr;
+    FormatHeader fmt = {};
+    size_t _dataOffset = 0;
+    uint64_t _dataSize = 0;
 };
