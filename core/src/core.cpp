@@ -220,6 +220,7 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["Radio"] = "radio";
 
     defConfig["moduleInstances"]["Frequency Manager"] = "frequency_manager";
+    defConfig["moduleInstances"]["Phasing"] = "phasing";
     defConfig["moduleInstances"]["Recorder"] = "recorder";
     defConfig["moduleInstances"]["Rigctl Server"] = "rigctl_server";
     // defConfig["moduleInstances"]["Rigctl Client"] = "rigctl_client";

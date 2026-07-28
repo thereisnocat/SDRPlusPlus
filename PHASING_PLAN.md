@@ -205,6 +205,17 @@ Optional but high-value: a 2-D gain/phase pad (drag a dot, x = phase, y = gain) 
 null-depth value shaded behind it. This is how the Perseus22 and RSR200 present it, and
 it finds a null far faster than two independent sliders.
 
+**Two refinements from building it (Phase 3):**
+
+- *Mode and Monitor are one control.* The list above has both, but there is a single
+  output stream, so choosing what the combiner does and choosing what you hear are the
+  same choice. Two controls would imply an independence that does not exist. They are one
+  "Output" combo.
+- *Sliders cannot land on an exact figure.* Dragging to "137 degrees" gives 136.98 or
+  137.02, and a phasing null is sharp enough that the difference shows in the meter. The
+  coarse and fine sliders are for hunting; a pair of numeric fields underneath are
+  authoritative and step by 0.01. Both are needed -- neither alone is usable.
+
 **Explicitly out of scope: headless/server mode.** misc_module ImGui menus are not
 serialized over the SDR++ server protocol — only source menus, via `SmGui`. Putting the
 controls in a misc module therefore means `sdrpp_server` users get no phasing UI. That
@@ -506,7 +517,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **0** | Synthetic source | No | **Done** — `source_modules/phasing_test_source/`. Two-channel signal generator: wanted tone + interferer at a settable inter-channel gain/phase, fractional channel-B delay, independent per-channel noise, A/B swap, and a built-in scalar test combiner so the module is self-verifying before the real phaser exists. Signal maths lives in `src/signal_model.h` (no SDR++ dependency) and is covered by `test/test_signal_model.cpp`; the worker/stream lifecycle is covered by `test/test_worker.cpp`. |
 | **1** | Core plumbing | No | **Done** — `ChannelSet` registry in `SourceManager`, the `Phasing` front end (`core/src/signal_path/phasing.*`) owning a splitter per channel plus `bindChannelStream`, `dsp::combine::Phaser` (scalar, manual, own accumulation buffers), `selectSource()` wiring, bypassed by default via `MODE_A_ONLY`. Covered by `core/test/test_phaser.cpp` and `core/test/test_phasing.cpp`. The Phase 0 source gained a "Dual channel" mode that registers a `ChannelSet`. Confirmed live: with the source in dual channel mode the waterfall is indistinguishable from plain channel A, with no gaps or audible stutter. |
 | **2** | Dual-channel I/O | No | **Done** — `wav::Writer` gained `addChunk()`; `core/src/utils/wav_meta.h` writes a verified `auxi` plus our `sdpc` chunk; the recorder has a "Record both channels" option writing I1 Q1 I2 Q2 with a MB/min estimate; `file_source` detects a 4-channel file and registers a `ChannelSet` so the phasing path lights up on playback. The two-input synchronisation the recorder needed was extracted from `Phaser` into `dsp::combine::ChannelSync` and is now shared. Covered by `core/test/test_wav_meta.cpp`; run everything with `core/test/run_tests.sh`. Confirmed live: a 19-second capture of the synthetic source wrote 4 channels at 1 Msps with `auxi` (centre 9917072 Hz) and `sdpc` (names 'A'/'B', both coherence flags) intact, and played back through the phasing path as two clean tones at the original offsets. |
-| **3** | UI module | No | `misc_modules/phasing/`, manual gain/phase/swap/delay, null-depth meter, monitor select, config persistence. **First user-visible release.** Fully exercisable against synthetic material. |
+| **3** | UI module | No | **Done** — `misc_modules/phasing/`: output select, coarse+fine gain and phase with exact numeric entry, swap, delay, null-depth meter with peak hold, per-frequency memories, settings keyed per source. `Phaser` gained a fractional-sample delay line. Confirmed live against the synthetic source. |
 | **4** | Auto-null | No | Block Wiener, adaptation rate, Freeze, reference-band selector. Convergence is measurable against a known synthetic weight — better ground truth than any on-air test. |
 | **5** | Wideband | No | Multi-tap frequency-domain weight; retires the fractional-delay control. Validated against the synthetic source's delay/frequency-tilt settings. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
