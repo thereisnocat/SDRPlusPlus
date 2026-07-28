@@ -178,6 +178,8 @@ void Phasing::setMode(dsp::combine::Phaser::Mode mode) { phaser.setMode(mode); }
 dsp::combine::Phaser::Mode Phasing::getMode() { return phaser.getMode(); }
 void Phasing::setWeight(float gainDb, float phaseDeg) { phaser.setWeight(gainDb, phaseDeg); }
 void Phasing::getWeight(float& gainDb, float& phaseDeg) { phaser.getWeight(gainDb, phaseDeg); }
+void Phasing::setDelay(float samples) { phaser.setDelay(samples); }
+float Phasing::getDelay() { return phaser.getDelay(); }
 dsp::combine::Phaser::Metrics Phasing::getMetrics() { return phaser.getMetrics(); }
 float Phasing::getNullDepth() { return phaser.getNullDepth(); }
 uint64_t Phasing::getDiscardCount() { return phaser.getDiscardCount(); }

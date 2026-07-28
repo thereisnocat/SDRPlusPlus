@@ -38,6 +38,10 @@ public:
     void unregisterChannels(const std::string& name);
     ChannelSet* getChannels(const std::string& name);
 
+    // Name of the currently selected source, empty if none. Lets a module key its
+    // settings per radio rather than sharing one set across all of them.
+    const std::string& getSelectedName() const { return selectedName; }
+
     void selectSource(std::string name);
     void showSelectedMenu();
     void start();

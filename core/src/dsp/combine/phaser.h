@@ -6,8 +6,96 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <vector>
+#include <algorithm>
 
 namespace dsp::combine {
+
+    // Fractional-sample delay line, used to line the two channels up when their feedlines
+    // differ in length. A scalar phasing weight cannot correct a timing offset: it shows
+    // up as a phase slope across the band, so the null only works at one spot in the
+    // passband. The multi-tap weight of a later phase subsumes this entirely.
+    //
+    // Interpolation is 4-point cubic (Catmull-Rom), which is ample for the sub-sample
+    // trims this is for. At 1 Msps one sample is roughly 200 m of coax, so in practice the
+    // useful range is well under a sample and the integer part rarely matters.
+    class DelayLine {
+    public:
+        static const int HISTORY = 64;
+
+        void init() {
+            hist.assign(HISTORY, complex_t{ 0.0f, 0.0f });
+        }
+
+        void reset() {
+            std::fill(hist.begin(), hist.end(), complex_t{ 0.0f, 0.0f });
+        }
+
+        // out[n] = in[n - delay], with the delay gliding from delayStart to delayEnd
+        // across the block. Ramping matters: a step change in delay is a step change in
+        // time, which breaks up audibly while a control is being dragged. Both must be in
+        // [2, HISTORY-3] so the interpolator has samples either side to work with.
+        void process(const complex_t* in, complex_t* out, int count, float delayStart, float delayEnd) {
+            if (count <= 0) { return; }
+            if ((int)scratch.size() < HISTORY + count) { scratch.resize(HISTORY + count); }
+
+            memcpy(scratch.data(), hist.data(), HISTORY * sizeof(complex_t));
+            memcpy(scratch.data() + HISTORY, in, count * sizeof(complex_t));
+
+            const float lo = 2.0f, hi = (float)(HISTORY - 3);
+            const float d0 = std::min(std::max(delayStart, lo), hi);
+            const float d1 = std::min(std::max(delayEnd, lo), hi);
+            const float step = (d1 - d0) / (float)count;
+
+            if (d0 == d1 && d0 == std::floor(d0)) {
+                // Whole-sample delay that is not moving: a straight copy.
+                memcpy(out, scratch.data() + HISTORY - (int)d0, count * sizeof(complex_t));
+            }
+            else {
+                for (int n = 0; n < count; n++) {
+                    const float d = d0 + step * (float)n;
+
+                    // Work in absolute position rather than splitting the delay itself.
+                    // Splitting d into floor/fraction and then interpolating *forward* by
+                    // that fraction lands at n - di + f, whose effective delay is di - f,
+                    // not di + f: the fractional part pulls the wrong way, and every time
+                    // d crosses an integer the position jumps by nearly two samples.
+                    const float pos = (float)n - d;
+                    const int i = (int)std::floor(pos);
+                    const float f = pos - (float)i;
+
+                    // Catmull-Rom through x0..x3, evaluated at f between x1 and x2.
+                    const complex_t* p = scratch.data() + HISTORY + i;
+                    const complex_t x0 = p[-1], x1 = p[0], x2 = p[1], x3 = p[2];
+
+                    const float a0r = x1.re;
+                    const float a1r = 0.5f * (x2.re - x0.re);
+                    const float a2r = x0.re - 2.5f * x1.re + 2.0f * x2.re - 0.5f * x3.re;
+                    const float a3r = 0.5f * (x3.re - x0.re) + 1.5f * (x1.re - x2.re);
+                    out[n].re = ((a3r * f + a2r) * f + a1r) * f + a0r;
+
+                    const float a0i = x1.im;
+                    const float a1i = 0.5f * (x2.im - x0.im);
+                    const float a2i = x0.im - 2.5f * x1.im + 2.0f * x2.im - 0.5f * x3.im;
+                    const float a3i = 0.5f * (x3.im - x0.im) + 1.5f * (x1.im - x2.im);
+                    out[n].im = ((a3i * f + a2i) * f + a1i) * f + a0i;
+                }
+            }
+
+            // Carry the tail forward as the next block's history.
+            if (count >= HISTORY) {
+                memcpy(hist.data(), in + count - HISTORY, HISTORY * sizeof(complex_t));
+            }
+            else {
+                memmove(hist.data(), hist.data() + count, (HISTORY - count) * sizeof(complex_t));
+                memcpy(hist.data() + HISTORY - count, in, count * sizeof(complex_t));
+            }
+        }
+
+    private:
+        std::vector<complex_t> hist;
+        std::vector<complex_t> scratch;
+    };
 
     // Two-channel antenna phasing combiner. See PHASING_PLAN.md section 2.2.
     //
@@ -54,6 +142,8 @@ namespace dsp::combine {
             _a = a;
             _b = b;
             sync.init(2);
+            delayA.init();
+            delayB.init();
             registerInput(_a);
             registerInput(_b);
             registerOutput(&out);
@@ -92,6 +182,18 @@ namespace dsp::combine {
             _gainDb = gainDb;
             _phaseDeg = phaseDeg;
             _target = { mag * std::cos(rad), mag * std::sin(rad) };
+        }
+
+        // Channel B's timing relative to A, in samples; may be fractional and may be
+        // negative. Only applied in MODE_MANUAL, so bypass stays bit-exact.
+        void setDelay(float samples) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _delay = std::min(std::max(samples, -(float)MAX_DELAY), (float)MAX_DELAY);
+        }
+
+        float getDelay() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _delay;
         }
 
         void getWeight(float& gainDb, float& phaseDeg) {
@@ -136,9 +238,12 @@ namespace dsp::combine {
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
             tempStop();
             sync.reset();
+            delayA.reset();
+            delayB.reset();
             {
                 std::lock_guard<std::mutex> lck2(paramMtx);
                 _current = _target;
+                _delayCurrent = _delay;
             }
             tempStart();
         }
@@ -171,10 +276,25 @@ namespace dsp::combine {
         void process(int count, const complex_t* a, const complex_t* b, complex_t* outBuf) {
             Mode mode;
             complex_t target;
+            float delay;
             {
                 std::lock_guard<std::mutex> lck(paramMtx);
                 mode = _mode;
                 target = _target;
+                delay = _delay;
+            }
+
+            // Both channels run through a delay line in manual mode, A at a fixed bulk
+            // delay and B offset from it, so a negative relative delay is expressible and
+            // changing the control does not jump the output. The pass-through modes skip
+            // the lines entirely, which is what keeps bypass bit-identical to the input.
+            if (mode == MODE_MANUAL) {
+                if ((int)dlyA.size() < count) { dlyA.resize(count); dlyB.resize(count); }
+                delayA.process(a, dlyA.data(), count, (float)BULK_DELAY, (float)BULK_DELAY);
+                delayB.process(b, dlyB.data(), count, (float)BULK_DELAY + _delayCurrent, (float)BULK_DELAY + delay);
+                _delayCurrent = delay;
+                a = dlyA.data();
+                b = dlyB.data();
             }
 
             if (mode == MODE_A_ONLY) {
@@ -222,18 +342,27 @@ namespace dsp::combine {
             powerOut.store(lv_creal(acc) * invN, std::memory_order_relaxed);
         }
 
+        // Bulk delay applied to both channels in manual mode, so the user's relative
+        // delay can swing either way around it.
+        static const int BULK_DELAY = 24;
+        static const int MAX_DELAY = 16;
+
         stream<complex_t>* _a = NULL;
         stream<complex_t>* _b = NULL;
         ChannelSync sync;
+        DelayLine delayA, delayB;
+        std::vector<complex_t> dlyA, dlyB;
 
         std::mutex paramMtx;
         Mode _mode = MODE_A_ONLY;
         complex_t _target = { 0.0f, 0.0f };
         float _gainDb = -1000.0f;
         float _phaseDeg = 0.0f;
+        float _delay = 0.0f;
 
         // Worker-thread only.
         complex_t _current = { 0.0f, 0.0f };
+        float _delayCurrent = 0.0f;
 
         std::atomic<float> powerA{ 0.0f };
         std::atomic<float> powerB{ 0.0f };

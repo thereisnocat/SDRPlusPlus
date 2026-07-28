@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cmath>
 #include <string>
+#include <complex>
 
 static int failures = 0;
 
@@ -52,7 +53,10 @@ struct Harness {
 
     // Channel A: wanted (0.01 cyc/samp, amp 0.1) + interferer (0.03 cyc/samp, amp 1.0)
     // Channel B: interferer only, times the complex weight g.
+    bool identical = false;
+
     void fill(dsp::complex_t* buf, int count, long& n, bool isB) {
+        if (identical) { isB = false; }
         const double gm = std::pow(10.0, interfGain / 20.0);
         const double gp = interfPhaseDeg * M_PI / 180.0;
         const double gr = gm * std::cos(gp), gi = gm * std::sin(gp);
@@ -219,15 +223,121 @@ int main() {
         rd.join();
         ph.out.clearReadStop();
 
+        // Skip the first block: manual mode runs both channels through a delay line, so
+        // the output begins with the line's fill (zeros stepping up to the signal). That
+        // is a stream-start transient, not the weight change under test here.
         float maxStep = 0.0f;
-        for (size_t i = 1; i < got.size(); i++) {
+        for (size_t i = N + 1; i < got.size(); i++) {
             const float d = std::abs(got[i].re - got[i - 1].re);
             if (d > maxStep) { maxStep = d; }
         }
-        printf("        %zu samples, largest sample-to-sample step %.6f\n", got.size(), maxStep);
+        printf("        %zu samples, largest step after the delay line fills %.6f\n", got.size(), maxStep);
         // Ramped over a 4096-sample block, the per-sample step is ~1/4096 = 0.00024.
         check(maxStep < 0.01f, "no discontinuity when the weight jumps");
-        check(got.size() > 0, "samples were produced");
+        check(got.size() > (size_t)N, "samples were produced");
+    }
+
+    // -----------------------------------------------------------------
+    printf("\nThe delay control shifts channel B\n");
+    {
+        // Identical channels with w = 1 cancel exactly, so any residual is the delay.
+        Harness h(0.0, 0.0);
+        h.identical = true;
+        h.phaser.setMode(dsp::combine::Phaser::MODE_MANUAL);
+        h.phaser.setWeight(0.0f, 0.0f);
+        h.phaser.setDelay(0.0f);
+        h.run(20, 4096, 20, 4096);
+        const double aligned = h.outputPowerDb();
+        printf("        delay 0.0: residual %.1f dB\n", aligned);
+        check(aligned < -60.0, "identical channels cancel when aligned");
+
+        Harness h2(0.0, 0.0);
+        h2.identical = true;
+        h2.phaser.setMode(dsp::combine::Phaser::MODE_MANUAL);
+        h2.phaser.setWeight(0.0f, 0.0f);
+        h2.phaser.setDelay(1.0f);
+        h2.run(20, 4096, 20, 4096);
+        const double shifted = h2.outputPowerDb();
+
+        // Channel A carries tones at 0.01 and 0.03 cycles/sample. One sample of skew
+        // rotates them by 2*pi*f, leaving |1 - exp(-j2*pi*f)| of each behind.
+        const double r1 = std::abs(1.0 - std::polar(1.0, -2.0 * M_PI * 0.01));
+        const double r2 = std::abs(1.0 - std::polar(1.0, -2.0 * M_PI * 0.03));
+        const double predicted = 10.0 * std::log10(0.1 * 0.1 * r1 * r1 + 1.0 * r2 * r2);
+        printf("        delay 1.0: residual %.2f dB, predicted %.2f dB\n", shifted, predicted);
+        check(std::abs(shifted - predicted) < 1.0, "one sample of delay leaves the predicted residual");
+        check(shifted > aligned + 20.0, "a delay measurably spoils an otherwise perfect null");
+
+        // A whole-sample delay is a plain copy; only a fractional one exercises the
+        // interpolator. Testing integers alone once hid an inverted fractional term that
+        // made the effective delay di - f instead of di + f.
+        Harness h3(0.0, 0.0);
+        h3.identical = true;
+        h3.phaser.setMode(dsp::combine::Phaser::MODE_MANUAL);
+        h3.phaser.setWeight(0.0f, 0.0f);
+        h3.phaser.setDelay(0.5f);
+        h3.run(20, 4096, 20, 4096);
+        const double frac = h3.outputPowerDb();
+        const double f1 = std::abs(1.0 - std::polar(1.0, -2.0 * M_PI * 0.01 * 0.5));
+        const double f2 = std::abs(1.0 - std::polar(1.0, -2.0 * M_PI * 0.03 * 0.5));
+        const double fracPredicted = 10.0 * std::log10(0.1 * 0.1 * f1 * f1 + 1.0 * f2 * f2);
+        printf("        delay 0.5: residual %.2f dB, predicted %.2f dB\n", frac, fracPredicted);
+        check(std::abs(frac - fracPredicted) < 1.0, "half a sample of delay lands where it should");
+    }
+
+    // -----------------------------------------------------------------
+    // Moving the delay control must not splice the signal. A step change in delay is a
+    // step change in time, which breaks up audibly while a control is being dragged.
+    printf("\nSweeping the delay does not splice the output\n");
+    {
+        dsp::stream<dsp::complex_t> a, b;
+        dsp::combine::Phaser ph;
+        ph.init(&a, &b);
+        ph.setMode(dsp::combine::Phaser::MODE_MANUAL);
+        ph.setWeight(0.0f, 0.0f);
+        ph.setDelay(0.0f);
+        ph.reset();
+        ph.start();
+
+        std::vector<dsp::complex_t> got;
+        std::thread rd([&] {
+            while (true) {
+                int c = ph.out.read();
+                if (c < 0) { break; }
+                for (int i = 0; i < c; i++) { got.push_back(ph.out.readBuf[i]); }
+                ph.out.flush();
+            }
+        });
+
+        const int N = 5000, BLOCKS = 40;
+        long n = 0;
+        for (int k = 0; k < BLOCKS; k++) {
+            for (int i = 0; i < N; i++, n++) {
+                const double p = 2.0 * M_PI * 0.01 * (double)n;
+                dsp::complex_t s = { (float)std::cos(p), (float)std::sin(p) };
+                a.writeBuf[i] = s;
+                b.writeBuf[i] = s;
+            }
+            // Sweep across whole-sample boundaries, which is where the sign error showed.
+            if (k >= 10 && k < 30) { ph.setDelay((float)(k - 10) * 0.1f); }
+            a.swap(N);
+            b.swap(N);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        ph.stop();
+        ph.out.stopReader();
+        rd.join();
+        ph.out.clearReadStop();
+
+        double worst = 0.0, typical = 0.0;
+        for (size_t i = N + 1; i < got.size(); i++) {
+            const double d = std::hypot(got[i].re - got[i - 1].re, got[i].im - got[i - 1].im);
+            typical += d;
+            if (d > worst) { worst = d; }
+        }
+        typical /= (double)(got.size() - N - 1);
+        printf("        worst step %.6f, typical %.6f, ratio %.1f\n", worst, typical, worst / (typical + 1e-12));
+        check(worst < typical * 10.0, "no splice when the delay is swept across whole samples");
     }
 
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");

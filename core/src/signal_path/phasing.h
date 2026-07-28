@@ -63,6 +63,8 @@ public:
     dsp::combine::Phaser::Mode getMode();
     void setWeight(float gainDb, float phaseDeg);
     void getWeight(float& gainDb, float& phaseDeg);
+    void setDelay(float samples);
+    float getDelay();
 
     dsp::combine::Phaser::Metrics getMetrics();
     float getNullDepth();
