@@ -259,6 +259,19 @@ public:
             sigpath::iqFrontEnd.bindIQStream(basebandStream);
         }
 
+        // Say so: a dual channel capture runs at four times the data rate of an audio
+        // recording, and silently starting one is how a disk fills up.
+        if (recMode == RECORDER_MODE_BASEBAND) {
+            if (recordingDual) {
+                flog::info("Recording both channels ('{0}', '{1}') as 4 interleaved WAV channels at {2} Hz",
+                           sigpath::phasing.getChannelName(dualChA), sigpath::phasing.getChannelName(dualChB),
+                           (uint64_t)samplerate);
+            }
+            else {
+                flog::info("Recording baseband, 2 channels at {0} Hz", (uint64_t)samplerate);
+            }
+        }
+
         recording = true;
     }
 
