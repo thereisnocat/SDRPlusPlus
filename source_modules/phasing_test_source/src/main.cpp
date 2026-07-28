@@ -225,7 +225,7 @@ private:
         }
 
         // -- Wanted signal -----------------------------------------------------
-        SmGui::Text("Wanted signal");
+        SmGui::Text("Wanted signal  (level is in A; below is B relative to A)");
         if (SmGui::Checkbox(CONCAT("Enabled##_phtest_wen_", _this->name), &_this->wantedEnabled)) {
             _this->set(&Params::wantedEnabled, _this->wantedEnabled);
             dirty = true;
@@ -242,13 +242,13 @@ private:
             _this->set(&Params::wantedLevel, _this->wantedLevelF);
             dirty = true;
         }
-        SmGui::LeftLabel("B Gain");
+        SmGui::LeftLabel("B gain vs A");
         SmGui::FillWidth();
         if (SmGui::SliderFloat(CONCAT("##_phtest_wg_", _this->name), &_this->wantedGainF, -40.0f, 40.0f, SmGui::FMT_STR_FLOAT_DB_TWO_DECIMAL)) {
             _this->set(&Params::wantedGain, _this->wantedGainF);
             dirty = true;
         }
-        SmGui::LeftLabel("B Phase");
+        SmGui::LeftLabel("B phase vs A");
         SmGui::FillWidth();
         if (SmGui::SliderFloat(CONCAT("##_phtest_wp_", _this->name), &_this->wantedPhaseF, -180.0f, 180.0f, SmGui::FMT_STR_FLOAT_TWO_DECIMAL)) {
             _this->set(&Params::wantedPhase, _this->wantedPhaseF);
@@ -256,7 +256,7 @@ private:
         }
 
         // -- Interferer --------------------------------------------------------
-        SmGui::Text("Interferer");
+        SmGui::Text("Interferer  (level is in A; below is B relative to A)");
         if (SmGui::Checkbox(CONCAT("Enabled##_phtest_ien_", _this->name), &_this->interfEnabled)) {
             _this->set(&Params::interfEnabled, _this->interfEnabled);
             dirty = true;
@@ -273,13 +273,13 @@ private:
             _this->set(&Params::interfLevel, _this->interfLevelF);
             dirty = true;
         }
-        SmGui::LeftLabel("B Gain");
+        SmGui::LeftLabel("B gain vs A");
         SmGui::FillWidth();
         if (SmGui::SliderFloat(CONCAT("##_phtest_ig_", _this->name), &_this->interfGainF, -40.0f, 40.0f, SmGui::FMT_STR_FLOAT_DB_TWO_DECIMAL)) {
             _this->set(&Params::interfGain, _this->interfGainF);
             dirty = true;
         }
-        SmGui::LeftLabel("B Phase");
+        SmGui::LeftLabel("B phase vs A");
         SmGui::FillWidth();
         if (SmGui::SliderFloat(CONCAT("##_phtest_ip_", _this->name), &_this->interfPhaseF, -180.0f, 180.0f, SmGui::FMT_STR_FLOAT_TWO_DECIMAL)) {
             _this->set(&Params::interfPhase, _this->interfPhaseF);
@@ -287,7 +287,7 @@ private:
         }
 
         // -- Channel B effects -------------------------------------------------
-        SmGui::Text("Channel B");
+        SmGui::Text("Channel B timing");
         SmGui::LeftLabel("Delay (samp)");
         SmGui::FillWidth();
         if (SmGui::SliderFloat(CONCAT("##_phtest_dly_", _this->name), &_this->delaySamplesF, -16.0f, 16.0f, SmGui::FMT_STR_FLOAT_THREE_DECIMAL)) {
