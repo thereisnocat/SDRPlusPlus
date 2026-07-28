@@ -514,3 +514,21 @@ other misc modules; the core pieces (registry, phaser block) are unconditional b
 **Resolved:** headless/server phasing support is out of scope (§2.3). Dual-channel
 recording for offline re-phasing is in scope, now Phase 2 (§4). Hardware access is not on
 the critical path — Phases 0–5 are developed against a synthetic two-channel source (§5).
+
+---
+
+## 8. Before shipping
+
+Decisions already made that only take effect at release, collected here so they are not
+rediscovered at the last minute.
+
+- **Set `OPT_BUILD_PHASING_TEST_SOURCE` to `OFF`** in `CMakeLists.txt`. It is `ON` during
+  development because Phases 1–5 are built and regression-tested against it, but a
+  synthetic signal generator has no business in the source list of a shipped build. The
+  option and the module stay in the tree — only the default changes. A reminder comment
+  sits next to the option itself, which is where it will actually be noticed.
+- **Say the wideband limitation out loud in the UI** (§2.5). Until the multi-tap weight of
+  Phase 6 lands, a null-depth meter reading 45 dB at the VFO while the rest of the band
+  barely moves is correct behaviour, and without a word of explanation it reads as a bug.
+- **Decide sidecar vs. embedded RIFF chunk** for dual-channel recording metadata (§4.2)
+  before any recordings exist in the wild to be compatible with.
