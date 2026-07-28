@@ -65,9 +65,15 @@ public:
     void getWeight(float& gainDb, float& phaseDeg);
     void setDelay(float samples);
     float getDelay();
+    void setAdaptRate(float rate);
+    float getAdaptRate();
+    void setSampleRate(double sampleRate);
+    void setReferenceBand(bool enabled, double offsetHz, double widthHz);
+    void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz);
 
     dsp::combine::Phaser::Metrics getMetrics();
     float getNullDepth();
+    bool isNullDepthBandLimited();
     uint64_t getDiscardCount();
 
     // Fired whenever the attached channel set changes, including detaching. The phasing

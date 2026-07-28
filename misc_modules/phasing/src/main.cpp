@@ -97,6 +97,10 @@ private:
         if (c.contains("gainDb")) { gainCoarse = c["gainDb"]; }
         if (c.contains("phaseDeg")) { phaseCoarse = c["phaseDeg"]; }
         if (c.contains("delay")) { delay = c["delay"]; }
+        if (c.contains("adaptRate")) { adaptRate = c["adaptRate"]; }
+        if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
+        if (c.contains("refOffset")) { refOffset = c["refOffset"]; }
+        if (c.contains("refWidth")) { refWidth = c["refWidth"]; }
 
         memories.clear();
         if (c.contains("memories")) {
@@ -127,6 +131,10 @@ private:
         c["gainDb"] = gainCoarse;
         c["phaseDeg"] = phaseCoarse;
         c["delay"] = delay;
+        c["adaptRate"] = adaptRate;
+        c["refEnabled"] = refEnabled;
+        c["refOffset"] = refOffset;
+        c["refWidth"] = refWidth;
         json mems = json::array();
         for (const auto& m : memories) {
             json j;
@@ -148,8 +156,19 @@ private:
 
     void applyToPhaser() {
         sigpath::phasing.setMode((dsp::combine::Phaser::Mode)mode);
-        sigpath::phasing.setWeight(effectiveGain(), effectivePhase());
+        // Auto and hold own the weight themselves; pushing the UI's copy at them would
+        // undo what the solver just worked out.
+        if (mode != dsp::combine::Phaser::MODE_AUTO && mode != dsp::combine::Phaser::MODE_HOLD) {
+            sigpath::phasing.setWeight(effectiveGain(), effectivePhase());
+        }
         sigpath::phasing.setDelay(delay);
+        sigpath::phasing.setAdaptRate(adaptRate);
+        applyReferenceBand();
+    }
+
+    void applyReferenceBand() {
+        sigpath::phasing.setSampleRate(sigpath::iqFrontEnd.getSampleRate());
+        sigpath::phasing.setReferenceBand(refEnabled, refOffset, refWidth);
     }
 
     void recall(const Memory& m) {
@@ -203,13 +222,22 @@ private:
         ImGui::LeftLabel("Output");
         ImGui::FillWidth();
         if (ImGui::Combo(CONCAT("##_phasing_mode_", _this->name), &_this->mode,
-                         "Channel A only\0Channel B only\0Combined (A - w*B)\0")) {
+                         "Channel A only\0Channel B only\0Manual\0Auto-null\0Hold\0")) {
             _this->applyToPhaser();
             _this->saveSettings();
         }
 
-        const bool combining = (_this->mode == dsp::combine::Phaser::MODE_MANUAL);
-        if (!combining) { style::beginDisabled(); }
+        const bool combining = dsp::combine::Phaser::isCombining((dsp::combine::Phaser::Mode)_this->mode);
+        const bool adapting = (_this->mode == dsp::combine::Phaser::MODE_AUTO);
+
+        // While adapting, the weight belongs to the algorithm; the controls become a
+        // readout. Editing them would be overwritten within a block anyway.
+        if (adapting) {
+            sigpath::phasing.getWeight(_this->gainCoarse, _this->phaseCoarse);
+            _this->gainFine = 0.0f;
+            _this->phaseFine = 0.0f;
+        }
+        if (!combining || adapting) { style::beginDisabled(); }
 
         // -- Gain --------------------------------------------------------------
         ImGui::LeftLabel("Gain");
@@ -280,7 +308,80 @@ private:
             _this->saveSettings();
         }
 
-        if (!combining) { style::endDisabled(); }
+        if (!combining || adapting) { style::endDisabled(); }
+
+        // -- Adaptation --------------------------------------------------------
+        if (combining) {
+            if (!adapting) { style::beginDisabled(); }
+            ImGui::LeftLabel("Rate");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_phasing_rate_", _this->name), &_this->adaptRate, 0.001f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic)) {
+                sigpath::phasing.setAdaptRate(_this->adaptRate);
+                _this->saveSettings();
+            }
+            if (!adapting) { style::endDisabled(); }
+
+            if (adapting) {
+                // The workflow a phasing box imposes anyway: converge on the pest while
+                // it is the loudest thing present, then lock before the wanted signal
+                // comes up and the algorithm starts nulling that instead.
+                if (ImGui::Button(CONCAT("Freeze##_phasing_freeze_", _this->name))) {
+                    _this->mode = dsp::combine::Phaser::MODE_HOLD;
+                    _this->applyToPhaser();
+                    _this->saveSettings();
+                }
+                ImGui::SameLine();
+                ImGui::TextWrapped("adapting");
+            }
+            else if (_this->mode == dsp::combine::Phaser::MODE_HOLD) {
+                if (ImGui::Button(CONCAT("Resume##_phasing_resume_", _this->name))) {
+                    _this->mode = dsp::combine::Phaser::MODE_AUTO;
+                    _this->applyToPhaser();
+                    _this->saveSettings();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(CONCAT("Copy to manual##_phasing_tomanual_", _this->name))) {
+                    sigpath::phasing.getWeight(_this->gainCoarse, _this->phaseCoarse);
+                    _this->gainFine = 0.0f;
+                    _this->phaseFine = 0.0f;
+                    _this->mode = dsp::combine::Phaser::MODE_MANUAL;
+                    _this->applyToPhaser();
+                    _this->saveSettings();
+                }
+            }
+
+            // Adapting on the whole band nulls whatever is loudest, which when the DX
+            // peaks is the DX. Pointing the solver at a stretch containing only the pest
+            // is the thing an SDR can do that an analogue phasing box cannot.
+            if (ImGui::Checkbox(CONCAT("Reference band##_phasing_refen_", _this->name), &_this->refEnabled)) {
+                _this->applyReferenceBand();
+                _this->saveSettings();
+            }
+            if (_this->refEnabled) {
+                ImGui::LeftLabel("  offset");
+                ImGui::FillWidth();
+                if (ImGui::InputDouble(CONCAT("##_phasing_refoff_", _this->name), &_this->refOffset, 1000.0, 10000.0, "%.0f Hz")) {
+                    _this->applyReferenceBand();
+                    _this->saveSettings();
+                }
+                ImGui::LeftLabel("  width");
+                ImGui::FillWidth();
+                if (ImGui::InputDouble(CONCAT("##_phasing_refwid_", _this->name), &_this->refWidth, 1000.0, 10000.0, "%.0f Hz")) {
+                    _this->refWidth = std::max(_this->refWidth, 100.0);
+                    _this->applyReferenceBand();
+                    _this->saveSettings();
+                }
+                if (ImGui::Button(CONCAT("From VFO##_phasing_refvfo_", _this->name))) {
+                    // Point it at whatever the user is looking at.
+                    _this->refOffset = gui::waterfall.selectedVFO.empty() ? 0.0
+                                     : gui::waterfall.vfos[gui::waterfall.selectedVFO]->generalOffset;
+                    _this->applyReferenceBand();
+                    _this->saveSettings();
+                }
+                ImGui::TextWrapped("Band-limiting is approximate; strong signals just "
+                                   "outside it still pull on the estimate.");
+            }
+        }
 
         // -- Null depth --------------------------------------------------------
         const float depth = sigpath::phasing.getNullDepth();
@@ -288,7 +389,8 @@ private:
         else { _this->peakDepth -= 0.25f; }   // slow decay so the best result stays visible
         _this->peakDepth = std::max(_this->peakDepth, 0.0f);
 
-        ImGui::LeftLabel("Null depth");
+        const bool banded = sigpath::phasing.isNullDepthBandLimited();
+        ImGui::LeftLabel(banded ? "Null depth (band)" : "Null depth (wide)");
         ImGui::Text("%.1f dB (best %.1f)", depth, _this->peakDepth);
         ImGui::FillWidth();
         ImGui::VolumeMeter(std::clamp(depth, 0.0f, 60.0f), std::clamp(_this->peakDepth, 0.0f, 60.0f), 0, 60);
@@ -299,6 +401,26 @@ private:
         // unless it is said out loud.
         ImGui::TextWrapped("A single weight nulls deeply over a narrow span. Away from the "
                            "null frequency, cancellation falls off.");
+        if (!banded) {
+            // Whole-band depth answers "did total power drop", which is not the same
+            // question as "did the pest go away", and can mark a correct null down.
+            ImGui::TextWrapped("Measured across the whole band, so a weight that cancels one "
+                               "signal but lifts another can score poorly. Set a reference "
+                               "band to score the null where it matters.");
+        }
+
+        if (ImGui::Button(CONCAT("Reset combiner##_phasing_reset_", _this->name))) {
+            // Settings persist per source, so a delay or weight left over from an earlier
+            // session goes on quietly spoiling every null until it is noticed.
+            _this->gainCoarse = 0.0f;
+            _this->gainFine = 0.0f;
+            _this->phaseCoarse = 0.0f;
+            _this->phaseFine = 0.0f;
+            _this->delay = 0.0f;
+            _this->peakDepth = 0.0f;
+            _this->applyToPhaser();
+            _this->saveSettings();
+        }
 
         // -- Memories ----------------------------------------------------------
         ImGui::Separator();
@@ -366,6 +488,10 @@ private:
     float phaseFine = 0.0f;
     float delay = 0.0f;
     float peakDepth = 0.0f;
+    float adaptRate = 0.05f;
+    bool refEnabled = false;
+    double refOffset = 0.0;
+    double refWidth = 20000.0;
 
     std::vector<Memory> memories;
     int memId = 0;

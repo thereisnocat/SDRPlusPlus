@@ -1,4 +1,5 @@
 #include "phasing.h"
+#include "signal_path.h"
 #include <utils/flog.h>
 #include <algorithm>
 
@@ -50,6 +51,9 @@ void Phasing::build() {
     splitters[chA]->bindStream(&feedA);
     splitters[chB]->bindStream(&feedB);
     applyTaps();
+
+    // The reference band mixer needs to know the rate it is working at.
+    phaser.setSampleRate(sigpath::iqFrontEnd.getSampleRate());
 
     phaser.reset();
     phaser.start();
@@ -180,6 +184,12 @@ void Phasing::setWeight(float gainDb, float phaseDeg) { phaser.setWeight(gainDb,
 void Phasing::getWeight(float& gainDb, float& phaseDeg) { phaser.getWeight(gainDb, phaseDeg); }
 void Phasing::setDelay(float samples) { phaser.setDelay(samples); }
 float Phasing::getDelay() { return phaser.getDelay(); }
+void Phasing::setAdaptRate(float rate) { phaser.setAdaptRate(rate); }
+float Phasing::getAdaptRate() { return phaser.getAdaptRate(); }
+void Phasing::setSampleRate(double sampleRate) { phaser.setSampleRate(sampleRate); }
+void Phasing::setReferenceBand(bool enabled, double offsetHz, double widthHz) { phaser.setReferenceBand(enabled, offsetHz, widthHz); }
+void Phasing::getReferenceBand(bool& enabled, double& offsetHz, double& widthHz) { phaser.getReferenceBand(enabled, offsetHz, widthHz); }
 dsp::combine::Phaser::Metrics Phasing::getMetrics() { return phaser.getMetrics(); }
 float Phasing::getNullDepth() { return phaser.getNullDepth(); }
+bool Phasing::isNullDepthBandLimited() { return phaser.isNullDepthBandLimited(); }
 uint64_t Phasing::getDiscardCount() { return phaser.getDiscardCount(); }

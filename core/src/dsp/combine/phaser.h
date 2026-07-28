@@ -2,10 +2,12 @@
 #include "../block.h"
 #include "../buffer/buffer.h"
 #include "channel_sync.h"
+#include "ref_band.h"
 #include <mutex>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <complex>
 #include <vector>
 #include <algorithm>
 
@@ -119,8 +121,12 @@ namespace dsp::combine {
         enum Mode {
             MODE_A_ONLY,   // pass channel A through untouched; the bypass state
             MODE_B_ONLY,   // pass channel B through untouched
-            MODE_MANUAL    // Y = A - w*B with the user's weight
+            MODE_MANUAL,   // Y = A - w*B with the user's weight
+            MODE_AUTO,     // same, with w solved for continuously
+            MODE_HOLD      // same, with w frozen wherever adaptation left it
         };
+
+        static bool isCombining(Mode m) { return m != MODE_A_ONLY && m != MODE_B_ONLY; }
 
         struct Metrics {
             float powerA = 0.0f;    // mean |A|^2 over the last processed block
@@ -196,6 +202,44 @@ namespace dsp::combine {
             return _delay;
         }
 
+        // How much of each block's freshly solved weight to take, per block. Small values
+        // lock onto the persistent interferer and ignore fades; large ones chase whatever
+        // is loudest right now, including the signal you are trying to keep.
+        void setAdaptRate(float rate) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _adaptRate = std::min(std::max(rate, 0.0001f), 1.0f);
+        }
+
+        float getAdaptRate() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _adaptRate;
+        }
+
+        // Needed only by the reference band, to place its mixer.
+        void setSampleRate(double sampleRate) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _sampleRate = sampleRate;
+            _refDirty = true;
+        }
+
+        // Restrict adaptation to a slice of spectrum, offset from centre. Without this,
+        // minimising output power nulls whatever is loudest, which when the wanted signal
+        // peaks is the wanted signal.
+        void setReferenceBand(bool enabled, double offsetHz, double widthHz) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _refEnabled = enabled;
+            _refOffset = offsetHz;
+            _refWidth = widthHz;
+            _refDirty = true;
+        }
+
+        void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            enabled = _refEnabled;
+            offsetHz = _refOffset;
+            widthHz = _refWidth;
+        }
+
         void getWeight(float& gainDb, float& phaseDeg) {
             std::lock_guard<std::mutex> lck(paramMtx);
             gainDb = _gainDb;
@@ -217,7 +261,18 @@ namespace dsp::combine {
 
         // Cancellation achieved, in dB: how far the output sits below channel A. This is
         // the number the user is actually optimising when turning the knobs.
+        // True when the depth below is measured inside the reference band rather than
+        // across the whole spectrum.
+        bool isNullDepthBandLimited() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _refEnabled && _mode != MODE_A_ONLY && _mode != MODE_B_ONLY;
+        }
+
         float getNullDepth() {
+            if (isNullDepthBandLimited()) {
+                const float bd = bandDepth.load(std::memory_order_relaxed);
+                return bd;
+            }
             const float a = powerA.load(std::memory_order_relaxed);
             const float o = powerOut.load(std::memory_order_relaxed);
             if (a <= 0.0f) { return 0.0f; }
@@ -240,6 +295,8 @@ namespace dsp::combine {
             sync.reset();
             delayA.reset();
             delayB.reset();
+            refBand.reset();
+            metricBand.reset();
             {
                 std::lock_guard<std::mutex> lck2(paramMtx);
                 _current = _target;
@@ -277,24 +334,55 @@ namespace dsp::combine {
             Mode mode;
             complex_t target;
             float delay;
+            float adaptRate;
+            bool refEnabled;
             {
                 std::lock_guard<std::mutex> lck(paramMtx);
                 mode = _mode;
                 target = _target;
                 delay = _delay;
+                adaptRate = _adaptRate;
+                refEnabled = _refEnabled;
+                if (_refDirty) {
+                    refBand.configure(_sampleRate, _refOffset, _refWidth);
+                    metricBand.configure(_sampleRate, _refOffset, _refWidth);
+                    _refDirty = false;
+                }
             }
 
             // Both channels run through a delay line in manual mode, A at a fixed bulk
             // delay and B offset from it, so a negative relative delay is expressible and
             // changing the control does not jump the output. The pass-through modes skip
             // the lines entirely, which is what keeps bypass bit-identical to the input.
-            if (mode == MODE_MANUAL) {
+            if (isCombining(mode)) {
                 if ((int)dlyA.size() < count) { dlyA.resize(count); dlyB.resize(count); }
                 delayA.process(a, dlyA.data(), count, (float)BULK_DELAY, (float)BULK_DELAY);
                 delayB.process(b, dlyB.data(), count, (float)BULK_DELAY + _delayCurrent, (float)BULK_DELAY + delay);
                 _delayCurrent = delay;
                 a = dlyA.data();
                 b = dlyB.data();
+            }
+
+            // Solve for the weight that cancels whatever the two channels have in common,
+            // then take a fraction of it. This is the Wiener solution: minimising
+            // E|A - wB|^2 gives w = E[A conj(B)] / E[|B|^2]. A block estimate is both
+            // cheaper and steadier than a sample-wise gradient.
+            if (mode == MODE_AUTO) {
+                std::complex<double> rab(0.0, 0.0);
+                double rbb = 0.0;
+                if (refEnabled) { refBand.accumulate(a, b, count, rab, rbb); }
+                else { RefBand::accumulateWideband(a, b, count, rab, rbb); }
+
+                if (rbb > 1e-20) {
+                    const std::complex<double> wOpt = rab / rbb;
+                    std::lock_guard<std::mutex> lck(paramMtx);
+                    const std::complex<double> wOld(_target.re, _target.im);
+                    const std::complex<double> wNew = wOld + (double)adaptRate * (wOpt - wOld);
+                    _target = { (float)wNew.real(), (float)wNew.imag() };
+                    _gainDb = 20.0f * std::log10(std::max((float)std::abs(wNew), 1e-12f));
+                    _phaseDeg = (float)(std::arg(wNew) * 180.0 / M_PI);
+                    target = _target;
+                }
             }
 
             if (mode == MODE_A_ONLY) {
@@ -325,6 +413,16 @@ namespace dsp::combine {
             }
 
             updateMetrics(count, a, b, outBuf);
+
+            // Score the null where the user pointed the solver, not across the whole band.
+            if (refEnabled && isCombining(mode)) {
+                std::complex<double> ignored(0.0, 0.0);
+                double pOut = 0.0, pIn = 0.0;
+                metricBand.accumulate(a, outBuf, count, ignored, pOut, &pIn);
+                if (pIn > 1e-20 && pOut > 1e-20) {
+                    bandDepth.store((float)(10.0 * std::log10(pIn / pOut)), std::memory_order_relaxed);
+                }
+            }
         }
 
         void updateMetrics(int count, const complex_t* a, const complex_t* b, const complex_t* y) {
@@ -351,6 +449,8 @@ namespace dsp::combine {
         stream<complex_t>* _b = NULL;
         ChannelSync sync;
         DelayLine delayA, delayB;
+        RefBand refBand;
+        RefBand metricBand;
         std::vector<complex_t> dlyA, dlyB;
 
         std::mutex paramMtx;
@@ -359,6 +459,12 @@ namespace dsp::combine {
         float _gainDb = -1000.0f;
         float _phaseDeg = 0.0f;
         float _delay = 0.0f;
+        float _adaptRate = 0.05f;
+        bool _refEnabled = false;
+        double _refOffset = 0.0;
+        double _refWidth = 20000.0;
+        double _sampleRate = 1000000.0;
+        bool _refDirty = true;
 
         // Worker-thread only.
         complex_t _current = { 0.0f, 0.0f };
@@ -367,5 +473,6 @@ namespace dsp::combine {
         std::atomic<float> powerA{ 0.0f };
         std::atomic<float> powerB{ 0.0f };
         std::atomic<float> powerOut{ 0.0f };
+        std::atomic<float> bandDepth{ 0.0f };
     };
 }

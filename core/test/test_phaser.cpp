@@ -340,6 +340,82 @@ int main() {
         check(worst < typical * 10.0, "no splice when the delay is swept across whole samples");
     }
 
+    // -----------------------------------------------------------------
+    // The whole reason for a synthetic source: the correct answer is known, so
+    // convergence can be scored rather than eyeballed. On the air you can null an
+    // interferer but never learn what the right weight was.
+    printf("\nAuto-null converges on the known weight\n");
+    {
+        const double gain = -3.0, phase = 137.0;
+        Harness h(gain, phase);
+        h.phaser.setMode(dsp::combine::Phaser::MODE_AUTO);
+        h.phaser.setWeight(-1000.0f, 0.0f);   // start from nothing
+        h.phaser.setAdaptRate(0.25f);
+        h.run(40, 4096, 40, 4096);
+
+        float gotGain = 0.0f, gotPhase = 0.0f;
+        h.phaser.getWeight(gotGain, gotPhase);
+        printf("        converged to %+.3f dB, %+.3f deg (want %+.3f, %+.3f)\n",
+               gotGain, gotPhase, -gain, -phase);
+        check(std::abs(gotGain - (float)-gain) < 0.5f, "gain converged to within 0.5 dB");
+        check(std::abs(gotPhase - (float)-phase) < 2.0f, "phase converged to within 2 degrees");
+
+        // The ceiling here is set by the wanted tone, which survives by design: channel A
+        // holds it at 0.1 alongside the interferer at 1.0, so a perfect cancellation of the
+        // interferer still leaves 10*log10(1.01/0.01) = 20.04 dB and no more. A depth much
+        // above that would mean the wanted signal was being nulled too.
+        const float depth = h.phaser.getNullDepth();
+        printf("        null depth at the end: %.1f dB (ceiling is 20.0)\n", depth);
+        check(depth > 19.0f && depth < 21.0f, "nulls the interferer and stops there");
+    }
+
+    printf("\nHold freezes the weight\n");
+    {
+        const double gain = -3.0, phase = 137.0;
+        Harness h(gain, phase);
+        h.phaser.setMode(dsp::combine::Phaser::MODE_AUTO);
+        h.phaser.setWeight(-1000.0f, 0.0f);
+        h.phaser.setAdaptRate(0.25f);
+        h.run(30, 4096, 30, 4096);
+        float g1 = 0.0f, p1 = 0.0f;
+        h.phaser.getWeight(g1, p1);
+
+        // Freeze, then feed channels whose correlation is entirely different. A still
+        // adapting weight would chase it; a frozen one must not move.
+        h.phaser.setMode(dsp::combine::Phaser::MODE_HOLD);
+        Harness h2(20.0, -50.0);
+        h2.phaser.setMode(dsp::combine::Phaser::MODE_HOLD);
+        h2.phaser.setWeight(g1, p1);
+        h2.run(20, 4096, 20, 4096);
+        float g2 = 0.0f, p2 = 0.0f;
+        h2.phaser.getWeight(g2, p2);
+        printf("        held %+.3f dB %+.3f deg through different material -> %+.3f dB %+.3f deg\n",
+               g1, p1, g2, p2);
+        check(g1 == g2 && p1 == p2, "hold does not move the weight");
+    }
+
+    printf("\nReference band ignores signals outside it\n");
+    {
+        // Wanted tone at 0.01 cyc/sample sits in A only; the interferer at 0.03 is in
+        // both. Point the reference band at the interferer and the solution should be the
+        // interferer's weight, undisturbed by the wanted tone's presence.
+        const double gain = -3.0, phase = 137.0;
+        Harness h(gain, phase);
+        h.phaser.setMode(dsp::combine::Phaser::MODE_AUTO);
+        h.phaser.setWeight(-1000.0f, 0.0f);
+        h.phaser.setAdaptRate(0.25f);
+        h.phaser.setSampleRate(1.0);                       // work in cycles/sample
+        h.phaser.setReferenceBand(true, 0.03, 0.004);      // centred on the interferer
+        h.run(40, 4096, 40, 4096);
+
+        float gotGain = 0.0f, gotPhase = 0.0f;
+        h.phaser.getWeight(gotGain, gotPhase);
+        printf("        converged to %+.3f dB, %+.3f deg (want %+.3f, %+.3f)\n",
+               gotGain, gotPhase, -gain, -phase);
+        check(std::abs(gotGain - (float)-gain) < 1.0f, "reference band solved the interferer's gain");
+        check(std::abs(gotPhase - (float)-phase) < 5.0f, "reference band solved the interferer's phase");
+    }
+
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

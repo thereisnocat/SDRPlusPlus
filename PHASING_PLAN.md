@@ -254,6 +254,15 @@ increasing order of value:
    untouched. This is the feature SDR++ can offer that an analog phasing box cannot —
    the user can *see* the pest on the waterfall and point at it.
 
+**Null depth has to be measured where the null is (found in Phase 4).** The obvious metric,
+`10*log10(mean|A|^2 / mean|Y|^2)` over the whole band, answers "did total power drop",
+which is not the same question as "did the pest go away". A weight that cancels the
+interferer perfectly is free to *amplify* everything else, so whole-band depth can mark the
+correct answer down: in testing, a reference-band solution that nulled the interferer
+exactly scored 3.4 dB while a wideband compromise that nulled nothing properly scored 4.2.
+When a reference band is set, the depth is therefore measured inside it, and the UI says
+which of the two it is showing.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
@@ -518,7 +527,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **1** | Core plumbing | No | **Done** — `ChannelSet` registry in `SourceManager`, the `Phasing` front end (`core/src/signal_path/phasing.*`) owning a splitter per channel plus `bindChannelStream`, `dsp::combine::Phaser` (scalar, manual, own accumulation buffers), `selectSource()` wiring, bypassed by default via `MODE_A_ONLY`. Covered by `core/test/test_phaser.cpp` and `core/test/test_phasing.cpp`. The Phase 0 source gained a "Dual channel" mode that registers a `ChannelSet`. Confirmed live: with the source in dual channel mode the waterfall is indistinguishable from plain channel A, with no gaps or audible stutter. |
 | **2** | Dual-channel I/O | No | **Done** — `wav::Writer` gained `addChunk()`; `core/src/utils/wav_meta.h` writes a verified `auxi` plus our `sdpc` chunk; the recorder has a "Record both channels" option writing I1 Q1 I2 Q2 with a MB/min estimate; `file_source` detects a 4-channel file and registers a `ChannelSet` so the phasing path lights up on playback. The two-input synchronisation the recorder needed was extracted from `Phaser` into `dsp::combine::ChannelSync` and is now shared. Covered by `core/test/test_wav_meta.cpp`; run everything with `core/test/run_tests.sh`. Confirmed live: a 19-second capture of the synthetic source wrote 4 channels at 1 Msps with `auxi` (centre 9917072 Hz) and `sdpc` (names 'A'/'B', both coherence flags) intact, and played back through the phasing path as two clean tones at the original offsets. |
 | **3** | UI module | No | **Done** — `misc_modules/phasing/`: output select, coarse+fine gain and phase with exact numeric entry, swap, delay, null-depth meter with peak hold, per-frequency memories, settings keyed per source. `Phaser` gained a fractional-sample delay line. Confirmed live against the synthetic source. |
-| **4** | Auto-null | No | Block Wiener, adaptation rate, Freeze, reference-band selector. Convergence is measurable against a known synthetic weight — better ground truth than any on-air test. |
+| **4** | Auto-null | No | **Done** — block Wiener solution (`MODE_AUTO`/`MODE_HOLD`), adaptation rate, Freeze/Resume/Copy-to-manual, and a reference band (`dsp/combine/ref_band.h`) restricting the solver to a slice of spectrum. Converges to the synthetic source's known weight to three decimals. Confirmed live. |
 | **5** | Wideband | No | Multi-tap frequency-domain weight; retires the fractional-delay control. Validated against the synthetic source's delay/frequency-tilt settings. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
 | **7** | More radios | Yes | RSPduo dual-tuner; Perseus22 and RSR200 source modules. |
