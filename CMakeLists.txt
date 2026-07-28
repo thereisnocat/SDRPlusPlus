@@ -25,6 +25,7 @@ option(OPT_BUILD_KCSDR_SOURCE "Build KCSDR Source Module (Dependencies: libkcsdr
 option(OPT_BUILD_LIMESDR_SOURCE "Build LimeSDR Source Module (Dependencies: liblimesuite)" OFF)
 option(OPT_BUILD_NETWORK_SOURCE "Build Network Source Module (no dependencies required)" ON)
 option(OPT_BUILD_PERSEUS_SOURCE "Build Perseus Source Module (Dependencies: libperseus-sdr)" OFF)
+option(OPT_BUILD_PHASING_TEST_SOURCE "Build the two-channel phasing test signal generator (no dependencies required)" ON)
 option(OPT_BUILD_PLUTOSDR_SOURCE "Build PlutoSDR Source Module (Dependencies: libiio, libad9361)" ON)
 option(OPT_BUILD_RFNM_SOURCE "Build RFNM Source Module (Dependencies: librfnm)" OFF)
 option(OPT_BUILD_RFSPACE_SOURCE "Build RFspace Source Module (no dependencies required)" ON)
@@ -187,6 +188,10 @@ endif (OPT_BUILD_NETWORK_SOURCE)
 if (OPT_BUILD_PERSEUS_SOURCE)
 add_subdirectory("source_modules/perseus_source")
 endif (OPT_BUILD_PERSEUS_SOURCE)
+
+if (OPT_BUILD_PHASING_TEST_SOURCE)
+add_subdirectory("source_modules/phasing_test_source")
+endif (OPT_BUILD_PHASING_TEST_SOURCE)
 
 if (OPT_BUILD_PLUTOSDR_SOURCE)
 add_subdirectory("source_modules/plutosdr_source")

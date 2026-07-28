@@ -191,6 +191,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["Network Source"]["enabled"] = true;
     defConfig["moduleInstances"]["PerseusSDR Source"]["module"] = "perseus_source";
     defConfig["moduleInstances"]["PerseusSDR Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["Phasing Test Source"]["module"] = "phasing_test_source";
+    defConfig["moduleInstances"]["Phasing Test Source"]["enabled"] = true;
     defConfig["moduleInstances"]["PlutoSDR Source"]["module"] = "plutosdr_source";
     defConfig["moduleInstances"]["PlutoSDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["RFNM Source"]["module"] = "rfnm_source";
