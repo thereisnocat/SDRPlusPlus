@@ -5,7 +5,7 @@
 //
 //   c++ -std=c++17 -O2 -I<repo>/core/src -I/opt/homebrew/include \
 //       -o /tmp/test_phasing core/test/test_phasing.cpp \
-//       -L<repo>/build -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build
+//       -L<repo>/build/core -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build/core
 //
 // The properties worth pinning down here are the ones that only emerge once the graph is
 // assembled: that a recording tap does not steal samples from the combiner, and that a

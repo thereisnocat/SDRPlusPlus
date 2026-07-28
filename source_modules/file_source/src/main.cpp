@@ -5,6 +5,7 @@
 #include <gui/gui.h>
 #include <signal_path/signal_path.h>
 #include <wavreader.h>
+#include <utils/wav_meta.h>
 #include <core.h>
 #include <gui/widgets/file_select.h>
 #include <filesystem>
@@ -51,6 +52,7 @@ public:
 
     ~FileSourceModule() {
         stop(this);
+        sigpath::sourceManager.unregisterChannels("File");
         sigpath::sourceManager.unregisterSource("File");
     }
 
@@ -102,7 +104,12 @@ private:
         gui::playbackBar.active = true;
         gui::playbackBar.progress = 0.0f;
         gui::playbackBar.currentTimeSec = 0.0f;
-        _this->workerThread = _this->float32Mode ? std::thread(floatWorker, _this) : std::thread(worker, _this);
+        if (_this->dualChannel) {
+            _this->workerThread = std::thread(dualWorker, _this);
+        }
+        else {
+            _this->workerThread = _this->float32Mode ? std::thread(floatWorker, _this) : std::thread(worker, _this);
+        }
         flog::info("FileSourceModule '{0}': Start!", _this->name);
     }
 
@@ -111,8 +118,12 @@ private:
         if (!_this->running) { return; }
         if (_this->reader == NULL) { return; }
         _this->stream.stopWriter();
+        _this->streamA.stopWriter();
+        _this->streamB.stopWriter();
         _this->workerThread.join();
         _this->stream.clearWriteStop();
+        _this->streamA.clearWriteStop();
+        _this->streamB.clearWriteStop();
         _this->running = false;
         _this->reader->rewind();
         gui::playbackBar.active = false;
@@ -151,8 +162,17 @@ private:
                     }
                     _this->sampleRate = _this->reader->getSampleRate();
                     core::setInputSampleRate(_this->sampleRate);
+                    _this->configureChannels();
                     std::string filename = std::filesystem::path(_this->fileSelect.path).filename().string();
                     _this->centerFreq = _this->getFrequency(filename);
+                    // An embedded auxi chunk is more trustworthy than parsing the filename.
+                    if (const auto* aux = _this->reader->getChunk("auxi")) {
+                        if (aux->size() >= sizeof(wavmeta::AuxiChunk)) {
+                            wavmeta::AuxiChunk a;
+                            memcpy(&a, aux->data(), sizeof(a));
+                            if (a.centerFreq > 0) { _this->centerFreq = (double)a.centerFreq; }
+                        }
+                    }
                     tuner::tune(tuner::TUNER_MODE_IQ_ONLY, "", _this->centerFreq);
                     //gui::freqSelect.minFreq = _this->centerFreq - (_this->sampleRate/2);
                     //gui::freqSelect.maxFreq = _this->centerFreq + (_this->sampleRate/2);
@@ -225,6 +245,47 @@ private:
         delete[] inBuf;
     }
 
+    // Four WAV channels are two complex channels interleaved as I1 Q1 I2 Q2. Split them
+    // back apart and hand both to the phasing front end, so a dual channel recording can
+    // be re-phased exactly as if the radio were still connected.
+    static void dualWorker(void* ctx) {
+        FileSourceModule* _this = (FileSourceModule*)ctx;
+        double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
+        int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
+        std::vector<int16_t> inBuf(blockSize * 4);
+        std::vector<float> fBuf(blockSize * 4);
+
+        while (true) {
+            if (_this->seekPending.exchange(false)) {
+                _this->reader->seekToFraction(_this->seekFraction.load());
+            }
+
+            if (_this->float32Mode) {
+                _this->reader->readSamples(fBuf.data(), blockSize * 4 * sizeof(float));
+            }
+            else {
+                _this->reader->readSamples(inBuf.data(), blockSize * 4 * sizeof(int16_t));
+                volk_16i_s32f_convert_32f(fBuf.data(), inBuf.data(), 32768.0f, blockSize * 4);
+            }
+
+            for (int i = 0; i < blockSize; i++) {
+                _this->streamA.writeBuf[i] = { fBuf[4 * i + 0], fBuf[4 * i + 1] };
+                _this->streamB.writeBuf[i] = { fBuf[4 * i + 2], fBuf[4 * i + 3] };
+            }
+
+            uint64_t dataSize = _this->reader->getDataSize();
+            if (dataSize > 0) {
+                size_t byteOff = _this->reader->getCurrentByteOffset();
+                gui::playbackBar.progress = (float)((double)byteOff / (double)dataSize);
+                gui::playbackBar.currentTimeSec = (float)byteOff / (float)_this->reader->getBytesPerSecond();
+            }
+
+            // Swapped in the order the phaser reads them.
+            if (!_this->streamA.swap(blockSize)) { break; }
+            if (!_this->streamB.swap(blockSize)) { break; }
+        }
+    }
+
     static void floatWorker(void* ctx) {
         FileSourceModule* _this = (FileSourceModule*)ctx;
         double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
@@ -248,6 +309,38 @@ private:
         delete[] inBuf;
     }
 
+    // A four channel file is two complex channels: offer them to core for phasing so a
+    // dual channel recording plays back exactly like the radio that made it.
+    void configureChannels() {
+        sigpath::sourceManager.unregisterChannels("File");
+        dualChannel = false;
+        if (reader == NULL || reader->getChannelCount() != 4) { return; }
+
+        wavmeta::PhasingInfo info;
+        bool haveInfo = false;
+        if (const auto* c = reader->getChunk(std::string(wavmeta::PHASING_CHUNK_ID, 4).c_str())) {
+            haveInfo = wavmeta::parsePhasing(c->data(), c->size(), info);
+        }
+
+        channels.count = 2;
+        channels.streams = { &streamA, &streamB };
+        if (haveInfo && info.names.size() >= 2) {
+            channels.names = { info.names[0], info.names[1] };
+        }
+        else {
+            // A four channel file with no chunk of ours is still probably two IQ channels;
+            // play it back rather than refusing, just without the labels.
+            channels.names = { "1", "2" };
+        }
+        channels.phaseCoherent = haveInfo ? info.phaseCoherent : false;
+        channels.sampleAligned = haveInfo ? info.sampleAligned : true;
+
+        dualChannel = true;
+        sigpath::sourceManager.registerChannels("File", &channels);
+        flog::info("FileSourceModule: 4-channel recording, offering channels '{0}' and '{1}'",
+                   channels.names[0], channels.names[1]);
+    }
+
     double getFrequency(std::string filename) {
         std::regex expr("[0-9]+Hz");
         std::smatch matches;
@@ -260,6 +353,10 @@ private:
     FileSelect fileSelect;
     std::string name;
     dsp::stream<dsp::complex_t> stream;
+    dsp::stream<dsp::complex_t> streamA;
+    dsp::stream<dsp::complex_t> streamB;
+    ChannelSet channels;
+    bool dualChannel = false;
     SourceManager::SourceHandler handler;
     WavReader* reader = NULL;
     bool running = false;

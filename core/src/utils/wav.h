@@ -3,6 +3,8 @@
 #include <fstream>
 #include <stdint.h>
 #include <mutex>
+#include <vector>
+#include <array>
 #include "riff.h"
 
 namespace wav {    
@@ -44,6 +46,12 @@ namespace wav {
         void close();
 
         void setChannels(int channels);
+
+        // Queue a RIFF chunk to be written between "fmt " and "data". Must be called
+        // before open(): open() opens the data chunk immediately after the format chunk,
+        // so there is no way to insert one afterwards. Cleared by close().
+        void addChunk(const char id[4], const void* data, size_t len);
+        void clearChunks();
         void setSamplerate(uint64_t samplerate);
         void setFormat(Format format);
         void setSampleType(SampleType type);
@@ -62,6 +70,8 @@ namespace wav {
         Format _format;
         SampleType _type;
         size_t bytesPerSamp;
+
+        std::vector<std::pair<std::array<char, 4>, std::vector<uint8_t>>> extraChunks;
 
         uint8_t* bufU8 = NULL;
         int16_t* bufI16 = NULL;

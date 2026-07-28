@@ -4,7 +4,7 @@
 //
 //   c++ -std=c++17 -O2 -I<repo>/core/src -I/opt/homebrew/include \
 //       -o /tmp/test_phaser core/test/test_phaser.cpp \
-//       -L<repo>/build -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build
+//       -L<repo>/build/core -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build/core
 //
 // The point of interest is the ring buffering. dsp::Operator, the obvious base class for
 // a two-input block, discards both inputs whenever their counts disagree, and

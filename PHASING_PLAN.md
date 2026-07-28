@@ -409,22 +409,58 @@ Caveats to handle:
   than quadraphonic audio. Sample rate rides in the WAV header; center frequency currently
   only appears in the filename template.
 
-  Embedded rather than a JSON sidecar, for two reasons: the Perseus22 already does it that
-  way, so following suit is the interoperable choice; and these recordings are kept for
-  years, over which a sidecar is exactly the kind of thing that gets separated from its
-  audio by a file move, a copy to another disk, or an archive tool. A chunk cannot be
-  parted from the samples it describes.
+  Embedded rather than a JSON sidecar, because these recordings are kept for years, over
+  which a sidecar is exactly the kind of thing that gets separated from its audio by a file
+  move, a copy to another disk, or an archive tool. Metadata that cannot be parted from the
+  samples it describes is worth a little extra work.
 
-  Follow the `auxi` convention that Perseus, HDSDR, SDR Console and SpectraVue already
-  share, so the recordings open as more than raw quad audio elsewhere. **Do not write the
-  layout from memory** — confirm the exact field order and sizes against the bytes of a
-  real Perseus22 file before implementing. Ralph has an archive of them, which makes this
-  a five-minute check rather than a guess.
+  **What the survey of real files actually showed** (checked rather than assumed, and it
+  contradicted the first draft of this section):
 
-  `auxi` carries a single center frequency and has no concept of per-channel antenna
-  labels or a coherence flag, so the phasing-specific metadata (channel names, `coherent`,
-  which two channels were combined) needs a second, custom chunk alongside it. Keep the
-  standard chunk standard and put our own fields in our own chunk.
+  | Format | Container | Metadata |
+  |---|---|---|
+  | Perseus22 `.p22` | **not RIFF** — proprietary, magic `P22REC013` | fixed binary header, centre frequency as a float64 |
+  | Perseus `.wav` | RIFF | `rcvr` chunk, 34 bytes |
+  | QS1R `.wav` | RIFF | `rcvr` chunk, 38 bytes, with a receiver-name string |
+  | HDSDR / SDR Console / SpectraVue | RIFF | `auxi` chunk, 164 bytes |
+
+  So there is no Perseus22 RIFF chunk to follow — the Perseus22 does embed its metadata,
+  but in a container of its own that has nothing to do with WAV. The decision to embed
+  stands; the choice of *which* chunk has to be made on other grounds.
+
+  **Write `auxi`.** It has the widest reader support of the three, and its layout is now
+  verified rather than recalled, decoded from
+  `HDSDR_20171123_005716Z_1130kHz_RF.wav` with the filename as independent ground truth:
+
+  ```
+  offset  size  field
+     0     16   StartTime   SYSTEMTIME: year, month, dayOfWeek, day, hour, min, sec, ms
+    16     16   StopTime    same layout
+    32      4   CenterFreq  Hz            (read 1130000; filename says 1130kHz)
+    36      4   ADFrequency
+    40      4   IFFrequency
+    44      4   Bandwidth
+    48      4   IQOffset
+    52      4   DBOffset
+    56      4   MaxVal
+    60      4   (repeat of centre frequency in the sample examined)
+    64      4   unused
+    68    ...   NUL-terminated name of the next file in a split recording
+  total 164 bytes
+  ```
+
+  Start time 2017-11-23 00:57:16, day-of-week 4 (a Thursday, which it was), and centre
+  frequency 1130000 all agree with the filename, so the field offsets are not in doubt.
+
+  `auxi` carries a single centre frequency and has no concept of per-channel antenna
+  labels or a coherence flag — it predates anyone recording two antennas at once. The
+  phasing-specific metadata (channel names, `coherent`, which two channels were combined)
+  therefore needs a second, custom chunk alongside it. Keep the standard chunk standard and
+  put our own fields in our own chunk, so other software still reads what it can.
+
+  Not in scope, but worth noting for later: reading `.p22` directly would let a Perseus22
+  recording be re-phased in SDR++, which is a genuinely attractive feature. It is a
+  separate project — a proprietary container reader, not a chunk.
 
   Implementation is small and already supported: `riff::Writer` has
   `beginChunk`/`write`/`endChunk` (`core/src/utils/riff.h`). The one constraint is
@@ -469,7 +505,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 |---|---|---|---|
 | **0** | Synthetic source | No | **Done** — `source_modules/phasing_test_source/`. Two-channel signal generator: wanted tone + interferer at a settable inter-channel gain/phase, fractional channel-B delay, independent per-channel noise, A/B swap, and a built-in scalar test combiner so the module is self-verifying before the real phaser exists. Signal maths lives in `src/signal_model.h` (no SDR++ dependency) and is covered by `test/test_signal_model.cpp`; the worker/stream lifecycle is covered by `test/test_worker.cpp`. |
 | **1** | Core plumbing | No | **Done** — `ChannelSet` registry in `SourceManager`, the `Phasing` front end (`core/src/signal_path/phasing.*`) owning a splitter per channel plus `bindChannelStream`, `dsp::combine::Phaser` (scalar, manual, own accumulation buffers), `selectSource()` wiring, bypassed by default via `MODE_A_ONLY`. Covered by `core/test/test_phaser.cpp` and `core/test/test_phasing.cpp`. The Phase 0 source gained a "Dual channel" mode that registers a `ChannelSet`. Confirmed live: with the source in dual channel mode the waterfall is indistinguishable from plain channel A, with no gaps or audible stutter. |
-| **2** | Dual-channel I/O | No | 4-channel recording (recorder checkbox + sidecar metadata) and dual-channel `file_source` playback with `registerChannels()`. Record the synthetic source, play it back, confirm round-trip fidelity. |
+| **2** | Dual-channel I/O | No | **Done** — `wav::Writer` gained `addChunk()`; `core/src/utils/wav_meta.h` writes a verified `auxi` plus our `sdpc` chunk; the recorder has a "Record both channels" option writing I1 Q1 I2 Q2 with a MB/min estimate; `file_source` detects a 4-channel file and registers a `ChannelSet` so the phasing path lights up on playback. The two-input synchronisation the recorder needed was extracted from `Phaser` into `dsp::combine::ChannelSync` and is now shared. Covered by `core/test/test_wav_meta.cpp`; run everything with `core/test/run_tests.sh`. |
 | **3** | UI module | No | `misc_modules/phasing/`, manual gain/phase/swap/delay, null-depth meter, monitor select, config persistence. **First user-visible release.** Fully exercisable against synthetic material. |
 | **4** | Auto-null | No | Block Wiener, adaptation rate, Freeze, reference-band selector. Convergence is measurable against a known synthetic weight — better ground truth than any on-air test. |
 | **5** | Wideband | No | Multi-tap frequency-domain weight; retires the fractional-delay control. Validated against the synthetic source's delay/frequency-tilt settings. |
@@ -531,9 +567,9 @@ other misc modules; the core pieces (registry, phaser block) are unconditional b
 - **Interaction with `IQFrontEnd`'s DC blocker and conjugate stage.** Both run
   downstream of the phaser and should be harmless, but the DC blocker's adaptation may
   interact with a rapidly-changing weight during auto-null convergence. Check in Phase 4.
-- **Exact `auxi` chunk layout (§4.2).** The container question is settled; the field
-  layout is not, and it must not be reconstructed from memory. Verify against a real
-  Perseus22 recording during Phase 2.
+- **A custom chunk id for the phasing metadata (§4.2).** `auxi` covers centre frequency
+  and timing; channel names, the coherence flag and which pair was combined need a chunk of
+  our own. The id should be unlikely to collide with anything else in the wild.
 
 **Working assumptions (deliberate, revisit only if contradicted):**
 
@@ -544,7 +580,8 @@ other misc modules; the core pieces (registry, phaser block) are unconditional b
 
 **Resolved:** headless/server phasing support is out of scope (§2.3). Dual-channel
 recording for offline re-phasing is in scope, now Phase 2 (§4), and its metadata goes in an
-embedded RIFF chunk following the `auxi` convention rather than a sidecar (§4.2). Hardware
+embedded RIFF chunks -- a verified `auxi` plus a custom one for the phasing fields --
+rather than a sidecar (§4.2). Hardware
 access is not on the critical path — Phases 0–5 are developed against a synthetic
 two-channel source (§5).
 
@@ -563,6 +600,6 @@ rediscovered at the last minute.
 - **Say the wideband limitation out loud in the UI** (§2.5). Until the multi-tap weight of
   Phase 6 lands, a null-depth meter reading 45 dB at the VFO while the rest of the band
   barely moves is correct behaviour, and without a word of explanation it reads as a bug.
-- **Verify the `auxi` layout against a real Perseus22 file** before the first dual-channel
-  recording exists, since every capture made afterwards has to stay compatible with
-  whatever gets written first (§4.2).
+- **Freeze the custom phasing chunk's layout** before the first dual-channel recording
+  exists, since every capture made afterwards has to stay readable by the same parser
+  (§4.2). The `auxi` half is already pinned down against real files.

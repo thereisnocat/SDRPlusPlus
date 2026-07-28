@@ -1,6 +1,7 @@
 #pragma once
 #include "../block.h"
 #include "../buffer/buffer.h"
+#include "channel_sync.h"
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -21,10 +22,10 @@ namespace dsp::combine {
     // Deliberately NOT built on dsp::Operator. Operator::run() reads both inputs and, if
     // the counts disagree, flushes both and returns 0 -- silently discarding samples --
     // and dsp::stream::flush() is all-or-nothing with no partial-consumption path. Two
-    // upstream resamplers emitting different block sizes would therefore glitch. This
-    // block keeps its own accumulation buffers and consumes min(availA, availB) per pass,
-    // retaining the remainder. discardCount is instrumented so a test can assert that
-    // nothing was ever dropped.
+    // upstream resamplers emitting different block sizes would therefore glitch. It
+    // delegates to ChannelSync, which accumulates per channel and hands back only what
+    // both can supply, and instruments a discard count so a test can assert that nothing
+    // was ever dropped.
     class Phaser : public block {
     public:
         enum Mode {
@@ -46,18 +47,13 @@ namespace dsp::combine {
         virtual ~Phaser() {
             if (!_block_init) { return; }
             stop();
-            buffer::free(bufA);
-            buffer::free(bufB);
             _block_init = false;
         }
 
         void init(stream<complex_t>* a, stream<complex_t>* b) {
             _a = a;
             _b = b;
-            bufA = buffer::alloc<complex_t>(CAPACITY);
-            bufB = buffer::alloc<complex_t>(CAPACITY);
-            sizeA = 0;
-            sizeB = 0;
+            sync.init(2);
             registerInput(_a);
             registerInput(_b);
             registerOutput(&out);
@@ -74,8 +70,7 @@ namespace dsp::combine {
             _b = b;
             registerInput(_a);
             registerInput(_b);
-            sizeA = 0;
-            sizeB = 0;
+            sync.reset();
             tempStart();
         }
 
@@ -133,16 +128,14 @@ namespace dsp::combine {
         // Samples dropped because an input ran far enough ahead to overrun the holding
         // buffer. Must stay at zero in normal operation; a non-zero value means the two
         // channels are badly out of step, not merely block-misaligned.
-        uint64_t getDiscardCount() { return discardCount.load(std::memory_order_relaxed); }
+        uint64_t getDiscardCount() { return sync.discardCount(); }
 
         // Only safe while the block is stopped, or from inside tempStop/tempStart.
         void reset() {
             assert(_block_init);
             std::lock_guard<std::recursive_mutex> lck(ctrlMtx);
             tempStop();
-            sizeA = 0;
-            sizeB = 0;
-            discardCount.store(0, std::memory_order_relaxed);
+            sync.reset();
             {
                 std::lock_guard<std::mutex> lck2(paramMtx);
                 _current = _target;
@@ -151,37 +144,22 @@ namespace dsp::combine {
         }
 
         int run() {
-            // Top up whichever channel is behind, rather than reading one buffer from
-            // each per pass. Reading both in lockstep would require the two inputs to
-            // deliver the same *number of reads*, not merely the same number of samples:
-            // a channel arriving in 4800-sample blocks would run dry while one arriving
-            // in 3000-sample blocks still had data queued, and this block would then wait
-            // forever on the exhausted side while the other backed up behind it.
-            //
-            // Reading only the shorter side also bounds the buffers -- neither can get
-            // more than one read ahead of the other -- and leaves the upstream
-            // backpressure intact.
-            if (sizeA <= sizeB) {
-                const int c = _a->read();
-                if (c < 0) { return -1; }
-                accumulate(bufA, sizeA, _a->readBuf, c);
-                _a->flush();
-            }
-            else {
-                const int c = _b->read();
-                if (c < 0) { return -1; }
-                accumulate(bufB, sizeB, _b->readBuf, c);
-                _b->flush();
-            }
+            // Top up whichever channel is behind rather than reading one buffer from each
+            // per pass; ChannelSync explains why that distinction matters.
+            const int ch = sync.nextChannel();
+            stream<complex_t>* in = ch ? _b : _a;
+
+            const int c = in->read();
+            if (c < 0) { return -1; }
+            sync.feed(ch, in->readBuf, c);
+            in->flush();
 
             // Only as much as both channels can supply; the surplus stays buffered.
-            const int count = std::min(sizeA, sizeB);
+            const int count = sync.available();
             if (count <= 0) { return 0; }
 
-            process(count, bufA, bufB, out.writeBuf);
-
-            consume(bufA, sizeA, count);
-            consume(bufB, sizeB, count);
+            process(count, sync.data(0), sync.data(1), out.writeBuf);
+            sync.consume(count);
 
             if (!out.swap(count)) { return -1; }
             return count;
@@ -190,41 +168,6 @@ namespace dsp::combine {
         stream<complex_t> out;
 
     protected:
-        // Holding capacity per channel. A single upstream read can be as large as
-        // STREAM_BUFFER_SIZE, so this has to be at least that; in practice sources write
-        // blocks a few thousand samples long and the retained remainder is tiny.
-        static const int CAPACITY = STREAM_BUFFER_SIZE;
-
-        void accumulate(complex_t* buf, int& size, const complex_t* src, int count) {
-            if (count <= 0) { return; }
-
-            if (count >= CAPACITY) {
-                // Pathological: one read alone fills the buffer. Keep the newest.
-                discardCount.fetch_add(size + (count - CAPACITY), std::memory_order_relaxed);
-                memcpy(buf, src + (count - CAPACITY), CAPACITY * sizeof(complex_t));
-                size = CAPACITY;
-                return;
-            }
-
-            if (size + count > CAPACITY) {
-                // Drop the oldest held samples to make room. Dropping the oldest rather
-                // than the newest keeps the two channels as close to aligned as possible.
-                const int over = size + count - CAPACITY;
-                discardCount.fetch_add(over, std::memory_order_relaxed);
-                memmove(buf, buf + over, (size - over) * sizeof(complex_t));
-                size -= over;
-            }
-
-            memcpy(buf + size, src, count * sizeof(complex_t));
-            size += count;
-        }
-
-        static void consume(complex_t* buf, int& size, int count) {
-            const int left = size - count;
-            if (left > 0) { memmove(buf, buf + count, left * sizeof(complex_t)); }
-            size = left;
-        }
-
         void process(int count, const complex_t* a, const complex_t* b, complex_t* outBuf) {
             Mode mode;
             complex_t target;
@@ -281,11 +224,7 @@ namespace dsp::combine {
 
         stream<complex_t>* _a = NULL;
         stream<complex_t>* _b = NULL;
-
-        complex_t* bufA = NULL;
-        complex_t* bufB = NULL;
-        int sizeA = 0;
-        int sizeB = 0;
+        ChannelSync sync;
 
         std::mutex paramMtx;
         Mode _mode = MODE_A_ONLY;
@@ -299,6 +238,5 @@ namespace dsp::combine {
         std::atomic<float> powerA{ 0.0f };
         std::atomic<float> powerB{ 0.0f };
         std::atomic<float> powerOut{ 0.0f };
-        std::atomic<uint64_t> discardCount{ 0 };
     };
 }

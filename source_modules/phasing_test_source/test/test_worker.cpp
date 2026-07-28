@@ -6,7 +6,7 @@
 //
 //   c++ -std=c++17 -O2 -I<repo>/core/src -I/opt/homebrew/include \
 //       -o /tmp/worker_test test/test_worker.cpp \
-//       -L<repo>/build -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build
+//       -L<repo>/build/core -lsdrpp_core -L/opt/homebrew/lib -lvolk -Wl,-rpath,<repo>/build/core
 //
 #include <dsp/types.h>
 #include <dsp/stream.h>

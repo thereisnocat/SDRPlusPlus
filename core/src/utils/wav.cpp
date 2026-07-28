@@ -76,6 +76,13 @@ namespace wav {
         rw.write((uint8_t*)&hdr, sizeof(FormatHeader));
         rw.endChunk();
 
+        // Any extra metadata chunks, which have to land between "fmt " and "data"
+        for (auto& [id, data] : extraChunks) {
+            rw.beginChunk(id.data());
+            if (!data.empty()) { rw.write(data.data(), data.size()); }
+            rw.endChunk();
+        }
+
         // Begin data chunk
         rw.beginChunk(DATA_MARKER);
         
@@ -111,6 +118,18 @@ namespace wav {
             dsp::buffer::free(bufI32);
             bufI32 = NULL;
         }
+    }
+
+    void Writer::addChunk(const char id[4], const void* data, size_t len) {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        std::array<char, 4> cid{ id[0], id[1], id[2], id[3] };
+        const uint8_t* p = (const uint8_t*)data;
+        extraChunks.push_back({ cid, std::vector<uint8_t>(p, p + len) });
+    }
+
+    void Writer::clearChunks() {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        extraChunks.clear();
     }
 
     void Writer::setChannels(int channels) {

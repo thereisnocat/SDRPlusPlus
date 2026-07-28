@@ -21,6 +21,8 @@
 #include <core.h>
 #include <utils/optionlist.h>
 #include <utils/wav.h>
+#include <utils/wav_meta.h>
+#include <dsp/combine/channel_sync.h>
 #include <radio_interface.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -94,6 +96,9 @@ public:
         }
         if (config.conf[name].contains("ignoreSilence")) {
             ignoreSilence = config.conf[name]["ignoreSilence"];
+        }
+        if (config.conf[name].contains("recordDualChannel")) {
+            recordDualChannel = config.conf[name]["recordDualChannel"];
         }
         if (config.conf[name].contains("nameTemplate")) {
             std::string _nameTemplate = config.conf[name]["nameTemplate"];
@@ -175,10 +180,44 @@ public:
         else {
             samplerate = sigpath::iqFrontEnd.getSampleRate();
         }
+        // Dual channel capture records the raw channels upstream of the phaser, so the
+        // recording can be re-phased later. Two complex channels interleave into four WAV
+        // channels: I1 Q1 I2 Q2.
+        recordingDual = (recMode == RECORDER_MODE_BASEBAND) && recordDualChannel && sigpath::phasing.isActive();
+
         writer.setFormat(containers[containerId]);
-        writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
+        if (recordingDual) {
+            writer.setChannels(4);
+        }
+        else {
+            writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
+        }
         writer.setSampleType(sampleTypes[sampleTypeId]);
         writer.setSamplerate(samplerate);
+
+        // Metadata chunks, which have to be queued before open()
+        writer.clearChunks();
+        if (recMode == RECORDER_MODE_BASEBAND) {
+            const std::time_t now = std::time(NULL);
+            wavmeta::AuxiChunk auxi = wavmeta::makeAuxi(gui::waterfall.getCenterFrequency(), samplerate, now, now);
+            writer.addChunk("auxi", &auxi, sizeof(auxi));
+
+            if (recordingDual) {
+                wavmeta::PhasingInfo info;
+                info.channelCount = 2;
+                info.phaseCoherent = sigpath::phasing.isPhaseCoherent();
+                info.sampleAligned = sigpath::phasing.isSampleAligned();
+                int a = 0, b = 1;
+                sigpath::phasing.getChannelPair(a, b);
+                info.combinedA = 0;
+                info.combinedB = 1;
+                info.names = { sigpath::phasing.getChannelName(a), sigpath::phasing.getChannelName(b) };
+                dualChA = a;
+                dualChB = b;
+                auto blob = wavmeta::serializePhasing(info);
+                writer.addChunk(wavmeta::PHASING_CHUNK_ID, blob.data(), blob.size());
+            }
+        }
 
         // Open file
         std::string vfoName = (recMode == RECORDER_MODE_AUDIO) ? selectedStreamName : "";
@@ -200,6 +239,17 @@ public:
                 monoSink.start();
             }
             splitter.bindStream(&stereoStream);
+        }
+        else if (recordingDual) {
+            // Tap the two raw channels upstream of the combining.
+            dualA = new dsp::stream<dsp::complex_t>();
+            dualB = new dsp::stream<dsp::complex_t>();
+            dualSync.init(2);
+            dualBuf.resize(4 * STREAM_BUFFER_SIZE);
+            sigpath::phasing.bindChannelStream(dualChA, dualA);
+            sigpath::phasing.bindChannelStream(dualChB, dualB);
+            dualRun = true;
+            dualThread = std::thread(&RecorderModule::dualWorker, this);
         }
         else {
             // Create and bind IQ stream
@@ -224,6 +274,19 @@ public:
             s2m.stop();
             
         }
+        else if (recordingDual) {
+            dualRun = false;
+            dualA->stopReader();
+            dualB->stopReader();
+            if (dualThread.joinable()) { dualThread.join(); }
+            sigpath::phasing.unbindChannelStream(dualChA, dualA);
+            sigpath::phasing.unbindChannelStream(dualChB, dualB);
+            delete dualA;
+            delete dualB;
+            dualA = NULL;
+            dualB = NULL;
+            recordingDual = false;
+        }
         else {
             // Unbind and destroy IQ stream
             sigpath::iqFrontEnd.unbindIQStream(basebandStream);
@@ -238,6 +301,44 @@ public:
     }
 
 private:
+    // Interleaves the two raw channels into I1 Q1 I2 Q2 frames and writes them.
+    //
+    // The two taps come from separate splitters, so although a source normally writes the
+    // same block size to every channel, nothing in the contract guarantees it. ChannelSync
+    // handles the general case: read whichever channel is behind, and write only what both
+    // can supply. Reading one buffer from each per pass would deadlock the moment the two
+    // delivered different block sizes.
+    void dualWorker() {
+        while (dualRun) {
+            const int ch = dualSync.nextChannel();
+            dsp::stream<dsp::complex_t>* in = ch ? dualB : dualA;
+
+            const int c = in->read();
+            if (c < 0) { break; }
+            dualSync.feed(ch, in->readBuf, c);
+            in->flush();
+
+            const int count = dualSync.available();
+            if (count <= 0) { continue; }
+
+            const dsp::complex_t* a = dualSync.data(0);
+            const dsp::complex_t* b = dualSync.data(1);
+            for (int i = 0; i < count; i++) {
+                dualBuf[4 * i + 0] = a[i].re;
+                dualBuf[4 * i + 1] = a[i].im;
+                dualBuf[4 * i + 2] = b[i].re;
+                dualBuf[4 * i + 3] = b[i].im;
+            }
+
+            {
+                std::lock_guard<std::recursive_mutex> lck(recMtx);
+                if (writer.isOpen()) { writer.write(dualBuf.data(), count); }
+            }
+            dualSync.consume(count);
+            samplesWritten += count;
+        }
+    }
+
     static void menuHandler(void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
         float menuWidth = ImGui::GetContentRegionAvail().x;
@@ -301,6 +402,30 @@ private:
             config.acquire();
             config.conf[_this->name]["sampleType"] = _this->sampleTypes.key(_this->sampleTypeId);
             config.release(true);
+        }
+
+        // Dual channel capture, offered only when the selected source actually has
+        // channels to capture.
+        if (_this->recMode == RECORDER_MODE_BASEBAND && sigpath::phasing.isActive()) {
+            if (ImGui::Checkbox(CONCAT("Record both channels##_recorder_dual_", _this->name), &_this->recordDualChannel)) {
+                config.acquire();
+                config.conf[_this->name]["recordDualChannel"] = _this->recordDualChannel;
+                config.release(true);
+            }
+            if (_this->recordDualChannel) {
+                // Tell the user the cost before they fill a disk rather than after. The
+                // effective lever is the sample rate, not the sample type.
+                const double sr = (double)sigpath::iqFrontEnd.getSampleRate();
+                int bytesPerSamp = 2;
+                switch (_this->sampleTypes[_this->sampleTypeId]) {
+                    case wav::SAMP_TYPE_UINT8:   bytesPerSamp = 1; break;
+                    case wav::SAMP_TYPE_INT16:   bytesPerSamp = 2; break;
+                    case wav::SAMP_TYPE_INT32:   bytesPerSamp = 4; break;
+                    case wav::SAMP_TYPE_FLOAT32: bytesPerSamp = 4; break;
+                }
+                const double mbPerMin = sr * 4.0 * bytesPerSamp * 60.0 / 1e6;
+                ImGui::TextWrapped("4 channels (I1 Q1 I2 Q2), about %.0f MB/min", mbPerMin);
+            }
         }
 
         if (_this->recording) { style::endDisabled(); }
@@ -602,6 +727,18 @@ private:
 
     bool recording = false;
     bool ignoringSilence = false;
+
+    // Dual channel (phasing) capture
+    bool recordDualChannel = false;
+    bool recordingDual = false;
+    int dualChA = 0, dualChB = 1;
+    dsp::stream<dsp::complex_t>* dualA = NULL;
+    dsp::stream<dsp::complex_t>* dualB = NULL;
+    dsp::combine::ChannelSync dualSync;
+    std::vector<float> dualBuf;
+    std::thread dualThread;
+    std::atomic<bool> dualRun{ false };
+    std::atomic<uint64_t> samplesWritten{ 0 };
     wav::Writer writer;
     std::recursive_mutex recMtx;
     dsp::stream<dsp::complex_t>* basebandStream;

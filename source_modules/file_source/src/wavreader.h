@@ -4,6 +4,9 @@
 #include <string.h>
 #include <algorithm>
 #include <fstream>
+#include <map>
+#include <vector>
+#include <string>
 
 class WavReader {
 public:
@@ -37,6 +40,15 @@ public:
                     foundFmt = true;
                 }
             }
+            else if (memcmp(chunkId, "auxi", 4) == 0 || memcmp(chunkId, "sdpc", 4) == 0) {
+                // Metadata chunks are small; keep them so the caller can read the centre
+                // frequency and, for dual channel recordings, the channel description.
+                if (chunkSize > 0 && chunkSize <= (1u << 16)) {
+                    std::vector<uint8_t> buf(chunkSize);
+                    file.read((char*)buf.data(), chunkSize);
+                    chunks[std::string(chunkId, 4)] = std::move(buf);
+                }
+            }
             else if (memcmp(chunkId, "data", 4) == 0) {
                 _dataOffset = static_cast<size_t>(chunkDataPos);
                 // Use actual file size to handle >4GB files where the 32-bit
@@ -66,6 +78,12 @@ public:
 
     uint16_t getChannelCount() {
         return fmt.channelCount;
+    }
+
+    // Returns NULL if the file carries no such chunk.
+    const std::vector<uint8_t>* getChunk(const char* id) const {
+        auto it = chunks.find(std::string(id, 4));
+        return (it == chunks.end()) ? NULL : &it->second;
     }
 
     uint32_t getSampleRate() {
@@ -137,6 +155,7 @@ private:
     size_t bytesRead = 0;
 
     FormatHeader fmt = {};
+    std::map<std::string, std::vector<uint8_t>> chunks;
     size_t _dataOffset = 0;
     uint64_t _dataSize = 0;
 };
