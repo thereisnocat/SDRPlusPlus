@@ -121,9 +121,18 @@ Event<std::string> onChannelsUnregistered;
 ```
 
 Sources that never call `registerChannels` behave exactly as today. `selectSource()`
-gains one branch: if the selected source has a `ChannelSet` **and** the phaser is
-enabled, wire `set->streams[a]` and `set->streams[b]` into the phaser and pass
-`phaser.out` to the frontend; otherwise pass `handler->stream` as before.
+gains one branch: if the selected source has a `ChannelSet`, wire its streams through the
+phaser and pass the phaser's output to the frontend; otherwise pass `handler->stream` as
+before.
+
+**Correction made during Phase 1:** this section originally said the branch should also
+test whether the phaser is *enabled*, with phasing switched out of the path entirely when
+off. That does not work. With a `ChannelSet` registered the source is writing to its
+channel streams, and an unread `dsp::stream` blocks its writer on the second swap — so
+"unwiring" the phaser would stall the source's worker outright. Bypass is therefore a
+*mode*, `Phaser::MODE_A_ONLY`, in which the output is a straight copy of channel A. That
+is bit-identical to the source having emitted that channel directly, which is exactly
+what it did before, and it is verified as such in `core/test/test_phaser.cpp`.
 
 Design for N channels in the struct even though we only combine 2 at first — a 4-port
 receiver is a plausible future and the registry shouldn't need re-cutting.
@@ -437,7 +446,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | Phase | Scope | Needs hardware? | Deliverable |
 |---|---|---|---|
 | **0** | Synthetic source | No | **Done** — `source_modules/phasing_test_source/`. Two-channel signal generator: wanted tone + interferer at a settable inter-channel gain/phase, fractional channel-B delay, independent per-channel noise, A/B swap, and a built-in scalar test combiner so the module is self-verifying before the real phaser exists. Signal maths lives in `src/signal_model.h` (no SDR++ dependency) and is covered by `test/test_signal_model.cpp`; the worker/stream lifecycle is covered by `test/test_worker.cpp`. |
-| **1** | Core plumbing | No | `ChannelSet` registry **including per-channel splitters and `bindChannelStream` (§4.1)**, `dsp::combine::Phaser` (scalar, manual only, with ring buffers), `selectSource()` wiring, bypassed by default. Testable end-to-end against Phase 0. |
+| **1** | Core plumbing | No | **Done** — `ChannelSet` registry in `SourceManager`, the `Phasing` front end (`core/src/signal_path/phasing.*`) owning a splitter per channel plus `bindChannelStream`, `dsp::combine::Phaser` (scalar, manual, own accumulation buffers), `selectSource()` wiring, bypassed by default via `MODE_A_ONLY`. Covered by `core/test/test_phaser.cpp` and `core/test/test_phasing.cpp`. The Phase 0 source gained a "Dual channel" mode that registers a `ChannelSet`. |
 | **2** | Dual-channel I/O | No | 4-channel recording (recorder checkbox + sidecar metadata) and dual-channel `file_source` playback with `registerChannels()`. Record the synthetic source, play it back, confirm round-trip fidelity. |
 | **3** | UI module | No | `misc_modules/phasing/`, manual gain/phase/swap/delay, null-depth meter, monitor select, config persistence. **First user-visible release.** Fully exercisable against synthetic material. |
 | **4** | Auto-null | No | Block Wiener, adaptation rate, Freeze, reference-band selector. Convergence is measurable against a known synthetic weight — better ground truth than any on-air test. |

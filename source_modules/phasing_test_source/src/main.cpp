@@ -67,11 +67,21 @@ public:
         handler.tuneHandler = tune;
         handler.stream = &out;
 
+        // The two raw channels, offered to core for phasing. Only registered while dual
+        // channel mode is on; otherwise this behaves as an ordinary single-stream source.
+        channels.count = 2;
+        channels.streams = { &outA, &outB };
+        channels.names = { "A", "B" };
+        channels.phaseCoherent = true;
+        channels.sampleAligned = true;
+
         sigpath::sourceManager.registerSource("Phasing Test", &handler);
+        if (dualChannel) { sigpath::sourceManager.registerChannels("Phasing Test", &channels); }
     }
 
     ~PhasingTestSourceModule() {
         stop(this);
+        sigpath::sourceManager.unregisterChannels("Phasing Test");
         sigpath::sourceManager.unregisterSource("Phasing Test");
     }
 
@@ -106,6 +116,9 @@ private:
         // 5ms blocks, bounded so neither end of the samplerate list gives a silly size.
         _this->blockSize = std::clamp<int>((int)(_this->params.sampleRate / 200.0), 256, STREAM_BUFFER_SIZE / 2);
         _this->gen.reset();
+        // Fixed for the duration of the run: the mode selector is disabled while running,
+        // because switching it changes which streams the worker writes to.
+        _this->runDual = _this->dualChannel;
 
         _this->run = true;
         _this->workerThread = std::thread(&PhasingTestSourceModule::worker, _this);
@@ -121,8 +134,12 @@ private:
 
         _this->run = false;
         _this->out.stopWriter();
+        _this->outA.stopWriter();
+        _this->outB.stopWriter();
         if (_this->workerThread.joinable()) { _this->workerThread.join(); }
         _this->out.clearWriteStop();
+        _this->outA.clearWriteStop();
+        _this->outB.clearWriteStop();
 
         flog::info("PhasingTestSourceModule '{0}': Stop!", _this->name);
     }
@@ -143,9 +160,17 @@ private:
 
             // dsp::complex_t is two floats, so the stream buffer is an interleaved
             // (re, im) float array as far as the generator is concerned.
-            gen.generate(p, blockSize, (float*)out.writeBuf);
-
-            if (!out.swap(blockSize)) { break; }
+            if (runDual) {
+                gen.generateDual(p, blockSize, (float*)outA.writeBuf, (float*)outB.writeBuf);
+                // Swapped in the order the phaser reads them, so neither side of the
+                // graph is left waiting on the other.
+                if (!outA.swap(blockSize)) { break; }
+                if (!outB.swap(blockSize)) { break; }
+            }
+            else {
+                gen.generate(p, blockSize, (float*)out.writeBuf);
+                if (!out.swap(blockSize)) { break; }
+            }
 
             // Pace to real time. Without this the generator would spin as fast as the
             // FFT path can consume it, which is neither a useful test condition nor a
@@ -179,7 +204,25 @@ private:
             core::setInputSampleRate(_this->samplerates.value(_this->srId));
             dirty = true;
         }
+        // Dual channel mode hands both raw channels to core's phasing front end instead
+        // of emitting one combined stream. Disabled while running because it changes
+        // which streams the worker writes and rebuilds the signal path.
+        if (!_this->running) { SmGui::ForceSync(); }
+        if (SmGui::Checkbox(CONCAT("Dual channel (phasing)##_phtest_dual_", _this->name), &_this->dualChannel)) {
+            if (_this->dualChannel) {
+                sigpath::sourceManager.registerChannels("Phasing Test", &_this->channels);
+            }
+            else {
+                sigpath::sourceManager.unregisterChannels("Phasing Test");
+            }
+            dirty = true;
+        }
         if (_this->running) { SmGui::EndDisabled(); }
+
+        if (_this->dualChannel) {
+            SmGui::Text("Channels A and B go to the phasing front end.");
+            SmGui::Text("The test combiner below is bypassed.");
+        }
 
         // -- Wanted signal -----------------------------------------------------
         SmGui::Text("Wanted signal");
@@ -379,6 +422,7 @@ private:
         if (c.contains("view")) { viewId = c["view"]; }
         if (c.contains("combGain")) { combGainF = c["combGain"]; }
         if (c.contains("combPhase")) { combPhaseF = c["combPhase"]; }
+        if (c.contains("dualChannel")) { dualChannel = c["dualChannel"]; }
         config.release();
 
         // Mirror the GUI-facing values into the worker's parameter block.
@@ -424,6 +468,7 @@ private:
         c["view"] = viewId;
         c["combGain"] = combGainF;
         c["combPhase"] = combPhaseF;
+        c["dualChannel"] = dualChannel;
         config.release(true);
     }
 
@@ -434,6 +479,13 @@ private:
 
     SourceManager::SourceHandler handler;
     dsp::stream<dsp::complex_t> out;
+
+    // Dual channel mode: the two raw channels, plus the set describing them to core.
+    dsp::stream<dsp::complex_t> outA;
+    dsp::stream<dsp::complex_t> outB;
+    ChannelSet channels;
+    bool dualChannel = false;
+    bool runDual = false;
 
     OptionList<int, double> samplerates;
     int srId = 0;

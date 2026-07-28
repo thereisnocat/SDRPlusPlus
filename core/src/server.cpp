@@ -87,6 +87,10 @@ namespace server {
         // Initialize SmGui in server mode
         SmGui::init(true);
 
+        // Must be ready before any source module is loaded, since a source may declare
+        // its channels as soon as it is instantiated.
+        sigpath::phasing.init();
+
         flog::info("Loading modules");
         // Load modules and check type to only load sources ( TODO: Have a proper type parameter int the info )
         // TODO LATER: Add whitelist/blacklist stuff

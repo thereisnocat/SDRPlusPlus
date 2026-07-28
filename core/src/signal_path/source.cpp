@@ -26,11 +26,67 @@ void SourceManager::unregisterSource(std::string name) {
         if (selectedHandler != NULL) {
             sources[selectedName]->deselectHandler(sources[selectedName]->ctx);
         }
-        sigpath::iqFrontEnd.setInput(&nullSource);
         selectedHandler = NULL;
     }
     sources.erase(name);
+    channelSets.erase(name);
+    if (name == selectedName) {
+        // Detaches phasing and falls back to the null source.
+        updateInput();
+    }
     onSourceUnregistered.emit(name);
+}
+
+void SourceManager::registerChannels(const std::string& name, ChannelSet* set) {
+    if (set == NULL || set->count < 2) {
+        flog::error("Tried to register a channel set with fewer than 2 channels for source: {0}", name);
+        return;
+    }
+    if ((int)set->streams.size() < set->count) {
+        flog::error("Channel set for source '{0}' claims {1} channels but supplies {2} streams",
+                    name, set->count, (int)set->streams.size());
+        return;
+    }
+    channelSets[name] = set;
+    if (name == selectedName) { updateInput(); }
+    onChannelsRegistered.emit(name);
+}
+
+void SourceManager::unregisterChannels(const std::string& name) {
+    if (channelSets.find(name) == channelSets.end()) { return; }
+    channelSets.erase(name);
+    if (name == selectedName) { updateInput(); }
+    onChannelsUnregistered.emit(name);
+}
+
+ChannelSet* SourceManager::getChannels(const std::string& name) {
+    auto it = channelSets.find(name);
+    return (it == channelSets.end()) ? NULL : it->second;
+}
+
+void SourceManager::updateInput() {
+    ChannelSet* set = getChannels(selectedName);
+    sigpath::phasing.setChannelSet(set);
+
+    dsp::stream<dsp::complex_t>* input;
+    if (sigpath::phasing.isActive()) {
+        // The source is writing to its channel streams; the combined result is what the
+        // rest of the application sees. Bypass is Phaser::MODE_A_ONLY, not a rewiring.
+        input = sigpath::phasing.getOutput();
+    }
+    else if (selectedHandler != NULL) {
+        input = selectedHandler->stream;
+    }
+    else {
+        input = &nullSource;
+    }
+
+    if (core::args["server"].b()) {
+        server::setInput(input);
+    }
+    else {
+        sigpath::iqFrontEnd.setInput(input);
+    }
 }
 
 std::vector<std::string> SourceManager::getSourceNames() {
@@ -50,13 +106,7 @@ void SourceManager::selectSource(std::string name) {
     selectedHandler = sources[name];
     selectedHandler->selectHandler(selectedHandler->ctx);
     selectedName = name;
-    if (core::args["server"].b()) {
-        server::setInput(selectedHandler->stream);
-    }
-    else {
-        sigpath::iqFrontEnd.setInput(selectedHandler->stream);
-    }
-    // Set server input here
+    updateInput();
 }
 
 void SourceManager::showSelectedMenu() {

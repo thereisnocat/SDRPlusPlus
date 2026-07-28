@@ -5,6 +5,7 @@
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <utils/event.h>
+#include "channel_set.h"
 
 class SourceManager {
 public:
@@ -28,6 +29,15 @@ public:
 
     void registerSource(std::string name, SourceHandler* handler);
     void unregisterSource(std::string name);
+
+    // Declare that a source can offer several coherent channels for phasing. Additive
+    // and optional: a source that never calls this behaves exactly as it always has.
+    // The set must stay valid until unregistered, and because registering rebuilds the
+    // signal path, changes should be made while the source is stopped.
+    void registerChannels(const std::string& name, ChannelSet* set);
+    void unregisterChannels(const std::string& name);
+    ChannelSet* getChannels(const std::string& name);
+
     void selectSource(std::string name);
     void showSelectedMenu();
     void start();
@@ -42,10 +52,17 @@ public:
     Event<std::string> onSourceRegistered;
     Event<std::string> onSourceUnregister;
     Event<std::string> onSourceUnregistered;
+    Event<std::string> onChannelsRegistered;
+    Event<std::string> onChannelsUnregistered;
     Event<double> onRetune;
 
 private:
+    // Point the IQ front end at either the phaser's output or the source's own stream,
+    // depending on whether the selected source currently offers channels.
+    void updateInput();
+
     std::map<std::string, SourceHandler*> sources;
+    std::map<std::string, ChannelSet*> channelSets;
     std::string selectedName;
     SourceHandler* selectedHandler = NULL;
     double tuneOffset;

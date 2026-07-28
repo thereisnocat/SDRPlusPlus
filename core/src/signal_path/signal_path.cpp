@@ -4,5 +4,6 @@ namespace sigpath {
     IQFrontEnd iqFrontEnd;
     VFOManager vfoManager;
     SourceManager sourceManager;
+    Phasing phasing;
     SinkManager sinkManager;
 };

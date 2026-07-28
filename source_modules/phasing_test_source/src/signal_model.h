@@ -151,7 +151,23 @@ namespace phtest {
 
         // Writes `count` interleaved (re, im) float pairs, i.e. 2*count floats.
         // dsp::complex_t is layout-compatible, so callers pass (float*)stream.writeBuf.
+        // Applies the view selection and the test combiner.
         void generate(const Params& p, int count, float* out) {
+            run<false>(p, count, out, NULL);
+        }
+
+        // Writes the two raw channels to separate buffers, ignoring the view and the test
+        // combiner. This is what a real two-channel radio hands to the phasing front end.
+        void generateDual(const Params& p, int count, float* outA, float* outB) {
+            run<true>(p, count, outA, outB);
+        }
+
+        cd wantedPhasor = { 1.0, 0.0 };
+        cd interfPhasor = { 1.0, 0.0 };
+
+    private:
+        template <bool DUAL>
+        void run(const Params& p, int count, float* o1, float* o2) {
             const ToneWeights wanted = toneWeights(p, false);
             const ToneWeights interf = toneWeights(p, true);
 
@@ -168,7 +184,7 @@ namespace phtest {
             // the complex RMS, making noise and tone levels directly comparable.
             const double namp = p.noiseEnabled ? std::pow(10.0, p.noiseLevel / 20.0) * std::sqrt(1.5) : 0.0;
 
-            const cd combW = toCd(weightFromPolar(p.combGain, p.combPhase));
+            [[maybe_unused]] const cd combW = toCd(weightFromPolar(p.combGain, p.combPhase));
 
             cd pw = wantedPhasor;
             cd pi = interfPhasor;
@@ -187,13 +203,21 @@ namespace phtest {
                 // would cancel it and quietly desynchronise the reported null weight
                 // from the signal actually being generated.
 
-                cd y;
-                if (p.view == VIEW_A) { y = a; }
-                else if (p.view == VIEW_B) { y = b; }
-                else { y = a - combW * b; }
+                if constexpr (DUAL) {
+                    o1[2 * n] = (float)a.re;
+                    o1[2 * n + 1] = (float)a.im;
+                    o2[2 * n] = (float)b.re;
+                    o2[2 * n + 1] = (float)b.im;
+                }
+                else {
+                    cd y;
+                    if (p.view == VIEW_A) { y = a; }
+                    else if (p.view == VIEW_B) { y = b; }
+                    else { y = a - combW * b; }
 
-                out[2 * n] = (float)y.re;
-                out[2 * n + 1] = (float)y.im;
+                    o1[2 * n] = (float)y.re;
+                    o1[2 * n + 1] = (float)y.im;
+                }
 
                 pw = pw * dW;
                 pi = pi * dI;
@@ -208,10 +232,6 @@ namespace phtest {
             interfPhasor = pi;
         }
 
-        cd wantedPhasor = { 1.0, 0.0 };
-        cd interfPhasor = { 1.0, 0.0 };
-
-    private:
         Rng rngA;
         Rng rngB;
     };

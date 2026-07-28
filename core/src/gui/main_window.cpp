@@ -92,6 +92,10 @@ void MainWindow::init() {
     sigpath::iqFrontEnd.init(&dummyStream, 8000000, true, 1, false, 1024, 20.0, IQFrontEnd::FFTWindow::NUTTALL, acquireFFTBuffer, releaseFFTBuffer, this);
     sigpath::iqFrontEnd.start();
 
+    // Must be ready before any source module is loaded, since a source may declare its
+    // channels as soon as it is instantiated.
+    sigpath::phasing.init();
+
     vfoCreatedHandler.handler = vfoAddedHandler;
     vfoCreatedHandler.ctx = this;
     sigpath::vfoManager.onVfoCreated.bindHandler(&vfoCreatedHandler);
