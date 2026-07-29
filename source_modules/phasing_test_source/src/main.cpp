@@ -286,6 +286,33 @@ private:
             dirty = true;
         }
 
+        // -- Broadband interferer ----------------------------------------------
+        // One noise process in both channels. With a channel delay it is the case a single
+        // complex weight cannot null, which is what the multi-tap weight is for.
+        SmGui::Text("Broadband interferer  (level is in A; below is B relative to A)");
+        if (SmGui::Checkbox(CONCAT("Enabled##_phtest_bben_", _this->name), &_this->broadbandEnabled)) {
+            _this->set(&Params::broadbandEnabled, _this->broadbandEnabled);
+            dirty = true;
+        }
+        SmGui::LeftLabel("Level");
+        SmGui::FillWidth();
+        if (SmGui::SliderFloat(CONCAT("##_phtest_bblvl_", _this->name), &_this->broadbandLevelF, -100.0f, 0.0f, SmGui::FMT_STR_FLOAT_DB_ONE_DECIMAL)) {
+            _this->set(&Params::broadbandLevel, _this->broadbandLevelF);
+            dirty = true;
+        }
+        SmGui::LeftLabel("B gain vs A");
+        SmGui::FillWidth();
+        if (SmGui::SliderFloat(CONCAT("##_phtest_bbg_", _this->name), &_this->broadbandGainF, -40.0f, 40.0f, SmGui::FMT_STR_FLOAT_DB_TWO_DECIMAL)) {
+            _this->set(&Params::broadbandGain, _this->broadbandGainF);
+            dirty = true;
+        }
+        SmGui::LeftLabel("B phase vs A");
+        SmGui::FillWidth();
+        if (SmGui::SliderFloat(CONCAT("##_phtest_bbp_", _this->name), &_this->broadbandPhaseF, -180.0f, 180.0f, SmGui::FMT_STR_FLOAT_TWO_DECIMAL)) {
+            _this->set(&Params::broadbandPhase, _this->broadbandPhaseF);
+            dirty = true;
+        }
+
         // -- Channel B effects -------------------------------------------------
         SmGui::Text("Channel B timing");
         SmGui::LeftLabel("Delay (samp)");
@@ -423,6 +450,10 @@ private:
         if (c.contains("combGain")) { combGainF = c["combGain"]; }
         if (c.contains("combPhase")) { combPhaseF = c["combPhase"]; }
         if (c.contains("dualChannel")) { dualChannel = c["dualChannel"]; }
+        if (c.contains("broadbandEnabled")) { broadbandEnabled = c["broadbandEnabled"]; }
+        if (c.contains("broadbandLevel")) { broadbandLevelF = c["broadbandLevel"]; }
+        if (c.contains("broadbandGain")) { broadbandGainF = c["broadbandGain"]; }
+        if (c.contains("broadbandPhase")) { broadbandPhaseF = c["broadbandPhase"]; }
         config.release();
 
         // Mirror the GUI-facing values into the worker's parameter block.
@@ -445,6 +476,10 @@ private:
         params.view = viewId;
         params.combGain = combGainF;
         params.combPhase = combPhaseF;
+        params.broadbandEnabled = broadbandEnabled;
+        params.broadbandLevel = broadbandLevelF;
+        params.broadbandGain = broadbandGainF;
+        params.broadbandPhase = broadbandPhaseF;
     }
 
     void saveConfig() {
@@ -469,6 +504,10 @@ private:
         c["combGain"] = combGainF;
         c["combPhase"] = combPhaseF;
         c["dualChannel"] = dualChannel;
+        c["broadbandEnabled"] = broadbandEnabled;
+        c["broadbandLevel"] = broadbandLevelF;
+        c["broadbandGain"] = broadbandGainF;
+        c["broadbandPhase"] = broadbandPhaseF;
         config.release(true);
     }
 
@@ -486,6 +525,10 @@ private:
     ChannelSet channels;
     bool dualChannel = false;
     bool runDual = false;
+    bool broadbandEnabled = false;
+    float broadbandLevelF = -15.0f;
+    float broadbandGainF = -3.0f;
+    float broadbandPhaseF = 137.0f;
 
     OptionList<int, double> samplerates;
     int srId = 0;

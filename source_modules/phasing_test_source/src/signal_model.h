@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 // Pure signal model for the two-channel phasing test source. Deliberately free of any
 // SDR++ dependency so it can be compiled and checked on its own:
@@ -78,6 +79,16 @@ namespace phtest {
         double interfGain = -3.0;
         double interfPhase = 137.0;
 
+        // A broadband interferer: one noise process fed to both channels, B's copy scaled
+        // and delayed. This is the case a single complex weight cannot solve -- a
+        // fractional delay makes the required weight vary across the band, so a scalar
+        // nulls at one frequency and nowhere else. It is what a neighbour's switching
+        // supply looks like, as opposed to a carrier.
+        bool broadbandEnabled = false;
+        double broadbandLevel = -15.0;    // dBFS in channel A
+        double broadbandGain = 0.0;       // dB, channel B relative to A
+        double broadbandPhase = 0.0;      // degrees
+
         double delaySamples = 0.0;        // channel B delay, may be fractional
         bool noiseEnabled = true;
         double noiseLevel = -80.0;        // dBFS per channel, independent
@@ -142,11 +153,19 @@ namespace phtest {
     // successive calls produce one continuous signal.
     class Generator {
     public:
+        // Bulk delay held on both channels' copy of the broadband interferer, so the
+        // relative delay between them is exactly Params::delaySamples and can go either way.
+        static const int BB_HISTORY = 256;
+        static const int BB_BULK = 64;
+
         void reset() {
             wantedPhasor = { 1.0, 0.0 };
             interfPhasor = { 1.0, 0.0 };
             rngA.seed(0x243F6A8885A308D3ull, 0x13198A2E03707344ull);
             rngB.seed(0xA4093822299F31D0ull, 0x082EFA98EC4E6C89ull);
+            rngBB.seed(0x452821E638D01377ull, 0xBE5466CF34E90C6Cull);
+            bbRing.assign(BB_HISTORY, cd{ 0.0, 0.0 });
+            bbWrite = 0;
         }
 
         // Writes `count` interleaved (re, im) float pairs, i.e. 2*count floats.
@@ -186,12 +205,27 @@ namespace phtest {
 
             [[maybe_unused]] const cd combW = toCd(weightFromPolar(p.combGain, p.combPhase));
 
+            // Uniform noise in [-1,1) has RMS 1/sqrt(3) per component, matching how the
+            // per-channel noise floor is scaled above.
+            const double bbAmp = p.broadbandEnabled ? std::pow(10.0, p.broadbandLevel / 20.0) * std::sqrt(1.5) : 0.0;
+            const cd bbW = toCd(weightFromPolar(p.broadbandGain, p.broadbandPhase));
+
             cd pw = wantedPhasor;
             cd pi = interfPhasor;
 
             for (int n = 0; n < count; n++) {
                 cd a = cAw * pw + cAi * pi;
                 cd b = cBw * pw + cBi * pi;
+
+                if (bbAmp != 0.0) {
+                    // One process, written once and read twice at different delays.
+                    bbRing[bbWrite] = cd{ rngBB.uni() * bbAmp, rngBB.uni() * bbAmp };
+                    const cd bbA = readRing((double)BB_BULK);
+                    const cd bbB = readRing((double)BB_BULK + p.delaySamples);
+                    a = a + bbA;
+                    b = b + bbW * bbB;
+                    bbWrite = (bbWrite + 1) % BB_HISTORY;
+                }
 
                 if (namp != 0.0) {
                     a = a + cd{ rngA.uni() * namp, rngA.uni() * namp };
@@ -232,7 +266,31 @@ namespace phtest {
             interfPhasor = pi;
         }
 
+        // Read the shared broadband process `delay` samples back, interpolating so a
+        // fractional delay is a real fractional delay rather than a rounded one.
+        cd readRing(double delay) const {
+            const double pos = (double)bbWrite - delay;
+            const int i = (int)std::floor(pos);
+            const double f = pos - (double)i;
+            auto at = [&](int k) -> cd {
+                int idx = ((k % BB_HISTORY) + BB_HISTORY) % BB_HISTORY;
+                return bbRing[idx];
+            };
+            const cd x0 = at(i - 1), x1 = at(i), x2 = at(i + 1), x3 = at(i + 2);
+            auto interp = [&](double a0, double a1, double a2, double a3) {
+                const double c0 = a1;
+                const double c1 = 0.5 * (a2 - a0);
+                const double c2 = a0 - 2.5 * a1 + 2.0 * a2 - 0.5 * a3;
+                const double c3 = 0.5 * (a3 - a0) + 1.5 * (a1 - a2);
+                return ((c3 * f + c2) * f + c1) * f + c0;
+            };
+            return cd{ interp(x0.re, x1.re, x2.re, x3.re), interp(x0.im, x1.im, x2.im, x3.im) };
+        }
+
         Rng rngA;
         Rng rngB;
+        Rng rngBB;
+        std::vector<cd> bbRing;
+        int bbWrite = 0;
     };
 }
