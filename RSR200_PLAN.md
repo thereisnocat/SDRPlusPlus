@@ -67,7 +67,12 @@ something the build can arrange. Per the bundled ReadMe: copy `ftd3xx.h` and `Ty
 > Approving the block in **System Settings → Privacy & Security** works too — the first
 > failed load raises the prompt — and that route leaves the xattr in place, so a lingering
 > `com.apple.quarantine` is *not* evidence the library is still blocked. Test by loading it
-> rather than by reading attributes.
+> rather than by reading attributes. (That is what was done here.)
+>
+> The approval is tied to that exact binary, so **a D3XX update will be blocked again**,
+> with the same misleading "code signature not valid" wording. Deleting the attribute
+> removes the cause rather than recording an exception, which is why it is the better habit
+> of the two — particularly in any scripted or repeated install.
 >
 > Verified on this machine: with the install name rewritten and Gatekeeper satisfied, the
 > library loads with no `DYLD_LIBRARY_PATH` set and `FT_CreateDeviceInfoList` returns
