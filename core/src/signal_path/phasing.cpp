@@ -200,6 +200,7 @@ void Phasing::setWhiteningEnabled(bool enabled) { phaser.setWhiteningEnabled(ena
 bool Phasing::getWhiteningEnabled() { return phaser.getWhiteningEnabled(); }
 float Phasing::getCoherence() { return phaser.getCoherence(); }
 float Phasing::getComponentSeparation() { return phaser.getComponentSeparation(); }
+void Phasing::getCombineCoefficients(dsp::complex_t& k0, dsp::complex_t& k1) { phaser.getCombineCoefficients(k0, k1); }
 dsp::combine::Phaser::Metrics Phasing::getMetrics() { return phaser.getMetrics(); }
 float Phasing::getNullDepth() { return phaser.getNullDepth(); }
 bool Phasing::isNullDepthBandLimited() { return phaser.isNullDepthBandLimited(); }

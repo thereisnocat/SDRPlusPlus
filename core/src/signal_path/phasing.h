@@ -83,6 +83,7 @@ public:
     bool getWhiteningEnabled();
     float getCoherence();
     float getComponentSeparation();
+    void getCombineCoefficients(dsp::complex_t& k0, dsp::complex_t& k1);
 
     dsp::combine::Phaser::Metrics getMetrics();
     float getNullDepth();

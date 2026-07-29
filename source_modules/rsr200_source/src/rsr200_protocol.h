@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstddef>
 #include <cmath>
+#include <complex>
 #include <algorithm>
 
 // Wire protocol for the Reuter RSR200B, from RSR200_DP_ENG_V52.pdf (firmware 225).
@@ -435,6 +436,51 @@ namespace rsr200 {
         int phi = (int)std::lround(phaseDegrees / 360.0 * 65536.0);
         phi = std::clamp(phi, -32768, 32767);
         return ((uint32_t)(uint16_t)(int16_t)phi << 16) | (uint32_t)(uint16_t)mag;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Handing a software-derived combination to the hardware combiner
+    //
+    // In Diversity mode the radio computes Y = A + g*B, with g the magnitude and phase set
+    // for channel 2. That is enough to null one arrival, and it costs no PC time and half
+    // the data rate -- but the weight cannot be *found* in that mode, because the radio
+    // returns only the combined result. So the workflow is necessarily two-step: solve in
+    // Separate mode with both channels available, then switch to Diversity and hand the
+    // answer over.
+    //
+    // Note the sign convention. The hardware *adds*, while the software phaser's manual
+    // weight is defined for subtraction (Y = A - wB). An additive coefficient pair
+    // (y = k0*A + k1*B), which is what the decorrelator produces, converts directly as
+    // g = k1/k0; a subtractive weight w would need g = -w.
+    // -----------------------------------------------------------------------------
+
+    struct HardwareWeight {
+        double magnitude = 1.0;     // 0.001 .. 8, the radio's expressible range
+        double phaseDegrees = 0.0;
+        bool representable = false; // false when the ratio falls outside that range
+        bool suggestSwap = false;   // true when swapping the channels would bring it inside
+    };
+
+    // The radio's magnitude spans 0 to just under 8 (16 bits at 1/8192 per LSB), so a
+    // combination needing more than 8x on channel 2 cannot be expressed. Swapping the
+    // channels inverts the ratio and usually brings it back into range, which the port
+    // mode can do with a single bit.
+    inline HardwareWeight hardwareWeightFor(std::complex<double> k0, std::complex<double> k1) {
+        HardwareWeight h;
+        if (std::abs(k0) < 1e-30) {
+            // Channel A contributes nothing: not expressible as A + g*B at any gain.
+            h.suggestSwap = true;
+            return h;
+        }
+
+        const std::complex<double> g = k1 / k0;
+        const double mag = std::abs(g);
+
+        h.magnitude = mag;
+        h.phaseDegrees = std::arg(g) * 180.0 / M_PI;
+        h.representable = (mag >= 0.001 && mag < 8.0);
+        h.suggestSwap = (mag >= 8.0);
+        return h;
     }
 
     inline std::vector<uint8_t> cmdSetVariable(uint32_t no, bool lan, Variable v,

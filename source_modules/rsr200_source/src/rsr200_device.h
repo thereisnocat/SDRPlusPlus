@@ -1,5 +1,6 @@
 #pragma once
 #include "rsr200_protocol.h"
+#include <complex>
 #include <functional>
 #include <string>
 #include <deque>
@@ -183,6 +184,20 @@ namespace rsr200 {
             if (!transport) { return fail("no transport"); }
             return send(cmdSetGenerator(nextNumber(), transport->isLan(), GEN_MAG_PHASE_CH2,
                                         packMagnitudePhase(magnitude, phaseDegrees)), nowMs, true);
+        }
+
+        // Hand a combination worked out in software to the radio's own combiner. The
+        // caller is expected to be in Separate mode while solving and to switch to
+        // OP_DIVERSITY afterwards; this only carries the weight across.
+        //
+        // Returns false without sending anything when the ratio is outside the radio's
+        // range, in which case `out` says whether swapping the channels would fix it.
+        bool setHardwareDiversityFrom(std::complex<double> k0, std::complex<double> k1,
+                                      uint64_t nowMs, HardwareWeight* out = nullptr) {
+            const HardwareWeight h = hardwareWeightFor(k0, k1);
+            if (out) { *out = h; }
+            if (!h.representable) { return false; }
+            return setHardwareDiversity(h.magnitude, h.phaseDegrees, nowMs);
         }
 
         bool startStream(uint64_t nowMs) {

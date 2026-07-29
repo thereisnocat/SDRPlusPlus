@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <complex>
 
 using namespace rsr200;
 
@@ -291,6 +292,58 @@ int main() {
               "LAN version packet parses");
         lanver[0] = 8;
         check(!parseLanVersionPacket(lanver, sizeof(lanver), r), "a wrong length is rejected");
+    }
+
+    // -----------------------------------------------------------------
+    printf("\nHanding a software combination to the hardware combiner\n");
+    {
+        // The radio computes Y = A + g*B. A signal whose channel-B copy is r times its
+        // channel-A copy is cancelled by g = -1/r.
+        const std::complex<double> r = std::polar(0.7, 2.39);      // -3 dB, 137 degrees
+        const std::complex<double> g = -1.0 / r;
+
+        // An additive coefficient pair that nulls it, as the decorrelator would produce:
+        // any scaling of (1, g) is the same combination.
+        const std::complex<double> k0 = std::polar(0.31, 1.1);
+        const std::complex<double> k1 = k0 * g;
+
+        HardwareWeight h = hardwareWeightFor(k0, k1);
+        check(h.representable, "the ratio is inside the radio's range");
+        check(std::abs(h.magnitude - std::abs(g)) < 1e-9, "magnitude survives the overall scaling");
+        check(std::abs(h.phaseDegrees - std::arg(g) * 180.0 / M_PI) < 1e-9, "as does phase");
+
+        // The real test: quantise through the wire format, then check the weight the radio
+        // would actually apply still cancels.
+        const uint32_t packed = packMagnitudePhase(h.magnitude, h.phaseDegrees);
+        const double qMag = (double)(packed & 0xFFFF) / 8192.0;
+        const double qPhase = (double)(int16_t)(packed >> 16) / 32768.0 * 180.0;
+        const std::complex<double> qg = std::polar(qMag, qPhase * M_PI / 180.0);
+        const double residual = 20.0 * std::log10(std::abs(1.0 + qg * r));
+        printf("        after quantisation the null is %.1f dB deep\n", residual);
+        check(residual < -60.0, "quantisation is not what limits the null");
+
+        // Out of range: channel B needs more than 8x, which the 16 bit magnitude cannot
+        // express. Swapping the channels inverts the ratio and brings it back.
+        HardwareWeight big = hardwareWeightFor(std::complex<double>(1.0, 0.0),
+                                               std::complex<double>(20.0, 0.0));
+        check(!big.representable && big.suggestSwap, "too large a ratio asks for a channel swap");
+        HardwareWeight swapped = hardwareWeightFor(std::complex<double>(20.0, 0.0),
+                                                   std::complex<double>(1.0, 0.0));
+        check(swapped.representable, "and swapping brings it back into range");
+
+        // A combination that ignores channel A entirely cannot be written as A + g*B.
+        HardwareWeight none = hardwareWeightFor(std::complex<double>(0.0, 0.0),
+                                                std::complex<double>(1.0, 0.0));
+        check(!none.representable && none.suggestSwap, "a channel B only combination asks for a swap");
+
+        // The sign convention is the easy thing to get wrong: the hardware adds where the
+        // software phaser's manual weight subtracts.
+        const std::complex<double> additive = hardwareWeightFor(
+            std::complex<double>(1.0, 0.0), std::complex<double>(-0.5, 0.0)).magnitude
+            * std::polar(1.0, hardwareWeightFor(std::complex<double>(1.0, 0.0),
+                                                std::complex<double>(-0.5, 0.0)).phaseDegrees * M_PI / 180.0);
+        check(std::abs(additive - std::complex<double>(-0.5, 0.0)) < 1e-9,
+              "a negative coefficient becomes a 180 degree phase, not a negative magnitude");
     }
 
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");

@@ -291,8 +291,38 @@ different things:
 
 **Offer both, default to software.** Expose hardware diversity as an operating mode for
 users who are bandwidth-constrained or want the radio to do the work; use Separate mode for
-everything else. Do not try to drive the hardware weight from our adaptive solver — the
-round trip through the command channel is far too slow for a control loop.
+everything else. Do not try to drive the hardware weight from our adaptive solver as a
+*control loop* — the round trip through the command channel is far too slow.
+
+### 7.2 Solve in software, hold in hardware
+
+The two are better combined than chosen between, and the decorrelator of `PHASING_PLAN.md`
+§2.6 makes it straightforward. There is a chicken-and-egg to respect: the weight cannot be
+*found* in Diversity mode, because the radio then returns only the combined result. So the
+workflow is necessarily two-step.
+
+1. Run in Separate mode with both channels. `MODE_DECORR_MIN` finds the combination that
+   nulls the dominant arrival, and `Phasing::getCombineCoefficients` exposes it as an
+   additive pair `y = k0·A + k1·B`.
+2. `hardwareWeightFor()` converts that to the radio's magnitude and phase, and
+   `Device::setHardwareDiversityFrom()` sends it.
+3. Switch to `OP_DIVERSITY` and single-channel output. The radio now holds the null on its
+   own, at half the data rate and no PC cost.
+
+**Mind the sign.** The radio computes `Y = A + g·B` — it *adds*, where the software
+phaser's manual weight is defined for subtraction. An additive coefficient pair converts
+directly as `g = k1/k0`; a subtractive weight would need `g = -w`. Getting this backwards
+produces a combination that peaks the interferer instead of nulling it, which looks like a
+sign of life and is therefore easy to accept.
+
+**Mind the range.** The magnitude is a 16-bit value at 1/8192 per LSB, so it spans 0 to
+just under 8. A combination needing more than 8× on channel 2 is inexpressible;
+`hardwareWeightFor()` reports that and suggests a channel swap, which inverts the ratio and
+is a single bit in the port mode.
+
+Quantisation is not the limitation: pushing a solved weight through the wire format and
+back leaves the null 88 dB deep, far below the 20–60 dB the manual attributes to antenna
+and propagation stability.
 
 ---
 

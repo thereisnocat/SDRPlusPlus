@@ -312,6 +312,14 @@ namespace dsp::combine {
         // Gap between the two principal components, in dB.
         float getComponentSeparation() { return separationValue.load(std::memory_order_relaxed); }
 
+        // The combination currently being applied, as y = k0*A + k1*B. Only meaningful in
+        // the decorrelation modes. Exposed so a radio that can combine in hardware can be
+        // handed the solution rather than having it found by hand.
+        void getCombineCoefficients(complex_t& k0, complex_t& k1) {
+            k0 = { coefA_re.load(std::memory_order_relaxed), coefA_im.load(std::memory_order_relaxed) };
+            k1 = { coefB_re.load(std::memory_order_relaxed), coefB_im.load(std::memory_order_relaxed) };
+        }
+
         void getWeight(float& gainDb, float& phaseDeg) {
             std::lock_guard<std::mutex> lck(paramMtx);
             gainDb = _gainDb;
@@ -648,6 +656,10 @@ namespace dsp::combine {
             }
             _k0 = t0;
             _k1 = t1;
+            coefA_re.store(t0.re, std::memory_order_relaxed);
+            coefA_im.store(t0.im, std::memory_order_relaxed);
+            coefB_re.store(t1.re, std::memory_order_relaxed);
+            coefB_im.store(t1.im, std::memory_order_relaxed);
         }
 
         void updateMetrics(int count, const complex_t* a, const complex_t* b, const complex_t* y) {
@@ -716,5 +728,7 @@ namespace dsp::combine {
         std::atomic<float> bandDepth{ 0.0f };
         std::atomic<float> coherenceValue{ 0.0f };
         std::atomic<float> separationValue{ 0.0f };
+        std::atomic<float> coefA_re{ 1.0f }, coefA_im{ 0.0f };
+        std::atomic<float> coefB_re{ 0.0f }, coefB_im{ 0.0f };
     };
 }
