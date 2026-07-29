@@ -64,8 +64,15 @@ something the build can arrange. Per the bundled ReadMe: copy `ftd3xx.h` and `Ty
 > sudo xattr -d com.apple.quarantine /usr/local/lib/libftd3xx.dylib /usr/local/lib/libftd3xx.1.1.8.dylib
 > ```
 >
-> Verified: with quarantine cleared and the install name rewritten, the library loads and
-> `FT_CreateDeviceInfoList` returns `FT_OK`.
+> Approving the block in **System Settings → Privacy & Security** works too — the first
+> failed load raises the prompt — and that route leaves the xattr in place, so a lingering
+> `com.apple.quarantine` is *not* evidence the library is still blocked. Test by loading it
+> rather than by reading attributes.
+>
+> Verified on this machine: with the install name rewritten and Gatekeeper satisfied, the
+> library loads with no `DYLD_LIBRARY_PATH` set and `FT_CreateDeviceInfoList` returns
+> `FT_OK` with zero devices — the correct answer with no radio attached. The USB path is
+> therefore proven end to end apart from the transport itself.
 
 > **The `make` step in the bundled ReadMe is optional.** The Makefile builds seventeen demo
 > programs (`streamer`, `LoopBack`, `GetDevInfo`, …); the library itself ships prebuilt, so
