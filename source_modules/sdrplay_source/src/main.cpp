@@ -88,7 +88,10 @@ public:
         // Init callbacks
         cbFuncs.EventCbFn = eventCB;
         cbFuncs.StreamACbFn = streamCB;
-        cbFuncs.StreamBCbFn = streamCB;
+        // Tuner B needs its own sink. Pointing both at one callback is harmless while only
+        // tuner A runs, but in dual tuner mode it would interleave two tuners into a single
+        // stream.
+        cbFuncs.StreamBCbFn = streamCB2;
 
         sdrplay_api_ErrT err = sdrplay_api_Open();
         if (err != sdrplay_api_Success) {
@@ -111,6 +114,27 @@ public:
         handler.tuneHandler = tune;
         handler.stream = &stream;
 
+        // Dual tuner: rspDuoSampleFreq picks the low IF, and both choices decimate to the
+        // same 2 MS/s at the callback -- measured, not assumed. Decimation divides that.
+        duoFsList.define(6000000, "6 MHz (1620 kHz IF)", 6000000.0);
+        duoFsList.define(8000000, "8 MHz (2048 kHz IF)", 8000000.0);
+        duoDecimList.define(1, "2.0 MHz", 1);
+        duoDecimList.define(2, "1.0 MHz", 2);
+        duoDecimList.define(4, "500 kHz", 4);
+        duoDecimList.define(8, "250 kHz", 8);
+        duoDecimList.define(16, "125 kHz", 16);
+        duoDecimList.define(32, "62.5 kHz", 32);
+
+        channels.count = 2;
+        channels.streams = { &stream, &stream2 };
+        channels.names = { "Tuner A", "Tuner B" };
+        channels.sampleAligned = true;    // measured: identical counts on both callbacks
+        // Left false deliberately. The two tuners share a clock, but whether the relative
+        // phase returns to the same value after a stop and restart has not been measured on
+        // this hardware, and claiming it would have the UI restore saved weights that may no
+        // longer apply. Flip it once tested with a signal in both ports.
+        channels.phaseCoherent = false;
+
         refresh();
 
         config.acquire();
@@ -126,6 +150,7 @@ public:
     ~SDRPlaySourceModule() {
         stop(this);
         if (initOk) { sdrplay_api_Close(); }
+        sigpath::sourceManager.unregisterChannels("SDRplay");
         sigpath::sourceManager.unregisterSource("SDRplay");
     }
 
@@ -401,6 +426,17 @@ public:
             }
         }
         else if (openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            if (config.conf["devices"][selectedName].contains("dualTuner")) {
+                rspduo_dualTuner = config.conf["devices"][selectedName]["dualTuner"];
+            }
+            if (config.conf["devices"][selectedName].contains("duoFs")) {
+                int k = config.conf["devices"][selectedName]["duoFs"];
+                if (duoFsList.keyExists(k)) { duoFsId = duoFsList.keyId(k); }
+            }
+            if (config.conf["devices"][selectedName].contains("duoDecim")) {
+                int k = config.conf["devices"][selectedName]["duoDecim"];
+                if (duoDecimList.keyExists(k)) { duoDecimId = duoDecimList.keyId(k); }
+            }
             if (config.conf["devices"][selectedName].contains("antenna")) {
                 rspduo_antennaPort = config.conf["devices"][selectedName]["antenna"];
             }
@@ -432,6 +468,10 @@ public:
         config.release();
 
         if (lnaGain >= lnaSteps) { lnaGain = lnaSteps - 1; }
+
+        // Register or drop the channel set for whatever was just selected, so a saved dual
+        // tuner setting takes effect on startup rather than only when the box is clicked.
+        applyDualMode();
 
         // Release device after selecting
         sdrplay_api_Uninit(openDev.dev);
@@ -480,6 +520,21 @@ private:
         return std::string(buf);
     }
 
+    // Dual tuner replaces the ordinary samplerate choice: the output rate is fixed by the
+    // API at 2 MS/s and divided by the decimation factor.
+    void applyDualMode() {
+        if (rspduo_dualTuner && openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            sampleRate = 2000000.0 / (double)duoDecimList.value(duoDecimId);
+            sigpath::sourceManager.registerChannels("SDRplay", &channels);
+        }
+        else {
+            rspduo_dualTuner = false;
+            sampleRate = samplerates.value(srId);
+            sigpath::sourceManager.unregisterChannels("SDRplay");
+        }
+        core::setInputSampleRate(sampleRate);
+    }
+
     static void menuSelected(void* ctx) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
         core::setInputSampleRate(_this->sampleRate);
@@ -498,8 +553,22 @@ private:
         // First, acquire device
         sdrplay_api_ErrT err;
 
-        _this->openDev.tuner = sdrplay_api_Tuner_A;
-        _this->openDev.rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
+        // Fixed for the run: the mode selector is disabled while streaming, because it
+        // changes how the device is opened.
+        _this->dualRunning = _this->rspduo_dualTuner && (_this->openDev.hwVer == SDRPLAY_RSPduo_ID);
+
+        if (_this->dualRunning) {
+            // rspDuoSampleFreq has to be set before SelectDevice, not after: the API derives
+            // fsHz and the IF from it while opening.
+            _this->openDev.tuner = sdrplay_api_Tuner_Both;
+            _this->openDev.rspDuoMode = sdrplay_api_RspDuoMode_Dual_Tuner;
+            _this->openDev.rspDuoSampleFreq = _this->duoFsList.value(_this->duoFsId);
+        }
+        else {
+            _this->openDev.tuner = sdrplay_api_Tuner_A;
+            _this->openDev.rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
+            _this->openDev.rspDuoSampleFreq = 0.0;
+        }
         err = sdrplay_api_SelectDevice(&_this->openDev);
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
@@ -531,6 +600,7 @@ private:
 
         // Configure device
         _this->bufferIndex = 0;
+        _this->bufferIndex2 = 0;
         _this->bufferSize = (float)_this->sampleRate / 200.0f;
 
         // RSP1A Options
@@ -576,7 +646,14 @@ private:
         }
 
         // General options
-        if (_this->ifModeId == 0) {
+        if (_this->dualRunning) {
+            // Dual tuner runs at a low IF, and the API has already set fsHz and ifType from
+            // rspDuoSampleFreq. Overwriting either here is how you get an Init failure or a
+            // silently wrong rate, so only bandwidth and decimation are ours to choose.
+            _this->channelParams->tunerParams.bwType = sdrplay_api_BW_1_536;
+            _this->bandwidth = sdrplay_api_BW_1_536;
+        }
+        else if (_this->ifModeId == 0) {
             _this->bandwidth = (_this->bandwidthId == 8) ? preferedBandwidth[_this->srId] : _this->bandwidths[_this->bandwidthId];
             _this->openDevParams->devParams->fsFreq.fsHz = _this->sampleRate;
             _this->channelParams->tunerParams.bwType = _this->bandwidth;
@@ -588,11 +665,18 @@ private:
         _this->channelParams->tunerParams.rfFreq.rfHz = _this->freq;
         _this->channelParams->tunerParams.gain.gRdB = _this->gain;
         _this->channelParams->tunerParams.gain.LNAstate = _this->lnaGain;
-        _this->channelParams->ctrlParams.decimation.enable = false;
         _this->channelParams->ctrlParams.dcOffset.DCenable = true;
         _this->channelParams->ctrlParams.dcOffset.IQenable = true;
-        _this->channelParams->tunerParams.ifType = ifModes[_this->ifModeId].ifValue;
         _this->channelParams->tunerParams.loMode = sdrplay_api_LO_Auto;
+        if (_this->dualRunning) {
+            const int decim = _this->duoDecimList.value(_this->duoDecimId);
+            _this->channelParams->ctrlParams.decimation.enable = (decim > 1);
+            _this->channelParams->ctrlParams.decimation.decimationFactor = (unsigned char)decim;
+        }
+        else {
+            _this->channelParams->ctrlParams.decimation.enable = false;
+            _this->channelParams->tunerParams.ifType = ifModes[_this->ifModeId].ifValue;
+        }
 
         // Hard coded AGC parameters
         _this->channelParams->ctrlParams.agc.attack_ms = _this->agcAttack;
@@ -601,6 +685,20 @@ private:
         _this->channelParams->ctrlParams.agc.decay_threshold_dB = _this->agcDecayThreshold;
         _this->channelParams->ctrlParams.agc.setPoint_dBfs = _this->agcSetPoint;
         _this->channelParams->ctrlParams.agc.enable = _this->agc ? sdrplay_api_AGC_CTRL_EN : sdrplay_api_AGC_DISABLE;
+
+        // Both tuners must carry identical settings, and the phase relationship between
+        // them only means anything if they do. openDev.tuner is Tuner_Both in dual mode, so
+        // every Update below reaches both without further work.
+        if (_this->dualRunning && _this->openDevParams->rxChannelB) {
+            sdrplay_api_RxChannelParamsT* a = _this->openDevParams->rxChannelA;
+            sdrplay_api_RxChannelParamsT* b = _this->openDevParams->rxChannelB;
+            b->tunerParams.bwType = a->tunerParams.bwType;
+            b->tunerParams.ifType = a->tunerParams.ifType;
+            b->tunerParams.rfFreq = a->tunerParams.rfFreq;
+            b->tunerParams.gain = a->tunerParams.gain;
+            b->tunerParams.loMode = a->tunerParams.loMode;
+            b->ctrlParams = a->ctrlParams;
+        }
 
         sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Dev_Fs, sdrplay_api_Update_Ext1_None);
         sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_BwType, sdrplay_api_Update_Ext1_None);
@@ -621,12 +719,15 @@ private:
         if (!_this->running) { return; }
         _this->running = false;
         _this->stream.stopWriter();
+        _this->stream2.stopWriter();
 
         // Release device after stopping
         sdrplay_api_Uninit(_this->openDev.dev);
         sdrplay_api_ReleaseDevice(&_this->openDev);
 
         _this->stream.clearWriteStop();
+        _this->stream2.clearWriteStop();
+        _this->dualRunning = false;
         flog::info("SDRPlaySourceModule '{0}': Stop!", _this->name);
     }
 
@@ -634,6 +735,11 @@ private:
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
         if (_this->running) {
             _this->channelParams->tunerParams.rfFreq.rfHz = freq;
+            // Both tuners, written before a single update, so they move together rather than
+            // one lagging the other by a command round trip.
+            if (_this->dualRunning && _this->openDevParams->rxChannelB) {
+                _this->openDevParams->rxChannelB->tunerParams.rfFreq.rfHz = freq;
+            }
             sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
         }
         _this->freq = freq;
@@ -656,6 +762,8 @@ private:
         }
 
         if (_this->ifModeId == 0) {
+            // In dual tuner mode the rate comes from the duo controls instead.
+            if (_this->rspduo_dualTuner) { SmGui::BeginDisabled(); }
             if (SmGui::Combo(CONCAT("##sdrplay_sr", _this->name), &_this->srId, _this->samplerates.txt)) {
                 _this->sampleRate = _this->samplerates[_this->srId];
                 if (_this->bandwidthId == 8) {
@@ -666,6 +774,7 @@ private:
                 config.conf["devices"][_this->selectedName]["samplerate"] = _this->samplerates.key(_this->srId);
                 config.release(true);
             }
+            if (_this->rspduo_dualTuner) { SmGui::EndDisabled(); }
 
             SmGui::SameLine();
             SmGui::FillWidth();
@@ -1004,6 +1113,37 @@ private:
     }
 
     void RSPduoMenu() {
+        // Both tuners at once, which is what the phasing front end needs. Disabled while
+        // running because it changes how the device is opened.
+        if (running) { SmGui::BeginDisabled(); }
+        SmGui::ForceSync();
+        if (SmGui::Checkbox(CONCAT("Dual tuner (phasing)##sdrplay_duo_", name), &rspduo_dualTuner)) {
+            applyDualMode();
+            config.acquire();
+            config.conf["devices"][selectedName]["dualTuner"] = rspduo_dualTuner;
+            config.release(true);
+        }
+        if (rspduo_dualTuner) {
+            SmGui::LeftLabel("ADC rate");
+            SmGui::FillWidth();
+            if (SmGui::Combo(CONCAT("##sdrplay_duofs_", name), &duoFsId, duoFsList.txt)) {
+                config.acquire();
+                config.conf["devices"][selectedName]["duoFs"] = duoFsList.key(duoFsId);
+                config.release(true);
+            }
+            SmGui::LeftLabel("Samplerate");
+            SmGui::FillWidth();
+            if (SmGui::Combo(CONCAT("##sdrplay_duosr_", name), &duoDecimId, duoDecimList.txt)) {
+                applyDualMode();
+                config.acquire();
+                config.conf["devices"][selectedName]["duoDecim"] = duoDecimList.key(duoDecimId);
+                config.release(true);
+            }
+            SmGui::Text("Both tuners share these settings.");
+            SmGui::Text("Antenna port choice below applies to tuner 1 only.");
+        }
+        if (running) { SmGui::EndDisabled(); }
+
         SmGui::LeftLabel("Antenna");
         SmGui::FillWidth();
         if (SmGui::Combo(CONCAT("##sdrplay_rspduo_ant", name), &rspduo_antennaPort, rspduo_antennaPortsTxt)) {
@@ -1108,6 +1248,25 @@ private:
         }
     }
 
+    // Tuner B, in dual tuner mode. The API delivers both callbacks in lockstep -- measured
+    // as identical sample counts, call counts and samples per call -- so the two streams
+    // stay aligned without any resynchronisation here.
+    static void streamCB2(short* xi, short* xq, sdrplay_api_StreamCbParamsT* params,
+                          unsigned int numSamples, unsigned int reset, void* cbContext) {
+        SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
+        if (!_this->running || !_this->dualRunning) { return; }
+        for (int i = 0; i < numSamples; i++) {
+            int id = _this->bufferIndex2++;
+            _this->stream2.writeBuf[id].re = (float)xi[i] / 32768.0f;
+            _this->stream2.writeBuf[id].im = (float)xq[i] / 32768.0f;
+
+            if (_this->bufferIndex2 >= _this->bufferSize) {
+                _this->stream2.swap(_this->bufferSize);
+                _this->bufferIndex2 = 0;
+            }
+        }
+    }
+
     static void eventCB(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner,
                         sdrplay_api_EventParamsT* params, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
@@ -1116,6 +1275,15 @@ private:
     std::string name;
     bool enabled = true;
     dsp::stream<dsp::complex_t> stream;
+    dsp::stream<dsp::complex_t> stream2;
+    ChannelSet channels;
+    OptionList<int, double> duoFsList;
+    OptionList<int, int> duoDecimList;
+    int duoFsId = 0;
+    int duoDecimId = 0;
+    bool rspduo_dualTuner = false;
+    bool dualRunning = false;
+    int bufferIndex2 = 0;
     double sampleRate;
     SourceManager::SourceHandler handler;
     bool running = false;

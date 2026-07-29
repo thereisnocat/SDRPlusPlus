@@ -75,7 +75,7 @@ as a member and hands core a pointer. Appending fields to the struct means core 
 past the end of structs allocated by modules compiled against the old header. Do **not**
 extend `SourceHandler` — use a side registry keyed by source name (§2.1).
 
-**(c) The SDRplay module is hardcoded to single-tuner.**
+**(c) The SDRplay module is hardcoded to single-tuner.** *(Fixed in Phase 7.)*
 `source_modules/sdrplay_source/src/main.cpp:233,502` set
 `sdrplay_api_RspDuoMode_Single_Tuner` unconditionally, and `rspDuoSelectAntennaPort()`
 (line 462) *swaps* the active tuner rather than running both. RSPduo support is a real
@@ -609,7 +609,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **4** | Auto-null | No | **Done** — block Wiener solution (`MODE_AUTO`/`MODE_HOLD`), adaptation rate, Freeze/Resume/Copy-to-manual, and a reference band (`dsp/combine/ref_band.h`) restricting the solver to a slice of spectrum. Converges to the synthetic source's known weight to three decimals. Confirmed live. |
 | **5** | Wideband | No | **Done** — `dsp/combine/wideband_solver.h/.cpp` solves an N-tap complex weight from averaged cross/auto-spectra and applies it as a short FIR; the delay control is disabled under it. Needed a broadband interferer in the synthetic source first (see below). Against a 3.7-sample skew a scalar recovers nothing while 64 taps hold the full null. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
-| **7** | More radios | Yes | RSPduo dual-tuner; Perseus22 and RSR200 source modules. |
+| **7** | More radios | Yes | **RSPduo dual-tuner done** — `sdrplay_source` opens `Tuner_Both` in `Dual_Tuner`, splits the two callbacks into two streams and registers a `ChannelSet`. Measured on hardware: both `rspDuoSampleFreq` choices decimate to 2 MS/s, and the two callbacks deliver in exact lockstep (identical sample counts, call counts and samples per call). `phaseCoherent` left false pending a measurement with signal in both ports. Perseus22 and RSR200 modules still to come. |
 | **8** | Decorrelation | No | **Done** — `dsp/combine/decorrelator.h`: closed-form 2×2 eigendecomposition, coherence, and whitening. `MODE_DECORR_MIN` nulls the dominant arrival, `MODE_DECORR_MAX` peaks it; noise measurement enables a maximum-SNR combine. Covered by `core/test/test_decorrelation.cpp`, where a station 26 dB beneath a local ends up 43 dB above it. See §2.6. |
 
 Phase 0 is doing real work here, not box-ticking. A synthetic source with a *known*
