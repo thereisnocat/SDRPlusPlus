@@ -201,9 +201,23 @@ Controls, ordered by what a DXer actually reaches for:
 - **Monitor** combo: listen to A / B / combined without disturbing the weight — makes
   "is this actually helping?" answerable
 
-Optional but high-value: a 2-D gain/phase pad (drag a dot, x = phase, y = gain) with the
-null-depth value shaded behind it. This is how the Perseus22 and RSR200 present it, and
-it finds a null far faster than two independent sliders.
+**A 2-D gain/phase pad — built, and polar rather than rectangular.** The sketch above said
+x = phase, y = gain, but the justification for wanting it at all was that this is how the
+Perseus22 and RSR200 present it, and both are polar. Polar is also the better picture on its
+own merits: the weight *is* a complex number, so the complex plane is its natural view, and
+phase wraps round the circle instead of hitting a discontinuity at the edge of a box. Angle
+is phase, radius is gain, centre is −40 dB, the emphasised ring is unity, the edge is +40 dB.
+
+The "null depth shaded behind it" is a map painted by exploring, not a prediction: depth at
+an untried setting cannot be known without applying it and measuring. Each cell records the
+best depth seen there, so a sweep leaves a field behind, with a marker on the deepest point
+and a control to return to it.
+
+It also draws read-only in the adaptive and decorrelation modes, showing where the solver
+has gone. For decorrelation, which applies a coefficient pair rather than one weight, the
+equivalent `w = −k1/k0` is shown so the solver's answer lands on the same picture as a
+hand-set one — a weight parked somewhere implausible is the first visible sign that the
+covariance estimate is being pulled by the wrong signal.
 
 **Two refinements from building it (Phase 3):**
 

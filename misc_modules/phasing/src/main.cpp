@@ -11,6 +11,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <complex>
 
 SDRPP_MOD_INFO{
     /* Name:            */ "phasing",
@@ -63,6 +64,146 @@ namespace {
         while (deg < -180.0f) { deg += 360.0f; }
         return deg;
     }
+}
+
+// Remembers how deep the null got at each point the operator has visited, so a sweep
+// leaves a map behind. Nothing can predict the depth at an unvisited setting -- it has to
+// be tried -- but there is no reason to make someone re-find a spot they already passed
+// through.
+struct NullHeat {
+    static const int ANGLES = 72;
+    static const int RADII = 20;
+
+    float best[ANGLES][RADII];
+    float bestDepth = -1e9f;
+    float bestGain = 0.0f;
+    float bestPhase = 0.0f;
+    bool any = false;
+
+    NullHeat() { clear(); }
+
+    void clear() {
+        for (int a = 0; a < ANGLES; a++) {
+            for (int r = 0; r < RADII; r++) { best[a][r] = -1e9f; }
+        }
+        bestDepth = -1e9f;
+        any = false;
+    }
+
+    static int angleBin(float phaseDeg) {
+        int a = (int)std::floor((phaseDeg + 180.0f) / 360.0f * (float)ANGLES);
+        return std::clamp(a, 0, ANGLES - 1);
+    }
+    static int radiusBin(float gainDb, float minDb, float maxDb) {
+        int r = (int)std::floor((gainDb - minDb) / (maxDb - minDb) * (float)RADII);
+        return std::clamp(r, 0, RADII - 1);
+    }
+
+    void record(float gainDb, float phaseDeg, float depth, float minDb, float maxDb) {
+        const int a = angleBin(phaseDeg);
+        const int r = radiusBin(gainDb, minDb, maxDb);
+        if (depth > best[a][r]) { best[a][r] = depth; }
+        if (depth > bestDepth) {
+            bestDepth = depth;
+            bestGain = gainDb;
+            bestPhase = phaseDeg;
+        }
+        any = true;
+    }
+};
+
+// A polar view of the complex weight: angle is phase, radius is gain. Dragging inside it
+// sets both at once, which is how a null is actually hunted -- the two are not independent,
+// and chasing them on separate sliders means walking a diagonal one axis at a time.
+//
+// Polar rather than the rectangular pad the plan first sketched. The plan justified the
+// idea by pointing at the Perseus22 and the RSR200, and both present this polar, for a good
+// reason: the thing being adjusted *is* a complex number, so the complex plane is its
+// natural picture, and phase wraps round the circle instead of hitting a discontinuity at
+// the edge of a box.
+//
+// Returns true when the user moved it.
+static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
+                     bool interactive, float minDb, float maxDb,
+                     const NullHeat* heat, float depthScale) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(size, size));
+
+    const ImVec2 centre(origin.x + size * 0.5f, origin.y + size * 0.5f);
+    const float radius = size * 0.5f - 10.0f;
+    const float span = std::max(1.0f, maxDb - minDb);
+
+    auto toScreen = [&](float g, float p) {
+        const float r = radius * std::clamp((g - minDb) / span, 0.0f, 1.0f);
+        const float th = p * (float)(M_PI / 180.0);
+        return ImVec2(centre.x + r * std::cos(th), centre.y - r * std::sin(th));
+    };
+
+    dl->AddCircleFilled(centre, radius + 6.0f, IM_COL32(18, 18, 22, 255), 64);
+
+    // The explored map, drawn as filled annular cells so it reads as a field rather than a
+    // scatter of dots.
+    if (heat && heat->any) {
+        for (int a = 0; a < NullHeat::ANGLES; a++) {
+            for (int r = 0; r < NullHeat::RADII; r++) {
+                const float d = heat->best[a][r];
+                if (d < -1e8f) { continue; }
+                const float t = std::clamp(d / std::max(depthScale, 1.0f), 0.0f, 1.0f);
+                const ImU32 col = IM_COL32((int)(40 + 60 * t), (int)(70 + 185 * t), (int)(90 + 60 * (1.0f - t)),
+                                           (int)(60 + 150 * t));
+                const float a0 = ((float)a / NullHeat::ANGLES) * 2.0f * (float)M_PI - (float)M_PI;
+                const float a1 = ((float)(a + 1) / NullHeat::ANGLES) * 2.0f * (float)M_PI - (float)M_PI;
+                const float r0 = radius * ((float)r / NullHeat::RADII);
+                const float r1 = radius * ((float)(r + 1) / NullHeat::RADII);
+                const ImVec2 p0(centre.x + r0 * std::cos(a0), centre.y - r0 * std::sin(a0));
+                const ImVec2 p1(centre.x + r1 * std::cos(a0), centre.y - r1 * std::sin(a0));
+                const ImVec2 p2(centre.x + r1 * std::cos(a1), centre.y - r1 * std::sin(a1));
+                const ImVec2 p3(centre.x + r0 * std::cos(a1), centre.y - r0 * std::sin(a1));
+                dl->AddQuadFilled(p0, p1, p2, p3, col);
+            }
+        }
+    }
+
+    // Gain rings every 20 dB, and the cardinal phases.
+    for (float g = minDb; g <= maxDb + 0.01f; g += 20.0f) {
+        const float r = radius * std::clamp((g - minDb) / span, 0.0f, 1.0f);
+        if (r < 1.0f) { continue; }
+        const bool unity = (std::abs(g) < 0.01f);
+        dl->AddCircle(centre, r, unity ? IM_COL32(150, 150, 160, 200) : IM_COL32(70, 70, 80, 180), 64, unity ? 1.6f : 1.0f);
+    }
+    for (int k = 0; k < 4; k++) {
+        const float th = (float)k * (float)M_PI * 0.5f;
+        dl->AddLine(centre, ImVec2(centre.x + radius * std::cos(th), centre.y - radius * std::sin(th)),
+                    IM_COL32(70, 70, 80, 160));
+    }
+    dl->AddText(ImVec2(centre.x + radius - 12.0f, centre.y - 16.0f), IM_COL32(140, 140, 150, 220), "0");
+    dl->AddText(ImVec2(centre.x - 26.0f, centre.y - 16.0f), IM_COL32(140, 140, 150, 220), "180");
+
+    // Where the deepest null was found, so it can be walked back to.
+    if (heat && heat->any && heat->bestDepth > -1e8f) {
+        const ImVec2 bp = toScreen(heat->bestGain, heat->bestPhase);
+        dl->AddCircle(bp, 6.0f, IM_COL32(255, 210, 80, 230), 12, 2.0f);
+    }
+
+    bool changed = false;
+    if (interactive && ImGui::IsItemActive()) {
+        const ImVec2 m = ImGui::GetIO().MousePos;
+        const float dx = m.x - centre.x;
+        const float dy = centre.y - m.y;
+        const float r = std::min(std::sqrt(dx * dx + dy * dy), radius);
+        if (r > 0.5f) {
+            phaseDeg = std::atan2(dy, dx) * (float)(180.0 / M_PI);
+            gainDb = minDb + (r / radius) * span;
+            changed = true;
+        }
+    }
+
+    const ImVec2 dot = toScreen(gainDb, phaseDeg);
+    dl->AddLine(centre, dot, IM_COL32(120, 200, 255, 140), 1.5f);
+    dl->AddCircleFilled(dot, 5.0f, IM_COL32(120, 200, 255, 255), 16);
+    dl->AddCircle(dot, 5.0f, IM_COL32(255, 255, 255, 200), 16, 1.5f);
+    return changed;
 }
 
 class PhasingModule : public ModuleManager::Instance {
@@ -305,6 +446,73 @@ private:
             _this->phaseFine = 0.0f;
             _this->applyToPhaser();
             _this->saveSettings();
+        }
+
+        // -- The pad -----------------------------------------------------------
+        // Interactive only where the weight is the operator's to set. In the adaptive and
+        // decorrelation modes it still draws, showing where the solver has gone, which is
+        // worth seeing: a weight parked somewhere implausible is the first sign that the
+        // covariance estimate is being pulled by the wrong signal.
+        if (combining) {
+            float padGain = _this->effectiveGain();
+            float padPhase = _this->effectivePhase();
+
+            if (decorrelating) {
+                // Decorrelation applies a pair, y = k0*A + k1*B, rather than a single
+                // weight. The equivalent of "A - w*B" is w = -k1/k0, which puts the
+                // solver's answer on the same picture as a hand-set one.
+                dsp::complex_t k0, k1;
+                sigpath::phasing.getCombineCoefficients(k0, k1);
+                const std::complex<float> c0(k0.re, k0.im), c1(k1.re, k1.im);
+                if (std::abs(c0) > 1e-12f) {
+                    const std::complex<float> w = -c1 / c0;
+                    padGain = std::clamp(20.0f * std::log10(std::max(std::abs(w), 1e-6f)), -40.0f, 40.0f);
+                    padPhase = std::arg(w) * (float)(180.0 / M_PI);
+                }
+            }
+
+            const bool live = (_this->mode == dsp::combine::Phaser::MODE_MANUAL);
+            const float padSize = std::min(menuWidth, 240.0f);
+
+            if (phasePad(CONCAT("##_phasing_pad_", _this->name), padSize, padGain, padPhase,
+                         live, -40.0f, 40.0f, &_this->heat, 40.0f)) {
+                _this->gainCoarse = padGain;
+                _this->phaseCoarse = wrap180(padPhase);
+                _this->gainFine = 0.0f;
+                _this->phaseFine = 0.0f;
+                _this->applyToPhaser();
+                _this->padDirty = true;
+            }
+
+            // Paint the map as the operator explores. The depth reported lags the weight by
+            // about a block, which at any human drag speed is far less than one cell.
+            const float depthNow = sigpath::phasing.getNullDepth();
+            if (depthNow > 0.0f) { _this->heat.record(padGain, padPhase, depthNow, -40.0f, 40.0f); }
+
+            if (_this->heat.any && _this->heat.bestDepth > -1e8f) {
+                ImGui::Text("Best here: %.1f dB at %+.2f dB, %+.2f deg",
+                            _this->heat.bestDepth, _this->heat.bestGain, _this->heat.bestPhase);
+                if (live) {
+                    if (ImGui::Button(CONCAT("Go to best##_phasing_gobest_", _this->name))) {
+                        _this->gainCoarse = _this->heat.bestGain;
+                        _this->phaseCoarse = wrap180(_this->heat.bestPhase);
+                        _this->gainFine = 0.0f;
+                        _this->phaseFine = 0.0f;
+                        _this->applyToPhaser();
+                        _this->saveSettings();
+                    }
+                    ImGui::SameLine();
+                }
+                if (ImGui::Button(CONCAT("Clear map##_phasing_clearmap_", _this->name))) {
+                    _this->heat.clear();
+                }
+            }
+
+            // Persist only once the drag ends, rather than writing config every frame.
+            if (_this->padDirty && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                _this->padDirty = false;
+                _this->saveSettings();
+            }
         }
 
         // -- Delay -------------------------------------------------------------
@@ -574,6 +782,8 @@ private:
     double refWidth = 20000.0;
     bool wideband = false;
     int wbTaps = 32;
+    NullHeat heat;
+    bool padDirty = false;
 
     std::vector<Memory> memories;
     int memId = 0;
