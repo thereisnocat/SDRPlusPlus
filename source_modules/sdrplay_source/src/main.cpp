@@ -506,6 +506,24 @@ public:
     }
 
     void rspDuoSelectAntennaPort(int port) {
+        // In dual tuner mode both tuners are already running, so there is no "active tuner"
+        // to swap -- SwapRspDuoActiveTuner returns InvalidParam. The only choice that still
+        // means anything is tuner 1's input, 50 ohm or Hi-Z; tuner 2 always has its own
+        // port. Falling through to the single tuner path would also repoint channelParams
+        // at channel B, sending later gain changes to the wrong tuner.
+        if (rspduo_dualTuner && openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            if (!openDevParams || !openDevParams->rxChannelA) { return; }
+            const sdrplay_api_RspDuo_AmPortSelectT amPort =
+                (port == 1) ? sdrplay_api_RspDuo_AMPORT_1 : sdrplay_api_RspDuo_AMPORT_2;
+            openDevParams->rxChannelA->rspDuoTunerParams.tuner1AmPortSel = amPort;
+            channelParams = openDevParams->rxChannelA;
+            if (running) {
+                sdrplay_api_Update(openDev.dev, sdrplay_api_Tuner_A,
+                                   sdrplay_api_Update_RspDuo_AmPortSelect, sdrplay_api_Update_Ext1_None);
+            }
+            return;
+        }
+
         if (port == 0) { rspDuoSelectTuner(sdrplay_api_Tuner_A, sdrplay_api_RspDuo_AMPORT_2); }
         if (port == 1) { rspDuoSelectTuner(sdrplay_api_Tuner_A, sdrplay_api_RspDuo_AMPORT_1); }
         if (port == 2) { rspDuoSelectTuner(sdrplay_api_Tuner_B, sdrplay_api_RspDuo_AMPORT_1); }
@@ -1146,7 +1164,8 @@ private:
                 config.release(true);
             }
             SmGui::Text("Both tuners share these settings.");
-            SmGui::Text("Antenna port choice below applies to tuner 1 only.");
+            SmGui::Text("Port below selects tuner 1 input (50 Ohm or Hi-Z).");
+            SmGui::Text("Tuner 2 always uses its own port.");
         }
         if (running) { SmGui::EndDisabled(); }
 
