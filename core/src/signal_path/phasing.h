@@ -74,6 +74,16 @@ public:
     void setReferenceBand(bool enabled, double offsetHz, double widthHz);
     void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz);
 
+    // Decorrelation: separating the dominant arrival from everything else.
+    void captureNoise(double seconds = 1.0);
+    bool isCapturingNoise();
+    bool hasNoiseReference();
+    void clearNoiseReference();
+    void setWhiteningEnabled(bool enabled);
+    bool getWhiteningEnabled();
+    float getCoherence();
+    float getComponentSeparation();
+
     dsp::combine::Phaser::Metrics getMetrics();
     float getNullDepth();
     bool isNullDepthBandLimited();

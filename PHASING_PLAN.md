@@ -273,6 +273,61 @@ exactly scored 3.4 dB while a wideband compromise that nulled nothing properly s
 When a reference band is set, the depth is therefore measured inside it, and the UI says
 which of the two it is showing.
 
+### 2.6 Decorrelation: separating the dominant arrival
+
+Prompted by the Perseus22, whose manual describes a "Decorrelation" function alongside
+"Blending" modes named *Decorrelated Max* and *Decorrelated Min*. Its wording is precise
+and worth quoting: the Signal function *"calculates the correlation matrix between the two
+channels, producing two uncorrelated signals"*. That is an eigendecomposition of the 2×2
+covariance — principal component analysis on two antennas.
+
+**It is not "common versus uncommon".** Every signal reaching two antennas is present in
+both; what distinguishes them is the complex ratio between channels, set by arrival
+direction. So the decomposition separates *the dominant arrival* from *everything
+orthogonal to it*:
+
+- the **principal** eigenvector is the maximum-power combination — whatever arrives
+  strongest;
+- the **minor** eigenvector is everything else, with that arrival removed.
+
+Two channels give exactly one degree of freedom, so this removes **one** dominant signal
+per processed band. That is precisely the medium wave case: null the local and whatever it
+was covering becomes audible.
+
+For 2×2 Hermitian the decomposition is closed form — `(R - λI)u = 0` gives
+`u = [Rab, λ - Raa]` — so there is no iteration and no matrix library
+(`dsp/combine/decorrelator.h`).
+
+**Relationship to the scalar weight.** `MODE_DECORR_MIN` and the existing auto-null solve
+nearly the same problem, but the Wiener form `Y = A - wB` privileges channel A and its
+weight grows without bound when the interferer is stronger in B. The eigenvector form is
+symmetric and unit-norm, so it nulls the dominant component exactly whichever channel
+favours it.
+
+**`MODE_DECORR_MAX` is genuinely new** — the combiner could previously only subtract.
+Peaking the dominant arrival is what makes a strong local *better*, rather than absent.
+
+**Whitening.** A maximum-power combination is not a maximum-SNR one if the two channels
+carry unequal noise: it drifts toward the noisier channel. Measuring the covariance on a
+quiet channel and applying `R^(-1/2)` fixes that, and the manual makes the same point about
+its own Noise function. The transform folds into the output coefficients
+(`u^H W x = (W^H u)^H x`), so it never touches a sample.
+
+**Coherence (the Perseus22's "Rho")** is `|Rab| / sqrt(Raa·Rbb)`, shown so the operator can
+see whether there is a dominant arrival to separate at all. It answers a question null
+depth cannot: whether the two channels are looking at the same thing.
+
+**Why medium wave suits it so well.** At MW the antennas sit within a small fraction of a
+wavelength, so the inter-channel ratio is flat across a 10 kHz channel and one complex
+weight is exactly right — coherence runs near 1. At HF with wider spacing that ratio varies
+across the band, which is what the multi-tap weight of §2.5 exists to handle.
+
+**Placement.** The Perseus22 does this per channel window with an estimation bandwidth of
+1–2 kHz for AM. Ours sits upstream of the VFOs, so the covariance is estimated over the
+reference band (§2.4) and the resulting weights applied broadband. That is equivalent for
+one VFO. Nulling a different local on each of several simultaneous VFOs needs the per-VFO
+channelisation change §2.5 sets aside.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
@@ -541,6 +596,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **5** | Wideband | No | **Done** — `dsp/combine/wideband_solver.h/.cpp` solves an N-tap complex weight from averaged cross/auto-spectra and applies it as a short FIR; the delay control is disabled under it. Needed a broadband interferer in the synthetic source first (see below). Against a 3.7-sample skew a scalar recovers nothing while 64 taps hold the full null. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
 | **7** | More radios | Yes | RSPduo dual-tuner; Perseus22 and RSR200 source modules. |
+| **8** | Decorrelation | No | **Done** — `dsp/combine/decorrelator.h`: closed-form 2×2 eigendecomposition, coherence, and whitening. `MODE_DECORR_MIN` nulls the dominant arrival, `MODE_DECORR_MAX` peaks it; noise measurement enables a maximum-SNR combine. Covered by `core/test/test_decorrelation.cpp`, where a station 26 dB beneath a local ends up 43 dB above it. See §2.6. |
 
 Phase 0 is doing real work here, not box-ticking. A synthetic source with a *known*
 inter-channel weight gives a ground truth no on-air test can: you can assert that auto-null

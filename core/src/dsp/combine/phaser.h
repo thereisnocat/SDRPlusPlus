@@ -3,6 +3,7 @@
 #include "../buffer/buffer.h"
 #include "channel_sync.h"
 #include "ref_band.h"
+#include "decorrelator.h"
 #include "wideband_solver.h"
 #include <mutex>
 #include <atomic>
@@ -124,10 +125,13 @@ namespace dsp::combine {
             MODE_B_ONLY,   // pass channel B through untouched
             MODE_MANUAL,   // Y = A - w*B with the user's weight
             MODE_AUTO,     // same, with w solved for continuously
-            MODE_HOLD      // same, with w frozen wherever adaptation left it
+            MODE_HOLD,     // same, with w frozen wherever adaptation left it
+            MODE_DECORR_MIN, // principal component removed: the dominant arrival is nulled
+            MODE_DECORR_MAX  // principal component kept: the dominant arrival is peaked
         };
 
         static bool isCombining(Mode m) { return m != MODE_A_ONLY && m != MODE_B_ONLY; }
+        static bool isDecorrelating(Mode m) { return m == MODE_DECORR_MIN || m == MODE_DECORR_MAX; }
 
         struct Metrics {
             float powerA = 0.0f;    // mean |A|^2 over the last processed block
@@ -262,6 +266,52 @@ namespace dsp::combine {
             widthHz = _refWidth;
         }
 
+        // Arm a noise measurement. The next second or so of covariance is taken as the
+        // noise-only reference and inverted to a whitening transform, after which a
+        // maximum-power combination is also a maximum-SNR one. Point the radio at a quiet
+        // channel first: whatever is on the air while this runs becomes "noise".
+        void captureNoise(double seconds = 1.0) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _noiseCapture = Covariance();
+            _noiseCaptureTerms = 0.0;
+            _noiseCaptureWanted = std::max(1.0, seconds * _sampleRate);
+            _capturingNoise = true;
+        }
+
+        bool isCapturingNoise() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _capturingNoise;
+        }
+
+        bool hasNoiseReference() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _haveWhitening;
+        }
+
+        void setWhiteningEnabled(bool enabled) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _whiteningEnabled = enabled;
+        }
+
+        bool getWhiteningEnabled() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _whiteningEnabled;
+        }
+
+        void clearNoiseReference() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _haveWhitening = false;
+            _whiteningEnabled = false;
+            _whitening = Matrix2();
+        }
+
+        // How strongly the two channels agree, 0 to 1. Near 1 means there is a dominant
+        // arrival worth separating; low values mean a diffuse mixture and nothing to null.
+        float getCoherence() { return coherenceValue.load(std::memory_order_relaxed); }
+
+        // Gap between the two principal components, in dB.
+        float getComponentSeparation() { return separationValue.load(std::memory_order_relaxed); }
+
         void getWeight(float& gainDb, float& phaseDeg) {
             std::lock_guard<std::mutex> lck(paramMtx);
             gainDb = _gainDb;
@@ -359,6 +409,7 @@ namespace dsp::combine {
             float adaptRate;
             bool refEnabled;
             bool wideband;
+            bool decorrelating;
             {
                 std::lock_guard<std::mutex> lck(paramMtx);
                 mode = _mode;
@@ -367,6 +418,8 @@ namespace dsp::combine {
                 adaptRate = _adaptRate;
                 refEnabled = _refEnabled;
                 wideband = _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
+                decorrelating = isDecorrelating(_mode);
+                if (decorrelating) { wideband = false; }
                 if (_wbDirty) {
                     wbSolver.configure(1024, _wbTaps, std::max(_adaptRate, 0.02f));
                     wbHist.assign(std::max(_wbTaps - 1, 0), complex_t{ 0.0f, 0.0f });
@@ -429,6 +482,17 @@ namespace dsp::combine {
                 if (mode == MODE_AUTO) { wbSolver.feed(a, b, count); }
                 wbSolver.copyTaps(wbTapsRev);
                 applyWideband(count, a, b, outBuf);
+                updateMetrics(count, a, b, outBuf);
+                if (refEnabled) { updateBandDepth(count, a, outBuf); }
+                return;
+            }
+
+            if (decorrelating || _capturingNoise) {
+                updateCovariance(count, a, b, refEnabled, adaptRate);
+            }
+
+            if (decorrelating) {
+                applyDecorrelation(count, a, b, outBuf, mode);
                 updateMetrics(count, a, b, outBuf);
                 if (refEnabled) { updateBandDepth(count, a, outBuf); }
                 return;
@@ -500,6 +564,92 @@ namespace dsp::combine {
             memcpy(wbHist.data(), wbLine.data() + count, (n - 1) * sizeof(complex_t));
         }
 
+        // Accumulate the 2x2 covariance, over the reference band when one is set so the
+        // decomposition describes the signal the user pointed at rather than the whole span.
+        void updateCovariance(int count, const complex_t* a, const complex_t* b,
+                              bool refEnabled, float adaptRate) {
+            std::complex<double> rab(0.0, 0.0);
+            double rbb = 0.0, raa = 0.0;
+            const int terms = refEnabled ? refBand.accumulate(a, b, count, rab, rbb, &raa)
+                                         : RefBand::accumulateWideband(a, b, count, rab, rbb, &raa);
+            if (terms <= 0) { return; }
+
+            const double inv = 1.0 / (double)terms;
+            raa *= inv;
+            rbb *= inv;
+            rab *= inv;
+
+            std::lock_guard<std::mutex> lck(paramMtx);
+
+            if (_capturingNoise) {
+                // Plain running mean: a noise reference wants the whole window weighted
+                // equally, not the tail favoured.
+                const double n = _noiseCaptureTerms;
+                const double m = n + (double)terms;
+                _noiseCapture.raa = (_noiseCapture.raa * n + raa * (double)terms) / m;
+                _noiseCapture.rbb = (_noiseCapture.rbb * n + rbb * (double)terms) / m;
+                _noiseCapture.rab = (_noiseCapture.rab * n + rab * (double)terms) / m;
+                _noiseCaptureTerms = m;
+                if (m >= _noiseCaptureWanted) {
+                    _capturingNoise = false;
+                    if (_noiseCapture.valid()) {
+                        _whitening = inverseSqrt(_noiseCapture);
+                        _haveWhitening = true;
+                    }
+                }
+            }
+
+            const double lambda = std::min(1.0, std::max(0.001, (double)adaptRate));
+            _cov.raa = _cov.raa * (1.0 - lambda) + raa * lambda;
+            _cov.rbb = _cov.rbb * (1.0 - lambda) + rbb * lambda;
+            _cov.rab = _cov.rab * (1.0 - lambda) + rab * lambda;
+        }
+
+        void applyDecorrelation(int count, const complex_t* a, const complex_t* b,
+                                complex_t* outBuf, Mode mode) {
+            Covariance cov;
+            Matrix2 whitening;
+            bool whitened = false;
+            {
+                std::lock_guard<std::mutex> lck(paramMtx);
+                cov = _cov;
+                whitening = _whitening;
+                whitened = _whiteningEnabled && _haveWhitening;
+            }
+
+            if (!cov.valid()) {
+                memcpy(outBuf, a, count * sizeof(complex_t));
+                return;
+            }
+
+            const Covariance working = whitened ? transform(cov, whitening) : cov;
+            const Eigen2 e = solveEigen2(working);
+            coherenceValue.store((float)coherence(cov), std::memory_order_relaxed);
+            separationValue.store((float)e.separationDb(), std::memory_order_relaxed);
+
+            std::complex<double> k0, k1;
+            combineCoefficients(mode == MODE_DECORR_MIN ? e.uMin : e.uMax,
+                                whitening, whitened, k0, k1);
+
+            // Ramp across the block, for the same reason the scalar weight does: the
+            // coefficients move every block while adapting, and stepping them clicks.
+            const float invN = 1.0f / (float)count;
+            const complex_t t0 = { (float)k0.real(), (float)k0.imag() };
+            const complex_t t1 = { (float)k1.real(), (float)k1.imag() };
+            const float d0r = (t0.re - _k0.re) * invN, d0i = (t0.im - _k0.im) * invN;
+            const float d1r = (t1.re - _k1.re) * invN, d1i = (t1.im - _k1.im) * invN;
+            float c0r = _k0.re, c0i = _k0.im, c1r = _k1.re, c1i = _k1.im;
+
+            for (int i = 0; i < count; i++) {
+                outBuf[i].re = (c0r * a[i].re - c0i * a[i].im) + (c1r * b[i].re - c1i * b[i].im);
+                outBuf[i].im = (c0r * a[i].im + c0i * a[i].re) + (c1r * b[i].im + c1i * b[i].re);
+                c0r += d0r; c0i += d0i;
+                c1r += d1r; c1i += d1i;
+            }
+            _k0 = t0;
+            _k1 = t1;
+        }
+
         void updateMetrics(int count, const complex_t* a, const complex_t* b, const complex_t* y) {
             // sum(x * conj(x)) is sum|x|^2, so one volk call per channel.
             lv_32fc_t acc;
@@ -542,6 +692,14 @@ namespace dsp::combine {
         double _refWidth = 20000.0;
         double _sampleRate = 1000000.0;
         bool _refDirty = true;
+        Covariance _cov;
+        Covariance _noiseCapture;
+        Matrix2 _whitening;
+        double _noiseCaptureTerms = 0.0;
+        double _noiseCaptureWanted = 0.0;
+        bool _capturingNoise = false;
+        bool _haveWhitening = false;
+        bool _whiteningEnabled = false;
         bool _wideband = false;
         int _wbTaps = 32;
         bool _wbDirty = true;
@@ -549,10 +707,14 @@ namespace dsp::combine {
         // Worker-thread only.
         complex_t _current = { 0.0f, 0.0f };
         float _delayCurrent = 0.0f;
+        complex_t _k0 = { 1.0f, 0.0f };
+        complex_t _k1 = { 0.0f, 0.0f };
 
         std::atomic<float> powerA{ 0.0f };
         std::atomic<float> powerB{ 0.0f };
         std::atomic<float> powerOut{ 0.0f };
         std::atomic<float> bandDepth{ 0.0f };
+        std::atomic<float> coherenceValue{ 0.0f };
+        std::atomic<float> separationValue{ 0.0f };
     };
 }

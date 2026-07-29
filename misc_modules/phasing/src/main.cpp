@@ -227,13 +227,15 @@ private:
         ImGui::LeftLabel("Output");
         ImGui::FillWidth();
         if (ImGui::Combo(CONCAT("##_phasing_mode_", _this->name), &_this->mode,
-                         "Channel A only\0Channel B only\0Manual\0Auto-null\0Hold\0")) {
+                         "Channel A only\0Channel B only\0Manual\0Auto-null\0Hold\0"
+                         "Decorrelate: null strongest\0Decorrelate: peak strongest\0")) {
             _this->applyToPhaser();
             _this->saveSettings();
         }
 
         const bool combining = dsp::combine::Phaser::isCombining((dsp::combine::Phaser::Mode)_this->mode);
         const bool adapting = (_this->mode == dsp::combine::Phaser::MODE_AUTO);
+        const bool decorrelating = dsp::combine::Phaser::isDecorrelating((dsp::combine::Phaser::Mode)_this->mode);
 
         // While adapting, the weight belongs to the algorithm; the controls become a
         // readout. Editing them would be overwritten within a block anyway.
@@ -242,7 +244,7 @@ private:
             _this->gainFine = 0.0f;
             _this->phaseFine = 0.0f;
         }
-        if (!combining || adapting) { style::beginDisabled(); }
+        if (!combining || adapting || decorrelating) { style::beginDisabled(); }
 
         // -- Gain --------------------------------------------------------------
         ImGui::LeftLabel("Gain");
@@ -321,10 +323,57 @@ private:
             ImGui::TextWrapped("Handled by the taps.");
         }
 
-        if (!combining || adapting) { style::endDisabled(); }
+        if (!combining || adapting || decorrelating) { style::endDisabled(); }
+
+        // -- Decorrelation -----------------------------------------------------
+        if (decorrelating) {
+            // Every signal reaches both antennas; what separates them is arrival
+            // direction. So this splits the dominant arrival from everything orthogonal
+            // to it, rather than "common" from "uncommon".
+            ImGui::TextWrapped("Splits the strongest arrival from everything else. "
+                               "Null it to hear what it was covering; peak it to favour it.");
+
+            ImGui::LeftLabel("Rate");
+            ImGui::FillWidth();
+            if (ImGui::SliderFloat(CONCAT("##_phasing_drate_", _this->name), &_this->adaptRate, 0.001f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic)) {
+                sigpath::phasing.setAdaptRate(_this->adaptRate);
+                _this->saveSettings();
+            }
+
+            const float rho = sigpath::phasing.getCoherence();
+            const float sep = sigpath::phasing.getComponentSeparation();
+            ImGui::Text("Coherence %.3f, separation %.1f dB", rho, sep);
+            ImGui::FillWidth();
+            ImGui::VolumeMeter(std::clamp(rho, 0.0f, 1.0f), std::clamp(rho, 0.0f, 1.0f), 0, 1);
+            if (rho < 0.5f) {
+                // Low coherence means there is no single dominant arrival to separate, so
+                // whatever the solver returns is arbitrary.
+                ImGui::TextWrapped("Low coherence: no single arrival dominates here, so "
+                                   "there is little to separate. Narrow the reference band "
+                                   "onto one signal.");
+            }
+
+            // Whitening, so that peaking the strongest arrival maximises signal to noise
+            // rather than merely power. Meaningless without a noise-only measurement.
+            if (sigpath::phasing.isCapturingNoise()) {
+                ImGui::TextWrapped("Measuring noise...");
+            }
+            else if (ImGui::Button(CONCAT("Measure noise##_phasing_noise_", _this->name))) {
+                sigpath::phasing.captureNoise(1.0);
+            }
+            if (sigpath::phasing.hasNoiseReference()) {
+                ImGui::SameLine();
+                bool w = sigpath::phasing.getWhiteningEnabled();
+                if (ImGui::Checkbox(CONCAT("Use it##_phasing_white_", _this->name), &w)) {
+                    sigpath::phasing.setWhiteningEnabled(w);
+                }
+                ImGui::TextWrapped("Tune to a clear channel before measuring: whatever is "
+                                   "on the air becomes the noise reference.");
+            }
+        }
 
         // -- Adaptation --------------------------------------------------------
-        if (combining) {
+        if (combining && !decorrelating) {
             if (!adapting) { style::beginDisabled(); }
             ImGui::LeftLabel("Rate");
             ImGui::FillWidth();

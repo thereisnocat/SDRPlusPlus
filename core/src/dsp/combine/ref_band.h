@@ -52,8 +52,10 @@ namespace dsp::combine {
         }
 
         // Whole-band correlation: no mixing, no filtering, every sample counts equally.
-        static void accumulateWideband(const complex_t* a, const complex_t* b, int count,
-                                       std::complex<double>& rab, double& rbb, double* raa = NULL) {
+        // Returns the number of terms accumulated, so a caller averaging across blocks can
+        // normalise: the band-limited path yields far fewer terms than samples fed in.
+        static int accumulateWideband(const complex_t* a, const complex_t* b, int count,
+                                      std::complex<double>& rab, double& rbb, double* raa = NULL) {
             for (int i = 0; i < count; i++) {
                 const std::complex<double> av(a[i].re, a[i].im);
                 const std::complex<double> bv(b[i].re, b[i].im);
@@ -61,6 +63,7 @@ namespace dsp::combine {
                 rbb += std::norm(bv);
                 if (raa) { *raa += std::norm(av); }
             }
+            return count;
         }
 
         // Correlation restricted to the configured band. State persists across calls so
@@ -70,8 +73,9 @@ namespace dsp::combine {
         // weight that cancels the interferer exactly can still raise total power, because
         // it is free to amplify everything else, so a whole-band power ratio marks the
         // correct answer down.
-        void accumulate(const complex_t* a, const complex_t* b, int count,
-                        std::complex<double>& rab, double& rbb, double* raa = NULL) {
+        int accumulate(const complex_t* a, const complex_t* b, int count,
+                       std::complex<double>& rab, double& rbb, double* raa = NULL) {
+            int terms = 0;
             for (int i = 0; i < count; i++) {
                 // One rotation, applied to both channels, so the relative phase survives.
                 const std::complex<double> av = std::complex<double>(a[i].re, a[i].im) * rot;
@@ -99,11 +103,13 @@ namespace dsp::combine {
                 rab += y2a * std::conj(y2b);
                 rbb += std::norm(y2b);
                 if (raa) { *raa += std::norm(y2a); }
+                terms++;
             }
 
             // Keep the mixer on the unit circle.
             const double m = std::abs(rot);
             if (m > 0.0) { rot /= m; }
+            return terms;
         }
 
         int decimation() const { return len1 * len2; }
