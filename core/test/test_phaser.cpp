@@ -416,6 +416,100 @@ int main() {
         check(std::abs(gotPhase - (float)-phase) < 5.0f, "reference band solved the interferer's phase");
     }
 
+    // -----------------------------------------------------------------
+    // The case a single complex weight provably cannot solve, and the reason the
+    // multi-tap weight exists. A broadband pest reaching both antennas with a timing
+    // difference needs a *different* weight at every frequency; one scalar can satisfy
+    // only one of them. See PHASING_PLAN.md section 2.5.
+    printf("\nA multi-tap weight nulls a delayed broadband pest; a scalar cannot\n");
+    {
+        struct Rig {
+            // Shared broadband process, read twice at different delays. Self-contained so
+            // the core tests stay independent of the test source module.
+            uint64_t s0 = 0x9E3779B97F4A7C15ull, s1 = 0xBF58476D1CE4E5B9ull;
+            std::vector<dsp::complex_t> ring{ std::vector<dsp::complex_t>(256, { 0.0f, 0.0f }) };
+            int w = 0;
+            long n = 0;
+
+            float uni() {
+                uint64_t x = s0, y = s1;
+                s0 = y; x ^= x << 23; s1 = x ^ y ^ (x >> 17) ^ (y >> 26);
+                return (float)(int32_t)((s1 + y) >> 32) * (1.0f / 2147483648.0f);
+            }
+            dsp::complex_t read(double d) {
+                const double pos = (double)w - d;
+                const int i = (int)std::floor(pos);
+                const float f = (float)(pos - (double)i);
+                auto at = [&](int k) { return ring[((k % 256) + 256) % 256]; };
+                const dsp::complex_t x1 = at(i), x2 = at(i + 1);
+                return { x1.re + f * (x2.re - x1.re), x1.im + f * (x2.im - x1.im) };
+            }
+            void fill(dsp::complex_t* a, dsp::complex_t* b, int count, double delay) {
+                for (int k = 0; k < count; k++, n++) {
+                    ring[w] = { uni() * 0.3f, uni() * 0.3f };
+                    const dsp::complex_t pa = read(64.0);
+                    const dsp::complex_t pb = read(64.0 + delay);
+                    // A wanted tone, present only in A, that must survive.
+                    const double ph = 2.0 * M_PI * 0.008 * (double)n;
+                    a[k] = { pa.re + (float)(0.02 * std::cos(ph)), pa.im + (float)(0.02 * std::sin(ph)) };
+                    b[k] = { pb.re * 0.7f, pb.im * 0.7f };
+                    w = (w + 1) % 256;
+                }
+            }
+        };
+
+        auto run = [](bool wideband, int taps, double delay) {
+            Rig rig;
+            dsp::stream<dsp::complex_t> a, b;
+            dsp::combine::Phaser ph;
+            ph.init(&a, &b);
+            ph.setMode(dsp::combine::Phaser::MODE_AUTO);
+            ph.setAdaptRate(0.3f);
+            ph.setWideband(wideband, taps);
+            ph.reset();
+            ph.start();
+
+            std::vector<dsp::complex_t> got;
+            std::thread rd([&] {
+                while (true) {
+                    int c = ph.out.read();
+                    if (c < 0) { break; }
+                    for (int i = 0; i < c; i++) { got.push_back(ph.out.readBuf[i]); }
+                    ph.out.flush();
+                }
+            });
+
+            const int N = 8192;
+            for (int k = 0; k < 100; k++) {
+                rig.fill(a.writeBuf, b.writeBuf, N, delay);
+                a.swap(N);
+                b.swap(N);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            ph.stop();
+            ph.out.stopReader();
+            rd.join();
+            ph.out.clearReadStop();
+
+            // Score the settled part only.
+            const size_t from = got.size() * 3 / 4;
+            double acc = 0.0;
+            for (size_t i = from; i < got.size(); i++) { acc += (double)got[i].re * got[i].re + (double)got[i].im * got[i].im; }
+            return 10.0 * std::log10(acc / (double)(got.size() - from) + 1e-300);
+        };
+
+        const double scalarFlat = run(false, 0, 0.0);
+        const double tapsFlat = run(true, 64, 0.0);
+        printf("        no delay:  scalar %.2f dB, 64 taps %.2f dB\n", scalarFlat, tapsFlat);
+        check(std::abs(scalarFlat - tapsFlat) < 3.0, "with no skew the two are equivalent");
+
+        const double scalarSkew = run(false, 0, 3.7);
+        const double tapsSkew = run(true, 64, 3.7);
+        printf("        3.7 samples: scalar %.2f dB, 64 taps %.2f dB\n", scalarSkew, tapsSkew);
+        check(scalarSkew > scalarFlat + 6.0, "a skew defeats the scalar weight");
+        check(tapsSkew < scalarSkew - 6.0, "the multi-tap weight recovers what the scalar loses");
+    }
+
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

@@ -3,6 +3,7 @@
 #include "../buffer/buffer.h"
 #include "channel_sync.h"
 #include "ref_band.h"
+#include "wideband_solver.h"
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -215,6 +216,27 @@ namespace dsp::combine {
             return _adaptRate;
         }
 
+        // Solve a multi-tap weight instead of a single complex one, so the null can vary
+        // across the band. Only meaningful while adapting -- nobody hand-tunes 32 taps --
+        // so it applies to MODE_AUTO and MODE_HOLD and is ignored in MODE_MANUAL.
+        void setWideband(bool enabled, int taps) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _wideband = enabled;
+            _wbTaps = std::clamp(taps, 4, 128);
+            _wbDirty = true;
+        }
+
+        void getWideband(bool& enabled, int& taps) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            enabled = _wideband;
+            taps = _wbTaps;
+        }
+
+        bool isWidebandActive() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
+        }
+
         // Needed only by the reference band, to place its mixer.
         void setSampleRate(double sampleRate) {
             std::lock_guard<std::mutex> lck(paramMtx);
@@ -336,6 +358,7 @@ namespace dsp::combine {
             float delay;
             float adaptRate;
             bool refEnabled;
+            bool wideband;
             {
                 std::lock_guard<std::mutex> lck(paramMtx);
                 mode = _mode;
@@ -343,6 +366,13 @@ namespace dsp::combine {
                 delay = _delay;
                 adaptRate = _adaptRate;
                 refEnabled = _refEnabled;
+                wideband = _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
+                if (_wbDirty) {
+                    wbSolver.configure(1024, _wbTaps, std::max(_adaptRate, 0.02f));
+                    wbHist.assign(std::max(_wbTaps - 1, 0), complex_t{ 0.0f, 0.0f });
+                    wbTapsRev.clear();
+                    _wbDirty = false;
+                }
                 if (_refDirty) {
                     refBand.configure(_sampleRate, _refOffset, _refWidth);
                     metricBand.configure(_sampleRate, _refOffset, _refWidth);
@@ -356,11 +386,21 @@ namespace dsp::combine {
             // the lines entirely, which is what keeps bypass bit-identical to the input.
             if (isCombining(mode)) {
                 if ((int)dlyA.size() < count) { dlyA.resize(count); dlyB.resize(count); }
-                delayA.process(a, dlyA.data(), count, (float)BULK_DELAY, (float)BULK_DELAY);
-                delayB.process(b, dlyB.data(), count, (float)BULK_DELAY + _delayCurrent, (float)BULK_DELAY + delay);
-                _delayCurrent = delay;
-                a = dlyA.data();
-                b = dlyB.data();
+                if (wideband) {
+                    // The taps span both signs of lag, so A is held back by half the span
+                    // and B is left alone -- the filter absorbs any timing difference,
+                    // which is why the scalar delay control is retired here.
+                    const float align = (float)wbSolver.alignmentDelay();
+                    delayA.process(a, dlyA.data(), count, align, align);
+                    a = dlyA.data();
+                }
+                else {
+                    delayA.process(a, dlyA.data(), count, (float)BULK_DELAY, (float)BULK_DELAY);
+                    delayB.process(b, dlyB.data(), count, (float)BULK_DELAY + _delayCurrent, (float)BULK_DELAY + delay);
+                    _delayCurrent = delay;
+                    a = dlyA.data();
+                    b = dlyB.data();
+                }
             }
 
             // Solve for the weight that cancels whatever the two channels have in common,
@@ -383,6 +423,15 @@ namespace dsp::combine {
                     _phaseDeg = (float)(std::arg(wNew) * 180.0 / M_PI);
                     target = _target;
                 }
+            }
+
+            if (wideband) {
+                if (mode == MODE_AUTO) { wbSolver.feed(a, b, count); }
+                wbSolver.copyTaps(wbTapsRev);
+                applyWideband(count, a, b, outBuf);
+                updateMetrics(count, a, b, outBuf);
+                if (refEnabled) { updateBandDepth(count, a, outBuf); }
+                return;
             }
 
             if (mode == MODE_A_ONLY) {
@@ -413,16 +462,42 @@ namespace dsp::combine {
             }
 
             updateMetrics(count, a, b, outBuf);
+            if (refEnabled && isCombining(mode)) { updateBandDepth(count, a, outBuf); }
+        }
 
-            // Score the null where the user pointed the solver, not across the whole band.
-            if (refEnabled && isCombining(mode)) {
-                std::complex<double> ignored(0.0, 0.0);
-                double pOut = 0.0, pIn = 0.0;
-                metricBand.accumulate(a, outBuf, count, ignored, pOut, &pIn);
-                if (pIn > 1e-20 && pOut > 1e-20) {
-                    bandDepth.store((float)(10.0 * std::log10(pIn / pOut)), std::memory_order_relaxed);
-                }
+        // Score the null where the user pointed the solver, not across the whole band.
+        void updateBandDepth(int count, const complex_t* a, const complex_t* y) {
+            std::complex<double> ignored(0.0, 0.0);
+            double pOut = 0.0, pIn = 0.0;
+            metricBand.accumulate(a, y, count, ignored, pOut, &pIn);
+            if (pIn > 1e-20 && pOut > 1e-20) {
+                bandDepth.store((float)(10.0 * std::log10(pIn / pOut)), std::memory_order_relaxed);
             }
+        }
+
+        // Y[n] = A[n] - sum_k g[k] B[n-k], with the taps held reversed so each output is a
+        // single dot product against a forward-ordered history.
+        void applyWideband(int count, const complex_t* a, const complex_t* b, complex_t* outBuf) {
+            const int n = (int)wbTapsRev.size();
+            if (n < 1) {
+                memcpy(outBuf, a, count * sizeof(complex_t));
+                return;
+            }
+            if ((int)wbHist.size() != n - 1) { wbHist.assign(n - 1, complex_t{ 0.0f, 0.0f }); }
+
+            wbLine.resize(n - 1 + count);
+            memcpy(wbLine.data(), wbHist.data(), (n - 1) * sizeof(complex_t));
+            memcpy(wbLine.data() + (n - 1), b, count * sizeof(complex_t));
+
+            for (int i = 0; i < count; i++) {
+                lv_32fc_t acc;
+                volk_32fc_x2_dot_prod_32fc(&acc, (const lv_32fc_t*)(wbLine.data() + i),
+                                           (const lv_32fc_t*)wbTapsRev.data(), n);
+                outBuf[i].re = a[i].re - lv_creal(acc);
+                outBuf[i].im = a[i].im - lv_cimag(acc);
+            }
+
+            memcpy(wbHist.data(), wbLine.data() + count, (n - 1) * sizeof(complex_t));
         }
 
         void updateMetrics(int count, const complex_t* a, const complex_t* b, const complex_t* y) {
@@ -451,6 +526,8 @@ namespace dsp::combine {
         DelayLine delayA, delayB;
         RefBand refBand;
         RefBand metricBand;
+        WidebandSolver wbSolver;
+        std::vector<complex_t> wbTapsRev, wbHist, wbLine;
         std::vector<complex_t> dlyA, dlyB;
 
         std::mutex paramMtx;
@@ -465,6 +542,9 @@ namespace dsp::combine {
         double _refWidth = 20000.0;
         double _sampleRate = 1000000.0;
         bool _refDirty = true;
+        bool _wideband = false;
+        int _wbTaps = 32;
+        bool _wbDirty = true;
 
         // Worker-thread only.
         complex_t _current = { 0.0f, 0.0f };

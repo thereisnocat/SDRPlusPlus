@@ -254,6 +254,16 @@ increasing order of value:
    untouched. This is the feature SDR++ can offer that an analog phasing box cannot —
    the user can *see* the pest on the waterfall and point at it.
 
+**A wideband canceller cannot be validated with tones (found in Phase 5).** The obvious
+test signal -- two pure tones with different inter-channel weights -- makes the multi-tap
+weight look *worse* than a scalar, and it is not a bug in the solver. With tonal input
+`Sbb(f)` is essentially zero away from the two bins, so `W(f) = Sab/Sbb` is undefined
+across almost the whole band and its impulse response is not concentrated in time;
+truncating it to N taps discards nearly all of it. Demonstrating the multi-tap weight
+requires a *broadband* interferer reaching both channels with a timing difference, which
+is why the synthetic source grew one in this phase. It was flagged as a Phase 5
+prerequisite back when the source was designed, and it was the whole job.
+
 **Null depth has to be measured where the null is (found in Phase 4).** The obvious metric,
 `10*log10(mean|A|^2 / mean|Y|^2)` over the whole band, answers "did total power drop",
 which is not the same question as "did the pest go away". A weight that cancels the
@@ -528,7 +538,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **2** | Dual-channel I/O | No | **Done** — `wav::Writer` gained `addChunk()`; `core/src/utils/wav_meta.h` writes a verified `auxi` plus our `sdpc` chunk; the recorder has a "Record both channels" option writing I1 Q1 I2 Q2 with a MB/min estimate; `file_source` detects a 4-channel file and registers a `ChannelSet` so the phasing path lights up on playback. The two-input synchronisation the recorder needed was extracted from `Phaser` into `dsp::combine::ChannelSync` and is now shared. Covered by `core/test/test_wav_meta.cpp`; run everything with `core/test/run_tests.sh`. Confirmed live: a 19-second capture of the synthetic source wrote 4 channels at 1 Msps with `auxi` (centre 9917072 Hz) and `sdpc` (names 'A'/'B', both coherence flags) intact, and played back through the phasing path as two clean tones at the original offsets. |
 | **3** | UI module | No | **Done** — `misc_modules/phasing/`: output select, coarse+fine gain and phase with exact numeric entry, swap, delay, null-depth meter with peak hold, per-frequency memories, settings keyed per source. `Phaser` gained a fractional-sample delay line. Confirmed live against the synthetic source. |
 | **4** | Auto-null | No | **Done** — block Wiener solution (`MODE_AUTO`/`MODE_HOLD`), adaptation rate, Freeze/Resume/Copy-to-manual, and a reference band (`dsp/combine/ref_band.h`) restricting the solver to a slice of spectrum. Converges to the synthetic source's known weight to three decimals. Confirmed live. |
-| **5** | Wideband | No | Multi-tap frequency-domain weight; retires the fractional-delay control. Validated against the synthetic source's delay/frequency-tilt settings. |
+| **5** | Wideband | No | **Done** — `dsp/combine/wideband_solver.h/.cpp` solves an N-tap complex weight from averaged cross/auto-spectra and applies it as a short FIR; the delay control is disabled under it. Needed a broadband interferer in the synthetic source first (see below). Against a 3.7-sample skew a scalar recovers nothing while 64 taps hold the full null. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
 | **7** | More radios | Yes | RSPduo dual-tuner; Perseus22 and RSR200 source modules. |
 
@@ -617,9 +627,8 @@ rediscovered at the last minute.
   synthetic signal generator has no business in the source list of a shipped build. The
   option and the module stay in the tree — only the default changes. A reminder comment
   sits next to the option itself, which is where it will actually be noticed.
-- **Say the wideband limitation out loud in the UI** (§2.5). Until the multi-tap weight of
-  Phase 6 lands, a null-depth meter reading 45 dB at the VFO while the rest of the band
-  barely moves is correct behaviour, and without a word of explanation it reads as a bug.
+- ~~**Say the wideband limitation out loud in the UI** (§2.5).~~ Done in Phase 3, and it
+  still applies whenever the multi-tap weight is switched off.
 - **Freeze the custom phasing chunk's layout** before the first dual-channel recording
   exists, since every capture made afterwards has to stay readable by the same parser
   (§4.2). The `auxi` half is already pinned down against real files.

@@ -101,6 +101,8 @@ private:
         if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
         if (c.contains("refOffset")) { refOffset = c["refOffset"]; }
         if (c.contains("refWidth")) { refWidth = c["refWidth"]; }
+        if (c.contains("wideband")) { wideband = c["wideband"]; }
+        if (c.contains("wbTaps")) { wbTaps = c["wbTaps"]; }
 
         memories.clear();
         if (c.contains("memories")) {
@@ -135,6 +137,8 @@ private:
         c["refEnabled"] = refEnabled;
         c["refOffset"] = refOffset;
         c["refWidth"] = refWidth;
+        c["wideband"] = wideband;
+        c["wbTaps"] = wbTaps;
         json mems = json::array();
         for (const auto& m : memories) {
             json j;
@@ -163,6 +167,7 @@ private:
         }
         sigpath::phasing.setDelay(delay);
         sigpath::phasing.setAdaptRate(adaptRate);
+        sigpath::phasing.setWideband(wideband, wbTaps);
         applyReferenceBand();
     }
 
@@ -301,11 +306,19 @@ private:
         }
 
         // -- Delay -------------------------------------------------------------
+        // A multi-tap weight spans lags of its own, so a separate alignment control there
+        // would be a second way to say the same thing.
+        const bool widebandOn = sigpath::phasing.isWidebandActive();
+        if (widebandOn) { style::beginDisabled(); }
         ImGui::LeftLabel("Delay");
         ImGui::FillWidth();
         if (ImGui::SliderFloat(CONCAT("##_phasing_delay_", _this->name), &_this->delay, -16.0f, 16.0f, "%.3f samples")) {
             _this->applyToPhaser();
             _this->saveSettings();
+        }
+        if (widebandOn) {
+            style::endDisabled();
+            ImGui::TextWrapped("Handled by the taps.");
         }
 
         if (!combining || adapting) { style::endDisabled(); }
@@ -348,6 +361,24 @@ private:
                     _this->applyToPhaser();
                     _this->saveSettings();
                 }
+            }
+
+            // A single weight can only null where the two channels differ by a
+            // frequency-flat ratio. Feedline length differences and any real antenna pair
+            // break that, which is what limits a scalar to notching one carrier.
+            if (ImGui::Checkbox(CONCAT("Wideband (multi-tap)##_phasing_wb_", _this->name), &_this->wideband)) {
+                sigpath::phasing.setWideband(_this->wideband, _this->wbTaps);
+                _this->saveSettings();
+            }
+            if (_this->wideband) {
+                ImGui::LeftLabel("  taps");
+                ImGui::FillWidth();
+                if (ImGui::SliderInt(CONCAT("##_phasing_wbtaps_", _this->name), &_this->wbTaps, 8, 96)) {
+                    sigpath::phasing.setWideband(_this->wideband, _this->wbTaps);
+                    _this->saveSettings();
+                }
+                ImGui::TextWrapped("More taps null across a wider span but take longer to "
+                                   "settle and cost more CPU.");
             }
 
             // Adapting on the whole band nulls whatever is loudest, which when the DX
@@ -492,6 +523,8 @@ private:
     bool refEnabled = false;
     double refOffset = 0.0;
     double refWidth = 20000.0;
+    bool wideband = false;
+    int wbTaps = 32;
 
     std::vector<Memory> memories;
     int memId = 0;

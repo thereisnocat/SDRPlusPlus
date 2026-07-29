@@ -187,6 +187,9 @@ float Phasing::getDelay() { return phaser.getDelay(); }
 void Phasing::setAdaptRate(float rate) { phaser.setAdaptRate(rate); }
 float Phasing::getAdaptRate() { return phaser.getAdaptRate(); }
 void Phasing::setSampleRate(double sampleRate) { phaser.setSampleRate(sampleRate); }
+void Phasing::setWideband(bool enabled, int taps) { phaser.setWideband(enabled, taps); }
+void Phasing::getWideband(bool& enabled, int& taps) { phaser.getWideband(enabled, taps); }
+bool Phasing::isWidebandActive() { return phaser.isWidebandActive(); }
 void Phasing::setReferenceBand(bool enabled, double offsetHz, double widthHz) { phaser.setReferenceBand(enabled, offsetHz, widthHz); }
 void Phasing::getReferenceBand(bool& enabled, double& offsetHz, double& widthHz) { phaser.getReferenceBand(enabled, offsetHz, widthHz); }
 dsp::combine::Phaser::Metrics Phasing::getMetrics() { return phaser.getMetrics(); }

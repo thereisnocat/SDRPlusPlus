@@ -68,6 +68,9 @@ public:
     void setAdaptRate(float rate);
     float getAdaptRate();
     void setSampleRate(double sampleRate);
+    void setWideband(bool enabled, int taps);
+    void getWideband(bool& enabled, int& taps);
+    bool isWidebandActive();
     void setReferenceBand(bool enabled, double offsetHz, double widthHz);
     void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz);
 
