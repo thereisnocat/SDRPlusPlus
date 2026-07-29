@@ -56,7 +56,7 @@ namespace dsp::combine {
         Eigen2 e;
         const double trace = c.raa + c.rbb;
         const double det = c.raa * c.rbb - std::norm(c.rab);
-        const double disc = std::sqrt(std::max(0.0, trace * trace - 4.0 * det));
+        const double disc = std::sqrt((std::max)(0.0, trace * trace - 4.0 * det));
 
         e.lambdaMax = 0.5 * (trace + disc);
         e.lambdaMin = 0.5 * (trace - disc);
@@ -87,7 +87,7 @@ namespace dsp::combine {
     // thing and there is a dominant arrival to separate out.
     inline double coherence(const Covariance& c) {
         if (!c.valid()) { return 0.0; }
-        return std::min(1.0, std::abs(c.rab) / std::sqrt(c.raa * c.rbb));
+        return (std::min)(1.0, std::abs(c.rab) / std::sqrt(c.raa * c.rbb));
     }
 
     // A 2x2 complex matrix, stored row-major.
@@ -105,8 +105,8 @@ namespace dsp::combine {
         if (!c.valid()) { return w; }
 
         const Eigen2 e = solveEigen2(c);
-        const double l1 = std::max(e.lambdaMax, 1e-300);
-        const double l2 = std::max(e.lambdaMin, 1e-300);
+        const double l1 = (std::max)(e.lambdaMax, 1e-300);
+        const double l2 = (std::max)(e.lambdaMin, 1e-300);
         const double s1 = 1.0 / std::sqrt(l1);
         const double s2 = 1.0 / std::sqrt(l2);
 

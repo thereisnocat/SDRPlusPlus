@@ -133,7 +133,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
 
     const ImVec2 centre(origin.x + size * 0.5f, origin.y + size * 0.5f);
     const float radius = size * 0.5f - 10.0f;
-    const float span = std::max(1.0f, maxDb - minDb);
+    const float span = (std::max)(1.0f, maxDb - minDb);
 
     auto toScreen = [&](float g, float p) {
         const float r = radius * std::clamp((g - minDb) / span, 0.0f, 1.0f);
@@ -150,7 +150,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
             for (int r = 0; r < NullHeat::RADII; r++) {
                 const float d = heat->best[a][r];
                 if (d < -1e8f) { continue; }
-                const float t = std::clamp(d / std::max(depthScale, 1.0f), 0.0f, 1.0f);
+                const float t = std::clamp(d / (std::max)(depthScale, 1.0f), 0.0f, 1.0f);
                 const ImU32 col = IM_COL32((int)(40 + 60 * t), (int)(70 + 185 * t), (int)(90 + 60 * (1.0f - t)),
                                            (int)(60 + 150 * t));
                 const float a0 = ((float)a / NullHeat::ANGLES) * 2.0f * FL_M_PI - FL_M_PI;
@@ -192,7 +192,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
         const ImVec2 m = ImGui::GetIO().MousePos;
         const float dx = m.x - centre.x;
         const float dy = centre.y - m.y;
-        const float r = std::min(std::sqrt(dx * dx + dy * dy), radius);
+        const float r = (std::min)(std::sqrt(dx * dx + dy * dy), radius);
         if (r > 0.5f) {
             phaseDeg = std::atan2(dy, dx) * (float)(180.0 / DB_M_PI);
             gainDb = minDb + (r / radius) * span;
@@ -467,13 +467,13 @@ private:
                 const std::complex<float> c0(k0.re, k0.im), c1(k1.re, k1.im);
                 if (std::abs(c0) > 1e-12f) {
                     const std::complex<float> w = -c1 / c0;
-                    padGain = std::clamp(20.0f * std::log10(std::max(std::abs(w), 1e-6f)), -40.0f, 40.0f);
+                    padGain = std::clamp(20.0f * std::log10((std::max)(std::abs(w), 1e-6f)), -40.0f, 40.0f);
                     padPhase = std::arg(w) * (float)(180.0 / DB_M_PI);
                 }
             }
 
             const bool live = (_this->mode == dsp::combine::Phaser::MODE_MANUAL);
-            const float padSize = std::min(menuWidth, 240.0f);
+            const float padSize = (std::min)(menuWidth, 240.0f);
 
             if (phasePad(CONCAT("##_phasing_pad_", _this->name), padSize, padGain, padPhase,
                          live, -40.0f, 40.0f, &_this->heat, 40.0f)) {
@@ -656,7 +656,7 @@ private:
                 ImGui::LeftLabel("  width");
                 ImGui::FillWidth();
                 if (ImGui::InputDouble(CONCAT("##_phasing_refwid_", _this->name), &_this->refWidth, 1000.0, 10000.0, "%.0f Hz")) {
-                    _this->refWidth = std::max(_this->refWidth, 100.0);
+                    _this->refWidth = (std::max)(_this->refWidth, 100.0);
                     _this->applyReferenceBand();
                     _this->saveSettings();
                 }
@@ -676,7 +676,7 @@ private:
         const float depth = sigpath::phasing.getNullDepth();
         if (depth > _this->peakDepth) { _this->peakDepth = depth; }
         else { _this->peakDepth -= 0.25f; }   // slow decay so the best result stays visible
-        _this->peakDepth = std::max(_this->peakDepth, 0.0f);
+        _this->peakDepth = (std::max)(_this->peakDepth, 0.0f);
 
         const bool banded = sigpath::phasing.isNullDepthBandLimited();
         ImGui::LeftLabel(banded ? "Null depth (band)" : "Null depth (wide)");
@@ -749,7 +749,7 @@ private:
         if (ImGui::Button(CONCAT("Delete##_phasing_memdel_", _this->name), ImVec2(menuWidth / 3.0f - 8, 0))) {
             if (_this->memId >= 0 && _this->memId < (int)_this->memories.size()) {
                 _this->memories.erase(_this->memories.begin() + _this->memId);
-                _this->memId = std::max(0, _this->memId - 1);
+                _this->memId = (std::max)(0, _this->memId - 1);
                 _this->saveSettings();
             }
         }

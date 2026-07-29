@@ -48,8 +48,8 @@ namespace dsp::combine {
             memcpy(scratch.data() + HISTORY, in, count * sizeof(complex_t));
 
             const float lo = 2.0f, hi = (float)(HISTORY - 3);
-            const float d0 = std::min(std::max(delayStart, lo), hi);
-            const float d1 = std::min(std::max(delayEnd, lo), hi);
+            const float d0 = (std::min)((std::max)(delayStart, lo), hi);
+            const float d1 = (std::min)((std::max)(delayEnd, lo), hi);
             const float step = (d1 - d0) / (float)count;
 
             if (d0 == d1 && d0 == std::floor(d0)) {
@@ -200,7 +200,7 @@ namespace dsp::combine {
         // negative. Only applied in MODE_MANUAL, so bypass stays bit-exact.
         void setDelay(float samples) {
             std::lock_guard<std::mutex> lck(paramMtx);
-            _delay = std::min(std::max(samples, -(float)MAX_DELAY), (float)MAX_DELAY);
+            _delay = (std::min)((std::max)(samples, -(float)MAX_DELAY), (float)MAX_DELAY);
         }
 
         float getDelay() {
@@ -213,7 +213,7 @@ namespace dsp::combine {
         // is loudest right now, including the signal you are trying to keep.
         void setAdaptRate(float rate) {
             std::lock_guard<std::mutex> lck(paramMtx);
-            _adaptRate = std::min(std::max(rate, 0.0001f), 1.0f);
+            _adaptRate = (std::min)((std::max)(rate, 0.0001f), 1.0f);
         }
 
         float getAdaptRate() {
@@ -275,7 +275,7 @@ namespace dsp::combine {
             std::lock_guard<std::mutex> lck(paramMtx);
             _noiseCapture = Covariance();
             _noiseCaptureTerms = 0.0;
-            _noiseCaptureWanted = std::max(1.0, seconds * _sampleRate);
+            _noiseCaptureWanted = (std::max)(1.0, seconds * _sampleRate);
             _capturingNoise = true;
         }
 
@@ -360,7 +360,7 @@ namespace dsp::combine {
             // Floor the residual rather than special-casing zero. A perfect cancellation
             // would otherwise report 0 dB, which reads as "no cancellation at all" -- the
             // exact opposite of what happened.
-            return 10.0f * std::log10(a / std::max(o, 1e-20f));
+            return 10.0f * std::log10(a / (std::max)(o, 1e-20f));
         }
 
         // Samples dropped because an input ran far enough ahead to overrun the holding
@@ -430,8 +430,8 @@ namespace dsp::combine {
                 decorrelating = isDecorrelating(_mode);
                 if (decorrelating) { wideband = false; }
                 if (_wbDirty) {
-                    wbSolver.configure(1024, _wbTaps, std::max(_adaptRate, 0.02f));
-                    wbHist.assign(std::max(_wbTaps - 1, 0), complex_t{ 0.0f, 0.0f });
+                    wbSolver.configure(1024, _wbTaps, (std::max)(_adaptRate, 0.02f));
+                    wbHist.assign((std::max)(_wbTaps - 1, 0), complex_t{ 0.0f, 0.0f });
                     wbTapsRev.clear();
                     _wbDirty = false;
                 }
@@ -481,7 +481,7 @@ namespace dsp::combine {
                     const std::complex<double> wOld(_target.re, _target.im);
                     const std::complex<double> wNew = wOld + (double)adaptRate * (wOpt - wOld);
                     _target = { (float)wNew.real(), (float)wNew.imag() };
-                    _gainDb = 20.0f * std::log10(std::max((float)std::abs(wNew), 1e-12f));
+                    _gainDb = 20.0f * std::log10((std::max)((float)std::abs(wNew), 1e-12f));
                     _phaseDeg = (float)(std::arg(wNew) * 180.0 / DB_M_PI);
                     target = _target;
                 }
@@ -608,7 +608,7 @@ namespace dsp::combine {
                 }
             }
 
-            const double lambda = std::min(1.0, std::max(0.001, (double)adaptRate));
+            const double lambda = (std::min)(1.0, (std::max)(0.001, (double)adaptRate));
             _cov.raa = _cov.raa * (1.0 - lambda) + raa * lambda;
             _cov.rbb = _cov.rbb * (1.0 - lambda) + rbb * lambda;
             _cov.rab = _cov.rab * (1.0 - lambda) + rab * lambda;

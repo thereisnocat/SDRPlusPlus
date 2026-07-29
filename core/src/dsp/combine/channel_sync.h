@@ -91,7 +91,7 @@ namespace dsp::combine {
             for (int i = 0; i < (int)bufs.size(); i++) {
                 const int left = sizes[i] - count;
                 if (left > 0) { memmove(bufs[i], bufs[i] + count, left * sizeof(complex_t)); }
-                sizes[i] = std::max(0, left);
+                sizes[i] = (std::max)(0, left);
             }
         }
 

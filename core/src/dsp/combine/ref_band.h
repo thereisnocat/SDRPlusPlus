@@ -32,16 +32,16 @@ namespace dsp::combine {
         void configure(double sampleRate, double offsetHz, double widthHz) {
             _sampleRate = sampleRate;
 
-            const double inc = -2.0 * DB_M_PI * offsetHz / std::max(sampleRate, 1.0);
+            const double inc = -2.0 * DB_M_PI * offsetHz / (std::max)(sampleRate, 1.0);
             rotStep = std::polar(1.0, inc);
 
             // Total decimation sets the passband: the cascade's first null sits at
             // sampleRate/D, so D ~ sampleRate/width puts the nominal width inside it.
-            const double w = std::max(widthHz, 1.0);
+            const double w = (std::max)(widthHz, 1.0);
             int D = (int)std::round(sampleRate / w);
             D = std::clamp(D, 1, 65536);
-            len1 = std::min(D, 32);
-            len2 = std::max(1, D / std::max(len1, 1));
+            len1 = (std::min)(D, 32);
+            len2 = (std::max)(1, D / (std::max)(len1, 1));
             reset();
         }
 
