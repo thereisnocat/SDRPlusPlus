@@ -16,6 +16,11 @@
 
 namespace phtest {
 
+    // MSVC's <cmath> only defines PI when _USE_MATH_DEFINES is set before the
+    // include, and this header deliberately pulls in nothing from SDR++, so it
+    // carries its own.
+    static constexpr double PI = 3.14159265358979323846;
+
     // Minimal complex double for the sample loop. std::complex is used for setup math
     // (it has abs/arg/polar/division) but its operator* carries NaN-handling branches.
     struct cd {
@@ -29,7 +34,7 @@ namespace phtest {
 
     // Complex weight from a gain in dB and a phase in degrees.
     inline std::complex<double> weightFromPolar(double gainDb, double phaseDeg) {
-        return std::polar(std::pow(10.0, gainDb / 20.0), phaseDeg * (M_PI / 180.0));
+        return std::polar(std::pow(10.0, gainDb / 20.0), phaseDeg * (PI / 180.0));
     }
 
     // xorshift128+. Uniform rather than Gaussian noise: the spectrum is flat either way,
@@ -128,7 +133,7 @@ namespace phtest {
         }
 
         const double amp = std::pow(10.0, level / 20.0);
-        const double delayPhase = -2.0 * M_PI * offset * p.delaySamples / p.sampleRate;
+        const double delayPhase = -2.0 * PI * offset * p.delaySamples / p.sampleRate;
 
         tw.a = std::complex<double>(amp, 0.0);
         tw.b = std::complex<double>(amp, 0.0) * weightFromPolar(gain, phase) * std::polar(1.0, delayPhase);
@@ -195,8 +200,8 @@ namespace phtest {
             const cd cAi = toCd(interf.a);
             const cd cBi = toCd(interf.b);
 
-            const cd dW = toCd(std::polar(1.0, 2.0 * M_PI * p.wantedOffset / p.sampleRate));
-            const cd dI = toCd(std::polar(1.0, 2.0 * M_PI * p.interfOffset / p.sampleRate));
+            const cd dW = toCd(std::polar(1.0, 2.0 * PI * p.wantedOffset / p.sampleRate));
+            const cd dI = toCd(std::polar(1.0, 2.0 * PI * p.interfOffset / p.sampleRate));
 
             // Uniform noise in [-1,1) has RMS 1/sqrt(3) per component, so a complex
             // sample has RMS sqrt(2/3). Scale so the dBFS figure the user typed matches

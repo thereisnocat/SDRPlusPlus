@@ -20,6 +20,11 @@
 
 namespace rsr200 {
 
+    // MSVC's <cmath> only defines PI when _USE_MATH_DEFINES is set before the
+    // include, and this header deliberately pulls in nothing from SDR++, so it
+    // carries its own.
+    static constexpr double PI = 3.14159265358979323846;
+
     // ---------------------------------------------------------------------------
     // Modes
     // ---------------------------------------------------------------------------
@@ -477,7 +482,7 @@ namespace rsr200 {
         const double mag = std::abs(g);
 
         h.magnitude = mag;
-        h.phaseDegrees = std::arg(g) * 180.0 / M_PI;
+        h.phaseDegrees = std::arg(g) * 180.0 / PI;
         h.representable = (mag >= 0.001 && mag < 8.0);
         h.suggestSwap = (mag >= 8.0);
         return h;

@@ -1,4 +1,5 @@
 #pragma once
+#include "../math/constants.h"
 #include "../types.h"
 #include <complex>
 #include <cmath>
@@ -31,7 +32,7 @@ namespace dsp::combine {
         void configure(double sampleRate, double offsetHz, double widthHz) {
             _sampleRate = sampleRate;
 
-            const double inc = -2.0 * M_PI * offsetHz / std::max(sampleRate, 1.0);
+            const double inc = -2.0 * DB_M_PI * offsetHz / std::max(sampleRate, 1.0);
             rotStep = std::polar(1.0, inc);
 
             // Total decimation sets the passband: the cascade's first null sits at

@@ -310,14 +310,14 @@ int main() {
         HardwareWeight h = hardwareWeightFor(k0, k1);
         check(h.representable, "the ratio is inside the radio's range");
         check(std::abs(h.magnitude - std::abs(g)) < 1e-9, "magnitude survives the overall scaling");
-        check(std::abs(h.phaseDegrees - std::arg(g) * 180.0 / M_PI) < 1e-9, "as does phase");
+        check(std::abs(h.phaseDegrees - std::arg(g) * 180.0 / rsr200::PI) < 1e-9, "as does phase");
 
         // The real test: quantise through the wire format, then check the weight the radio
         // would actually apply still cancels.
         const uint32_t packed = packMagnitudePhase(h.magnitude, h.phaseDegrees);
         const double qMag = (double)(packed & 0xFFFF) / 8192.0;
         const double qPhase = (double)(int16_t)(packed >> 16) / 32768.0 * 180.0;
-        const std::complex<double> qg = std::polar(qMag, qPhase * M_PI / 180.0);
+        const std::complex<double> qg = std::polar(qMag, qPhase * rsr200::PI / 180.0);
         const double residual = 20.0 * std::log10(std::abs(1.0 + qg * r));
         printf("        after quantisation the null is %.1f dB deep\n", residual);
         check(residual < -60.0, "quantisation is not what limits the null");
@@ -341,7 +341,7 @@ int main() {
         const std::complex<double> additive = hardwareWeightFor(
             std::complex<double>(1.0, 0.0), std::complex<double>(-0.5, 0.0)).magnitude
             * std::polar(1.0, hardwareWeightFor(std::complex<double>(1.0, 0.0),
-                                                std::complex<double>(-0.5, 0.0)).phaseDegrees * M_PI / 180.0);
+                                                std::complex<double>(-0.5, 0.0)).phaseDegrees * rsr200::PI / 180.0);
         check(std::abs(additive - std::complex<double>(-0.5, 0.0)) < 1e-9,
               "a negative coefficient becomes a 180 degree phase, not a negative magnitude");
     }

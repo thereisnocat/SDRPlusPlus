@@ -1,4 +1,5 @@
 #include "wideband_solver.h"
+#include "../math/constants.h"
 #include <fftw3.h>
 #include <mutex>
 #include <cmath>
@@ -69,7 +70,7 @@ namespace dsp::combine {
             // no business in.
             _window.resize(_fftSize);
             for (int i = 0; i < _fftSize; i++) {
-                _window[i] = 0.5f - 0.5f * std::cos(2.0f * (float)M_PI * (float)i / (float)_fftSize);
+                _window[i] = 0.5f - 0.5f * std::cos(2.0f * FL_M_PI * (float)i / (float)_fftSize);
             }
         }
 
@@ -168,7 +169,7 @@ namespace dsp::combine {
         for (int k = 0; k < _taps; k++) {
             const int lag = k;
             // Taper the ends: an abruptly truncated impulse response rings in frequency.
-            const float taper = 0.5f - 0.5f * std::cos(2.0f * (float)M_PI * ((float)k + 0.5f) / (float)_taps);
+            const float taper = 0.5f - 0.5f * std::cos(2.0f * FL_M_PI * ((float)k + 0.5f) / (float)_taps);
             g[k].re = h[lag][0] * scale * taper;
             g[k].im = h[lag][1] * scale * taper;
         }

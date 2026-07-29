@@ -388,7 +388,7 @@ private:
         // available as targets once the phasing module exists.
         if (nullWeight(p, true, nw)) {
             snprintf(buf, sizeof(buf), "Interferer nulls at: %+.2f dB, %+.2f deg",
-                     20.0 * std::log10(std::abs(nw)), std::arg(nw) * (180.0 / M_PI));
+                     20.0 * std::log10(std::abs(nw)), std::arg(nw) * (180.0 / phtest::PI));
         }
         else {
             snprintf(buf, sizeof(buf), "Interferer nulls at: n/a");
@@ -397,7 +397,7 @@ private:
 
         if (nullWeight(p, false, nw)) {
             snprintf(buf, sizeof(buf), "Wanted nulls at:     %+.2f dB, %+.2f deg",
-                     20.0 * std::log10(std::abs(nw)), std::arg(nw) * (180.0 / M_PI));
+                     20.0 * std::log10(std::abs(nw)), std::arg(nw) * (180.0 / phtest::PI));
         }
         else {
             snprintf(buf, sizeof(buf), "Wanted nulls at:     n/a");
@@ -417,7 +417,7 @@ private:
 
     void applyCombinerWeight(const std::complex<double>& w) {
         combGainF = (float)(20.0 * std::log10(std::abs(w)));
-        combPhaseF = (float)(std::arg(w) * (180.0 / M_PI));
+        combPhaseF = (float)(std::arg(w) * (180.0 / phtest::PI));
         viewId = VIEW_COMBINED;
         std::lock_guard<std::mutex> lck(paramMtx);
         params.combGain = combGainF;

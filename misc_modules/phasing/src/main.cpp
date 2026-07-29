@@ -1,4 +1,5 @@
 #include <imgui.h>
+#include <dsp/math/constants.h>
 #include <module.h>
 #include <gui/gui.h>
 #include <gui/style.h>
@@ -136,7 +137,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
 
     auto toScreen = [&](float g, float p) {
         const float r = radius * std::clamp((g - minDb) / span, 0.0f, 1.0f);
-        const float th = p * (float)(M_PI / 180.0);
+        const float th = p * (float)(DB_M_PI / 180.0);
         return ImVec2(centre.x + r * std::cos(th), centre.y - r * std::sin(th));
     };
 
@@ -152,8 +153,8 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
                 const float t = std::clamp(d / std::max(depthScale, 1.0f), 0.0f, 1.0f);
                 const ImU32 col = IM_COL32((int)(40 + 60 * t), (int)(70 + 185 * t), (int)(90 + 60 * (1.0f - t)),
                                            (int)(60 + 150 * t));
-                const float a0 = ((float)a / NullHeat::ANGLES) * 2.0f * (float)M_PI - (float)M_PI;
-                const float a1 = ((float)(a + 1) / NullHeat::ANGLES) * 2.0f * (float)M_PI - (float)M_PI;
+                const float a0 = ((float)a / NullHeat::ANGLES) * 2.0f * FL_M_PI - FL_M_PI;
+                const float a1 = ((float)(a + 1) / NullHeat::ANGLES) * 2.0f * FL_M_PI - FL_M_PI;
                 const float r0 = radius * ((float)r / NullHeat::RADII);
                 const float r1 = radius * ((float)(r + 1) / NullHeat::RADII);
                 const ImVec2 p0(centre.x + r0 * std::cos(a0), centre.y - r0 * std::sin(a0));
@@ -173,7 +174,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
         dl->AddCircle(centre, r, unity ? IM_COL32(150, 150, 160, 200) : IM_COL32(70, 70, 80, 180), 64, unity ? 1.6f : 1.0f);
     }
     for (int k = 0; k < 4; k++) {
-        const float th = (float)k * (float)M_PI * 0.5f;
+        const float th = (float)k * FL_M_PI * 0.5f;
         dl->AddLine(centre, ImVec2(centre.x + radius * std::cos(th), centre.y - radius * std::sin(th)),
                     IM_COL32(70, 70, 80, 160));
     }
@@ -193,7 +194,7 @@ static bool phasePad(const char* id, float size, float& gainDb, float& phaseDeg,
         const float dy = centre.y - m.y;
         const float r = std::min(std::sqrt(dx * dx + dy * dy), radius);
         if (r > 0.5f) {
-            phaseDeg = std::atan2(dy, dx) * (float)(180.0 / M_PI);
+            phaseDeg = std::atan2(dy, dx) * (float)(180.0 / DB_M_PI);
             gainDb = minDb + (r / radius) * span;
             changed = true;
         }
@@ -467,7 +468,7 @@ private:
                 if (std::abs(c0) > 1e-12f) {
                     const std::complex<float> w = -c1 / c0;
                     padGain = std::clamp(20.0f * std::log10(std::max(std::abs(w), 1e-6f)), -40.0f, 40.0f);
-                    padPhase = std::arg(w) * (float)(180.0 / M_PI);
+                    padPhase = std::arg(w) * (float)(180.0 / DB_M_PI);
                 }
             }
 

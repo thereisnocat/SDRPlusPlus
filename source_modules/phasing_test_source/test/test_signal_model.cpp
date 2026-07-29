@@ -44,7 +44,7 @@ static bool armNull(Params& p, bool interferer) {
     std::complex<double> w;
     if (!nullWeight(p, interferer, w)) { return false; }
     p.combGain = 20.0 * std::log10(std::abs(w));
-    p.combPhase = std::arg(w) * (180.0 / M_PI);
+    p.combPhase = std::arg(w) * (180.0 / phtest::PI);
     p.view = VIEW_COMBINED;
     return true;
 }
@@ -110,8 +110,8 @@ int main() {
         a.swapChannels = true;
         nullWeight(a, true, w2);
         printf("        unswapped %+.3f dB %+.2f deg, swapped %+.3f dB %+.2f deg\n",
-               20.0 * std::log10(std::abs(w1)), std::arg(w1) * 180.0 / M_PI,
-               20.0 * std::log10(std::abs(w2)), std::arg(w2) * 180.0 / M_PI);
+               20.0 * std::log10(std::abs(w1)), std::arg(w1) * 180.0 / phtest::PI,
+               20.0 * std::log10(std::abs(w2)), std::arg(w2) * 180.0 / phtest::PI);
         check(std::abs(w1 * w2 - std::complex<double>(1.0, 0.0)) < 1e-9,
               "swapped weight is the reciprocal of the unswapped one");
 
@@ -130,9 +130,9 @@ int main() {
         std::complex<double> wi, ww;
         nullWeight(p, true, wi);
         nullWeight(p, false, ww);
-        const double sep = std::arg(wi / ww) * (180.0 / M_PI);
+        const double sep = std::arg(wi / ww) * (180.0 / phtest::PI);
         printf("        interferer %+.2f deg, wanted %+.2f deg, separation %.2f deg\n",
-               std::arg(wi) * 180.0 / M_PI, std::arg(ww) * 180.0 / M_PI, sep);
+               std::arg(wi) * 180.0 / phtest::PI, std::arg(ww) * 180.0 / phtest::PI, sep);
         check(std::abs(sep) > 1.0, "the two tones demand measurably different weights");
 
         // A scalar weight can null one but must leave the other.

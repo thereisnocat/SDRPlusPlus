@@ -1,6 +1,7 @@
 #pragma once
 #include "../block.h"
 #include "../buffer/buffer.h"
+#include "../math/constants.h"
 #include "channel_sync.h"
 #include "ref_band.h"
 #include "decorrelator.h"
@@ -188,7 +189,7 @@ namespace dsp::combine {
         // Weight as the user thinks of it: a gain in dB and a phase in degrees.
         void setWeight(float gainDb, float phaseDeg) {
             const float mag = std::pow(10.0f, gainDb / 20.0f);
-            const float rad = phaseDeg * (float)(M_PI / 180.0);
+            const float rad = phaseDeg * (float)(DB_M_PI / 180.0);
             std::lock_guard<std::mutex> lck(paramMtx);
             _gainDb = gainDb;
             _phaseDeg = phaseDeg;
@@ -481,7 +482,7 @@ namespace dsp::combine {
                     const std::complex<double> wNew = wOld + (double)adaptRate * (wOpt - wOld);
                     _target = { (float)wNew.real(), (float)wNew.imag() };
                     _gainDb = 20.0f * std::log10(std::max((float)std::abs(wNew), 1e-12f));
-                    _phaseDeg = (float)(std::arg(wNew) * 180.0 / M_PI);
+                    _phaseDeg = (float)(std::arg(wNew) * 180.0 / DB_M_PI);
                     target = _target;
                 }
             }
