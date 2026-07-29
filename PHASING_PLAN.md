@@ -142,6 +142,21 @@ offset is stable *within* a run but random *across* runs) is still perfectly usa
 a constant offset is absorbed into the weight. It only means saved weights can't be
 restored blindly, which the UI should reflect by re-running auto-null on start.
 
+**Measured on the RSPduo, and it is exactly that case.** With a strong medium wave carrier
+reaching both ports: coherence `1.0000`, and the cross-correlation phase drifts under
+0.15° across a run — so a null holds once set. But across a stop and restart the phase
+lands anywhere in ±180°; six consecutive runs gave +91, +148, +111, −73, −143, +90 degrees.
+The two tuners share a clock, but their local oscillators come up at an arbitrary relative
+phase.
+
+The practical consequence is worth stating plainly, because it shapes what memories are
+for: on a source with `phaseCoherent == false`, a stored **gain and phase is not
+restorable** — recalling a memory usefully returns the frequency, mode and channel pair,
+but the weight itself must be re-found. Auto-null or decorrelation does that in a second or
+two, so the workflow is "recall, then re-converge" rather than "recall and listen". An
+obvious future refinement is for the UI to start adaptation automatically after recalling a
+memory on such a source.
+
 ### 2.2 Layer 2 — the combiner block (core DSP)
 
 New `core/src/dsp/combine/phaser.h`. Output:

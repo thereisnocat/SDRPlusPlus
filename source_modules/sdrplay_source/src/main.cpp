@@ -129,10 +129,16 @@ public:
         channels.streams = { &stream, &stream2 };
         channels.names = { "Tuner A", "Tuner B" };
         channels.sampleAligned = true;    // measured: identical counts on both callbacks
-        // Left false deliberately. The two tuners share a clock, but whether the relative
-        // phase returns to the same value after a stop and restart has not been measured on
-        // this hardware, and claiming it would have the UI restore saved weights that may no
-        // longer apply. Flip it once tested with a signal in both ports.
+        // False, and measured rather than assumed. With a strong medium wave carrier in
+        // both ports the two tuners are perfectly coherent -- coherence 1.0000, and the
+        // cross-correlation phase drifts under 0.15 degrees across a run -- so a null holds
+        // once set. But across a stop and restart the phase lands anywhere in +/-180: six
+        // consecutive runs gave +91, +148, +111, -73, -143, +90 degrees. The tuners share a
+        // clock but their LOs come up at an arbitrary relative phase.
+        //
+        // So a saved weight cannot be restored blindly on this radio. Recalling one gets the
+        // frequency and mode back; the weight itself has to be re-found, which auto-null or
+        // decorrelation does in a second or two.
         channels.phaseCoherent = false;
 
         refresh();
