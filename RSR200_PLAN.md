@@ -34,13 +34,47 @@ something the build can arrange. Per the bundled ReadMe: copy `ftd3xx.h` and `Ty
 `/usr/local/include`, and `libftd3xx.dylib` plus `libftd3xx.1.1.8.dylib` to
 `/usr/local/lib`.
 
-> **The same install-name trap as the SDRplay library.** `libftd3xx.1.1.8.dylib` records a
-> bare install name of `libftd3xx.dylib`. That resolves only because `/usr/local/lib` sits
-> on dyld's *fallback* search path — which is why the ReadMe also suggests setting
-> `DYLD_LIBRARY_PATH`. Relying on a fallback path is fragile. The module's CMake should do
-> what `sdrplay_source/CMakeLists.txt` now does: link the versioned file by absolute path
-> and rewrite the recorded dependency with `install_name_tool -change` as a post-build step,
-> so the loaded module carries an unambiguous path.
+> **The same install-name trap as the SDRplay library, and worse than first written here.**
+> `libftd3xx.1.1.8.dylib` records a bare install name of `libftd3xx.dylib`. An earlier draft
+> of this section said that resolves via dyld's fallback search path and the rewrite was
+> merely more robust. **That was wrong — it does not resolve at all.** Tested: dyld treats a
+> slash-less install name as a path relative to the *current working directory*, and never
+> consults `/usr/local/lib`:
+>
+> ```
+> Library not loaded: libftd3xx.dylib
+>   tried: 'libftd3xx.dylib' (no such file), '<cwd>/libftd3xx.dylib' (no such file)
+> ```
+>
+> So rewriting the dependency with `install_name_tool -change` is **mandatory**, not a
+> nicety. The module's CMake must do what `sdrplay_source/CMakeLists.txt` now does: link the
+> versioned file by absolute path and rewrite the recorded dependency as a post-build step.
+> Note that this needs `-Wl,-headerpad_max_install_names` at link time when the replacement
+> path is longer than the original, or `install_name_tool` refuses with "larger updated load
+> commands do not fit".
+
+> **Quarantine blocks the library even once it is found.** Files copied out of the
+> downloaded DMG carry `com.apple.quarantine`, and Gatekeeper refuses to load a quarantined
+> library into a process — reported as *"code signature not valid for use in process:
+> library load disallowed by system policy"*, which reads like a signing problem and is not
+> one. The signature is fine (FTDI, team `658CPPCMJJ`, verifies clean). Clear it after
+> installing:
+>
+> ```
+> sudo xattr -d com.apple.quarantine /usr/local/lib/libftd3xx.dylib /usr/local/lib/libftd3xx.1.1.8.dylib
+> ```
+>
+> Verified: with quarantine cleared and the install name rewritten, the library loads and
+> `FT_CreateDeviceInfoList` returns `FT_OK`.
+
+> **The `make` step in the bundled ReadMe is optional.** The Makefile builds seventeen demo
+> programs (`streamer`, `LoopBack`, `GetDevInfo`, …); the library itself ships prebuilt, so
+> the two headers and two dylibs are the whole driver. The ReadMe's `./rw` does not exist in
+> this package — there is no such source and no such target — and every target it *does*
+> build carries a `-dynamic` suffix, so even the real ones are `streamer-dynamic`. The demos
+> also link `-L.`, so building them means copying the folder somewhere writable first, the
+> DMG being read-only. `GetDevInfo` and `streamer` are the two worth building once the radio
+> is present.
 
 **(b) SFP module: ordered.** The RSR200's LAN port is an SFP 1000 cage rather than an
 RJ-45 jack, so a copper 1000BASE-T SFP is needed. On order alongside the radio.
