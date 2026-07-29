@@ -36,7 +36,8 @@ $REPO/source_modules/phasing_test_source/test/test_worker.cpp"
 
 # Suites with no dependency beyond the standard library.
 STANDALONE="$REPO/source_modules/phasing_test_source/test/test_signal_model.cpp
-$REPO/source_modules/rsr200_source/test/test_protocol.cpp"
+$REPO/source_modules/rsr200_source/test/test_protocol.cpp
+$REPO/source_modules/rsr200_source/test/test_device.cpp"
 
 fail=0
 

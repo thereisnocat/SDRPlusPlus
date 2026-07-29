@@ -303,8 +303,9 @@ source_modules/rsr200_source/
     CMakeLists.txt
     src/
         main.cpp          SDR++ module: menu, config, SourceHandler, ChannelSet
-        rsr200.h/.cpp     device: command construction, state, tuning, zone maths
-        transport.h       abstract: open/close, read block, write command
+        rsr200_protocol.h wire format: block geometry, commands, unpacking, zone maths
+        rsr200_device.h   device: config ordering, command numbering, acks, frame parsing
+        transport_lan.cpp TCP + UDP sockets, block resync, UDP reassembly
         transport_lan.cpp TCP + UDP sockets, block resync, UDP reassembly
         transport_usb.cpp FTDI D3XX
         framing.h/.cpp    block layouts, sample unpacking, embedded-command parsing
@@ -337,7 +338,8 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 |---|---|---|
 | **0** | **Done** — D3XX confirmed universal and user-space, SFP module ordered (§1). Remaining: install D3XX to `/usr/local` (needs sudo). | No |
 | **1** | **Done** — `src/rsr200_protocol.h`: block geometry, USB packet geometry, status header, 16/24-bit unpacking, block resynchronisation, all nine PC→radio commands, reply parsing, port/DSP mode bytes, hardware diversity weight packing, Nyquist zone mapping. `test/test_protocol.cpp` checks every documented figure and the manual's worked examples; wired into `core/test/run_tests.sh`. | No |
-| **2** | LAN transport: TCP connect, version query, `Set data transmission`, `Start stream`, block resync, single channel 16-bit. First live IQ. | Yes |
+| **1b** | **Done** — `src/rsr200_device.h`: the transport-agnostic device layer. Configuration ordering, command numbering, acknowledgement and fresh-number retry, embedded reply extraction, sequence-gap detection, sample delivery. Covered by `test/test_device.cpp` against a fake transport. Phase 2 is now mostly plugging in a socket. | No |
+| **2** | LAN transport: TCP connect, version query, block resync, UDP reassembly. It implements one interface — `sendCommand` and `nextFrame`. First live IQ. | Yes |
 | **3** | Full single-channel control: ADC clock, decimation, attenuators, input switching, 24-bit, Nyquist zone display and spectrum inversion. | Yes |
 | **4** | Dual channel Separate mode + `registerChannels()`. The phasing feature lights up. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. | Yes |
@@ -360,6 +362,11 @@ carry that risk.
 
 - **Maximum decimation: 16 or 64?** (§2) — the two documents disagree, and it sets the
   lowest usable sample rate.
+- **Are embedded LAN replies fixed at 8 bytes each?** A block gives a count of the commands
+  it carries, and both confirmation forms are 8 bytes, so the device layer assumes a fixed
+  stride. The document never says so outright, and the standalone LAN version reply is 12
+  bytes with a length prefix — if embedded replies are length-prefixed too, the stride is
+  wrong. Contained to one function, but worth checking against a real block early.
 - **Does `Set data transmission` need the stream stopped on LAN?** DP §3.3 says switching
   LAN mode automatically stops streaming and requires a fresh `Start stream` with a matching
   size code; the exact ordering wants confirming against the device.
