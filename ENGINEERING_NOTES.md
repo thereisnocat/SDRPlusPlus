@@ -33,6 +33,13 @@ converged to `+3.000 / −137.000`, that was proof, not encouragement.
 instrument that makes it observable *before* building the feature. The cost was one module;
 the return was five bugs that would otherwise have surfaced as "the nulling seems flaky."
 
+**The bet paid off on 2026-07-29.** With two real antennas on an RSPduo, auto-null and
+decorrelation both pulled stations out from under strong locals in daylight — the hard
+case for medium wave. Nothing had to be retuned or re-derived to make that work: the
+behaviour on air was the behaviour the synthetic source predicted. Six phases were built
+against a signal generator and worked the first time they met an antenna, which is the
+strongest available evidence that the ground truth was the right thing to build first.
+
 A second sequencing decision followed the same logic: dual-channel **recording** was moved
 *ahead* of the UI, so that one capture of a real interferer becomes permanent regression
 material rather than each test depending on whatever is on the air that evening.

@@ -436,6 +436,19 @@ single-tuner path for the other RSP models. `registerChannels()` with
 a run), `sampleAligned = true`. Both tuners must share sample rate and be tuned together
 — the module already centralizes tuning, so this is mostly bookkeeping.
 
+*Done, with one correction.* `phaseCoherent` had to be **false**: the offset is stable
+within a run, as expected, but it is redrawn on every start, so it is not something a
+saved setting can survive. That is a property of the radio, not a defect — it only means
+weights are per-session.
+
+The antenna port control needed a dual-mode path of its own. It compared the requested
+tuner against `openDev.tuner` and called `sdrplay_api_SwapRspDuoActiveTuner` on a
+mismatch, but in dual mode `openDev.tuner` is `Tuner_Both` and there is no active tuner
+to swap — the call returns `InvalidParam`. Selecting the tuner-2 port would additionally
+have repointed `channelParams` at channel B, quietly sending later gain changes to the
+wrong tuner. In dual mode the only live choice is tuner 1's input, 50 Ω or Hi-Z, since
+tuner 2 always has its own port.
+
 ### 3.3 Microtelecom Perseus22 / Reuter RSR200
 
 No modules exist for either today (`perseus_source` targets the original Perseus). Both
@@ -624,7 +637,7 @@ tested against a synthetic two-channel source. Hardware validation is a single p
 | **4** | Auto-null | No | **Done** — block Wiener solution (`MODE_AUTO`/`MODE_HOLD`), adaptation rate, Freeze/Resume/Copy-to-manual, and a reference band (`dsp/combine/ref_band.h`) restricting the solver to a slice of spectrum. Converges to the synthetic source's known weight to three decimals. Confirmed live. |
 | **5** | Wideband | No | **Done** — `dsp/combine/wideband_solver.h/.cpp` solves an N-tap complex weight from averaged cross/auto-spectra and applies it as a short FIR; the delay control is disabled under it. Needed a broadband interferer in the synthetic source first (see below). Against a 3.7-sample skew a scalar recovers nothing while 64 taps hold the full null. |
 | **6** | Fobos adapter + validation | **Yes** | `PORT_HF_DUAL`, dual DDC, `registerChannels()`. Then the deferred bench checks: confirm the `.re`/`.im` → HF1/HF2 mapping, phase stability over time and across a stop/start, and the CPU cost of two ≥50 Msps DDCs. First on-air nulls. |
-| **7** | More radios | Yes | **RSPduo dual-tuner done** — `sdrplay_source` opens `Tuner_Both` in `Dual_Tuner`, splits the two callbacks into two streams and registers a `ChannelSet`. Measured on hardware: both `rspDuoSampleFreq` choices decimate to 2 MS/s, and the two callbacks deliver in exact lockstep (identical sample counts, call counts and samples per call). `phaseCoherent` left false pending a measurement with signal in both ports. Perseus22 and RSR200 modules still to come. |
+| **7** | More radios | Yes | **RSPduo dual-tuner done** — `sdrplay_source` opens `Tuner_Both` in `Dual_Tuner`, splits the two callbacks into two streams and registers a `ChannelSet`. Measured on hardware: both `rspDuoSampleFreq` choices decimate to 2 MS/s, and the two callbacks deliver in exact lockstep (identical sample counts, call counts and samples per call). `phaseCoherent` stays false, now measured rather than assumed: coherence 1.0000 and drift under 0.15° *within* a run, but the A/B phase lands somewhere new on every start (six restarts gave +90.63, +147.93, +110.88, −73.43, −142.66, +90.35), so a saved weight cannot be restored across a stop/start. The antenna port control also needed a dual-mode path — see §3.2. Perseus22 and RSR200 modules still to come. |
 | **8** | Decorrelation | No | **Done** — `dsp/combine/decorrelator.h`: closed-form 2×2 eigendecomposition, coherence, and whitening. `MODE_DECORR_MIN` nulls the dominant arrival, `MODE_DECORR_MAX` peaks it; noise measurement enables a maximum-SNR combine. Covered by `core/test/test_decorrelation.cpp`, where a station 26 dB beneath a local ends up 43 dB above it. See §2.6. |
 
 Phase 0 is doing real work here, not box-ticking. A synthetic source with a *known*
@@ -663,6 +676,14 @@ other misc modules; the core pieces (registry, phaser block) are unconditional b
 4. **Weight changes are inaudible:** sweeping the phase control produces no clicks.
 5. **On-air:** with two antennas on a Fobos, a local carrier is nulled by ≥ 25 dB and the
    wanted signal on an adjacent frequency is not degraded by more than 3 dB.
+
+**Criterion 5 first met 2026-07-29**, on an RSPduo rather than a Fobos: with two real
+antennas on medium wave, both auto-null and decorrelation pulled stations out from under
+strong locals *in daylight* — the unfavourable case, with groundwave locals at full
+strength and little skywave to recover. This is the first end-to-end confirmation on
+signals nobody generated, and it validates the whole synthetic-source bet described in
+§5: six phases developed with no radio, and the behaviour on air matched what the test
+source predicted. Repeat on the Fobos in Phase 6 to close the criterion as written.
 
 ---
 
