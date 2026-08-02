@@ -598,6 +598,45 @@ Caveats to handle:
 - **Other software will misread it.** A 4-channel WAV opens elsewhere as quad audio.
   Unavoidable, and the same trade the Perseus22 makes; the sidecar mitigates it.
 
+### 4.2.1 Interoperability, and why we still keep our own container
+
+Checked against what actually exists rather than assumed, because the answer decides
+whether Yet Another Format is justified.
+
+**Neither SDRuno nor SDRconnect can record two tuners to one file.** Franco Venturi's
+`rsp-recorder` writes four formats -- WavViewDX-raw, Linrad, SDRuno and SDRconnect -- and
+instructs that for dual-tuner RSPduo captures you must use only the first two. The SDRplay
+formats are single-tuner. SDRconnect does do live diversity on the RSPduo, so the gap is
+specifically in *recording* the two channels separately, which is exactly what re-phasing
+needs. That msiner's DuoTools exists at all is the same evidence from another angle.
+
+**WavViewDX is the tool that matters, and it reads Linrad dual channel.** Reinhard Weiss's
+importer list includes "Linrad RAW, single and dual-channel" alongside Perseus, P22, SDR++
+and the rest. The same author's RSR200 Recorder writes files it can open, which is worth
+knowing given an RSR200 is on the way.
+
+**So the format question is settled by what carries the phasing metadata.** The Linrad
+header has no field for phase coherence, and that is not a detail we can drop: the RSPduo
+redraws its inter-tuner phase on every start, so a file that cannot say "these channels are
+not coherent" is one that cannot be safely re-phased later. Nothing off the shelf carries
+that, so our `sdpc` chunk stays.
+
+**What makes this cheap is that everyone already agrees on the payload.** Linrad, DuoWAV,
+rsp-recorder and this recorder all write int16 interleaved I1 Q1 I2 Q2. Four independent
+implementations, one order. Our data chunk is therefore byte-for-byte a Linrad dual-channel
+payload whenever the sample type is Int16, and conversion is a 41-byte header.
+
+`core/src/utils/linrad_raw.h` defines that header and `tools/wav2linrad.cpp` performs the
+conversion, verified byte-identical against the data chunk it came from. The header is
+41 bytes only because it is packed -- natural alignment of its two doubles would pad it to
+48 and produce a file nothing can read -- so `test_linrad_raw.cpp` asserts the size and
+every field offset. It has no version field and only a leading `-1` sentinel for
+identification, so nothing in the format would ever tell a reader we got it wrong.
+
+Export is deliberately one-way for now. Bringing Linrad and RSR200 Recorder captures *in*
+would let them be re-phased here, and is worth doing once there are real files to test
+against.
+
 ### 4.3 Playback
 
 Handled by the dual-channel `file_source` in §3.4. `WavReader`

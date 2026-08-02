@@ -47,8 +47,12 @@ namespace wavmeta {
         uint32_t iqOffset;
         uint32_t dbOffset;
         uint32_t maxVal;
-        uint32_t unused4;
-        uint32_t unused5;
+        // Named "unused" in the layouts this was decoded from, but SDRuno does use them:
+        // it stores the initial gains there in thousandths of a dB. We write zeros, which
+        // such a reader takes as a valid 0.000 dB rather than as "absent" -- worth knowing
+        // before anyone treats these as free space.
+        uint32_t initialGain1;
+        uint32_t initialGain2;
         // Followed by a NUL-terminated "next file" name, padding the chunk to 164 bytes
         // in the files examined. We write the name empty and pad to the same length so
         // readers expecting a fixed size are not surprised.
