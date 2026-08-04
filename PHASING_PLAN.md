@@ -741,7 +741,18 @@ strong locals *in daylight* — the unfavourable case, with groundwave locals at
 strength and little skywave to recover. This is the first end-to-end confirmation on
 signals nobody generated, and it validates the whole synthetic-source bet described in
 §5: six phases developed with no radio, and the behaviour on air matched what the test
-source predicted. Repeat on the Fobos in Phase 6 to close the criterion as written.
+source predicted.
+
+**Closed as written 2026-08-04, on the Fobos.** A station on 740 kHz was nulled, the
+application was quit and restarted, and the null was still where it had been left.
+
+That last part is the one capability no other radio here has. `phaseCoherent` is the
+distinction the `ChannelSet` contract was given at the very start, on the argument that a
+constant inter-channel offset is absorbed into the weight and only *reproducibility across
+a restart* decides whether a saved weight can be trusted. The RSPduo redraws its offset on
+every start, so there it cannot; the Fobos holds to 0.07° over eight restarts, so here it
+can. A design distinction made on paper in §2.1, measured in Phase 6, and now confirmed by
+a null that survived a quit -- which is the form the user actually experiences it in.
 
 ---
 
