@@ -35,6 +35,18 @@ public:
 
         // Initialize the DDC
         ddc.init(&ddcIn, 50e6, 50e6, 50e6, 0.0);
+        ddcB.init(&ddcInB, 50e6, 50e6, 50e6, 0.0);
+
+        // Both HF channels are digitised by the same ADC, arrive interleaved in one USB
+        // transfer, and are tuned by two DDCs given identical settings. There is no
+        // per-channel oscillator that could come up at a different phase, which is why
+        // this claims coherence where the RSPduo cannot -- but it is a claim from
+        // construction, and Phase 6 validation is what actually measures it.
+        channels.count = 2;
+        channels.streams = { &ddc.out, &ddcB.out };
+        channels.names = { "HF1", "HF2" };
+        channels.phaseCoherent = true;
+        channels.sampleAligned = true;
 
         handler.ctx = this;
         handler.selectHandler = menuSelected;
@@ -55,10 +67,15 @@ public:
         select(devSerial);
 
         sigpath::sourceManager.registerSource("FobosSDR", &handler);
+
+        // The saved port may already be the dual one, in which case core has to know
+        // before anything is selected or started.
+        applyPortMode();
     }
 
     ~FobosSDRSourceModule() {
-        // Nothing to do
+        // Core holds a bare pointer to our ChannelSet; it must not outlive us.
+        sigpath::sourceManager.unregisterChannels("FobosSDR");
     }
 
     void postInit() {}
@@ -78,7 +95,10 @@ public:
     enum Port {
         PORT_RF,
         PORT_HF1,
-        PORT_HF2
+        PORT_HF2,
+        // Both HF inputs at once, for phasing. PORT_HF1 and PORT_HF2 each throw away the
+        // other channel; this one keeps both. See PHASING_PLAN.md section 3.1.
+        PORT_HF_DUAL
     };
 
 private:
@@ -185,6 +205,7 @@ private:
         ports.define("rf", "RF", PORT_RF);
         ports.define("hf1", "HF1", PORT_HF1);
         ports.define("hf2", "HF2", PORT_HF2);
+        ports.define("hf_dual", "HF1 + HF2 (Phasing)", PORT_HF_DUAL);
 
         // Define clock sources
         clockSources.clear();
@@ -239,6 +260,22 @@ private:
 
         // Update the samplerate
         core::setInputSampleRate(sampleRate);
+
+        // The port that was just loaded decides whether we offer two channels.
+        applyPortMode();
+    }
+
+    // Registering the channel set is what makes core route this source through the phaser
+    // instead of straight to the frontend; unregistering puts it back. Called whenever the
+    // selected port changes, not only at start, because the wiring is decided when the
+    // source is selected.
+    void applyPortMode() {
+        if (ports.size() && ports[portId] == PORT_HF_DUAL) {
+            sigpath::sourceManager.registerChannels("FobosSDR", &channels);
+        }
+        else {
+            sigpath::sourceManager.unregisterChannels("FobosSDR");
+        }
     }
 
     static void menuSelected(void* ctx) {
@@ -296,6 +333,16 @@ private:
             _this->ddc.setOutSamplerate(_this->sampleRate, _this->sampleRate);
             _this->ddc.setOffset(_this->freq);
             _this->ddc.start();
+
+            // Second DDC for HF2, configured identically so the two channels stay in step.
+            // They are fed equal sample counts from the same buffer, but the phaser must
+            // not depend on that -- see PHASING_PLAN.md section 1.4 trap (a).
+            if (_this->port == PORT_HF_DUAL) {
+                _this->ddcB.setInSamplerate(actualSr);
+                _this->ddcB.setOutSamplerate(_this->sampleRate, _this->sampleRate);
+                _this->ddcB.setOffset(_this->freq);
+                _this->ddcB.start();
+            }
         }
 
         // Compute buffer size (Lower than usual, but it's a workaround for their API having broken streaming)
@@ -329,9 +376,13 @@ private:
             _this->ddc.out.clearWriteStop();
         }
         else {
+            // Both writers have to be released, or the worker sits in the swap of
+            // whichever one was not stopped and the join never returns.
             _this->ddcIn.stopWriter();
+            if (_this->port == PORT_HF_DUAL) { _this->ddcInB.stopWriter(); }
             if (_this->workerThread.joinable()) { _this->workerThread.join(); }
             _this->ddcIn.clearWriteStop();
+            if (_this->port == PORT_HF_DUAL) { _this->ddcInB.clearWriteStop(); }
         }
 
         // Stop streaming
@@ -339,6 +390,7 @@ private:
 
         // Stop the DDC
         _this->ddc.stop();
+        if (_this->port == PORT_HF_DUAL) { _this->ddcB.stop(); }
 
         // Close the device
         fobos_rx_close(_this->openDev);
@@ -355,6 +407,9 @@ private:
             }
             else {
                 _this->ddc.setOffset(freq);
+                // Both channels must follow the same tuning or the combining weight is
+                // meaningless -- they would be looking at different signals.
+                if (_this->port == PORT_HF_DUAL) { _this->ddcB.setOffset(freq); }
             }
         }
         _this->freq = freq;
@@ -398,6 +453,7 @@ private:
         SmGui::LeftLabel("Antenna Port");
         SmGui::FillWidth();
         if (SmGui::Combo(CONCAT("##_fobossdr_port_", _this->name), &_this->portId, _this->ports.txt)) {
+            _this->applyPortMode();
             if (!_this->selectedSerial.empty()) {
                 config.acquire();
                 config.conf["devices"][_this->selectedSerial]["port"] = _this->ports.key(_this->portId);
@@ -500,9 +556,33 @@ private:
                 for (int i = 0; i < sampCount; i++) {
                     ddcIn.writeBuf[i].re = 0.0f;
                 }
-                
+
                 // Send samples to the DDC
                 if (!ddcIn.swap(sampCount)) { break; }
+            }
+        }
+        else if (port == PORT_HF_DUAL) {
+            while (run) {
+                // Read samples. One buffer carries both ADC channels: .re is HF1 and .im
+                // is HF2 -- they are not the I and Q of one signal. The single-port modes
+                // above zero whichever one they do not want; here we keep both.
+                unsigned int sampCount = 0;
+                int err = fobos_rx_read_sync(openDev, (float*)ddcIn.writeBuf, &sampCount);
+                if (err) { break; }
+
+                // Split into two real-valued streams. HF2 must be copied out before HF1's
+                // imaginary part is cleared, or channel B receives zeros -- the two live
+                // in the same word, and the order of these three lines is the whole trick.
+                for (unsigned int i = 0; i < sampCount; i++) {
+                    ddcInB.writeBuf[i].re = ddcIn.writeBuf[i].im;
+                    ddcInB.writeBuf[i].im = 0.0f;
+                    ddcIn.writeBuf[i].im = 0.0f;
+                }
+
+                // Each DDC does double duty as the analytic converter for its own channel,
+                // exactly as in the single-port modes.
+                if (!ddcIn.swap(sampCount)) { break; }
+                if (!ddcInB.swap(sampCount)) { break; }
             }
         }
     }
@@ -536,6 +616,13 @@ private:
 
     dsp::stream<dsp::complex_t> ddcIn;
     dsp::channel::RxVFO ddc;
+
+    // Second channel, used only by PORT_HF_DUAL. ddc.out and ddcB.out are the two streams
+    // handed to core in `channels`; ddc.out doubles as handler.stream, which is safe
+    // because core reads either the phaser output or handler.stream, never both.
+    dsp::stream<dsp::complex_t> ddcInB;
+    dsp::channel::RxVFO ddcB;
+    ChannelSet channels;
 };
 
 MOD_EXPORT void _INIT_() {
