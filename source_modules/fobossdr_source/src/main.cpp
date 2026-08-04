@@ -6,6 +6,8 @@
 #include <core.h>
 #include <utils/optionlist.h>
 #include <atomic>
+#include <thread>
+#include <chrono>
 #include <fobos.h>
 
 SDRPP_MOD_INFO{
@@ -102,6 +104,21 @@ public:
     };
 
 private:
+    // The device will not reopen immediately after it has been streaming: the first
+    // fobos_rx_open() after a session always fails. Measured, because the obvious guesses
+    // are both wrong -- an immediate second attempt fails too, so a bare retry does not
+    // help, and it is not simply "every other open" either. It needs roughly half a second
+    // of wall time; probing every 500 ms it comes back on the second attempt, ~0.8 s after
+    // the close, every time. Without this, stopping and restarting the radio fails.
+    static int openDevice(fobos_dev_t** dev, int id) {
+        int err = fobos_rx_open(dev, id);
+        for (int attempt = 0; err && attempt < 5; attempt++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            err = fobos_rx_open(dev, id);
+        }
+        return err;
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -172,7 +189,7 @@ private:
 
         // Open the device
         fobos_dev_t* dev;
-        int err = fobos_rx_open(&dev, selectedDevId);
+        int err = openDevice(&dev, selectedDevId);
         if (err) {
             flog::error("Failed to open device: {}", err);
             return;
@@ -294,7 +311,7 @@ private:
         if (_this->running) { return; }
 
         // Open the device
-        int err = fobos_rx_open(&_this->openDev, _this->selectedDevId);
+        int err = openDevice(&_this->openDev, _this->selectedDevId);
         if (err) {
             flog::error("Failed to open device: {}", err);
             return;
