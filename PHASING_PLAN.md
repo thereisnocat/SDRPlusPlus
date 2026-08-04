@@ -417,15 +417,34 @@ Everything downstream of the source module sees `sampleRate`. The DDC cost is se
 hardware rather than treated as a blocker. The plan is built on it and it is recorded in
 §7 as an assumption to revisit rather than a question to answer before starting.
 
-**Cost concern, to measure when hardware is available:** this doubles the DDC load, and
-each DDC ingests ≥50 Msps. Worst case is a *low* display rate — 50 M → 1.25 M is a 40×
-decimation in one `RationalResampler`, done twice. Mitigation if needed: put a shared
-`dsp::multirate::PowerDecimator` (power-of-2 cascade with precomputed tap plans,
-`dsp/multirate/power_decimator.h` — already used by `IQFrontEnd`) on each channel to do
-the bulk decimation cheaply, leaving the `RxVFO` a much smaller ratio. Note the two
-channels are different signals, so the decimation itself cannot be shared between them;
-only the design can. Treat this as a known optimization to hold in reserve, not a
-prerequisite.
+**Cost concern: measured, and the prediction was backwards.** RxVFO throughput at the
+50 Msps the ADC actually delivers, one instance versus two:
+
+| Display rate | 1 DDC | 2 DDCs (each) |
+|---|---|---|
+| 1.25 MHz | 8.34x realtime | 7.51x |
+| 2.5 MHz | 6.59x | 6.29x |
+| 5 MHz | 4.13x | 3.93x |
+| 10 MHz | 2.33x | 2.41x |
+
+Two DDCs cost roughly 10% each rather than twice as much, because they run on separate
+cores -- total throughput nearly doubles, 417 to 751 Msps.
+
+The paragraph this replaces predicted that a *low* display rate would be the worst case,
+and held a shared `PowerDecimator` in reserve as the mitigation. Both halves were wrong.
+1.25 MHz is the **cheapest** case, not the dearest, and the reason is visible in the log
+line `predec: 32`: `RationalResampler` already contains a power-of-2 pre-decimator, so the
+mitigation was inside the block the whole time. A bigger decimation ratio means more of the
+work happens in the cheap stage. The genuine worst case is the *highest* display rate, and
+it still leaves 2.4x headroom.
+
+**Mapping confirmed.** `.re` is HF1, `.im` is HF2, measured with an antenna on HF1 only:
+`.re` sits 35.1 dB above `.im` and the correlation between components is 0.005. The
+assumption held, so the one-line fix the plan budgeted for was not needed. The same
+measurement showed the two ports have no measurable crosstalk, which matters because
+crosstalk is what would otherwise put a floor under achievable null depth -- with both
+ports open the components correlate at 0.97, purely because both pick up the same ambient
+noise, and connecting one antenna collapses that to 0.005.
 
 ### 3.2 SDRplay RSPduo
 
