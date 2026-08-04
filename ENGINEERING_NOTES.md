@@ -69,6 +69,17 @@ fast path is worse than no test, because it produces false confidence. Now cover
 fractional-delay check (lands within 0.01 dB of theory) and a sweep across whole samples
 asserting no splice.
 
+**This exact mistake recurred in Phase 6**, which is why it leads the list. Half the Fobos
+open attempts were failing; an open/close loop showed a clean ok/FAILED/ok/FAILED
+alternation, so a bare retry was written, committed, and *then* tested — and it did not
+work, because two back-to-back opens both fail. The alternation was a symptom, not the
+mechanism. What the device actually needs is about half a second of wall time after a
+streaming session; probing every 500 ms it returns on the second attempt, ~0.8 s after the
+close, every time. The corrected fix was verified before the commit stood, by giving the
+measurement harness the same strategy and watching 8 of 8 cycles succeed where 4 of 8 had
+failed. **A reproducible pattern is not the same as an explanation**, and the cost of
+finding that out is the same whether it is a delay line or a USB driver.
+
 **Second lesson, about process:** the first fix shipped for this was *ramping the delay*,
 aimed at a plausible cause that had not been confirmed. The ramping is correct and worth
 having — a step change in delay is a step change in time — but it was not the reported bug.
