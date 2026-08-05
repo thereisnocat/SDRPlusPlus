@@ -87,7 +87,7 @@ int main() {
 
     std::vector<complex_t> a(N), b(N);
     double phL = 0, phD = 0, phX = 0;
-    const double wL = 2.0 * M_PI * offL / sr, wD = 2.0 * M_PI * offD / sr, wX = 2.0 * M_PI * offX / sr;
+    const double wL = 2.0 * DB_M_PI * offL / sr, wD = 2.0 * DB_M_PI * offD / sr, wX = 2.0 * DB_M_PI * offX / sr;
     for (int i = 0; i < N; i++) {
         const std::complex<double> sL = std::polar(ampL, phL) * std::complex<double>(g(rng) * 0.3 + 1.0, 0);
         const std::complex<double> sD = std::polar(ampD, phD) * std::complex<double>(g(rng) * 0.3 + 1.0, 0);
