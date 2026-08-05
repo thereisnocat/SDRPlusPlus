@@ -393,6 +393,30 @@ The Decorrelation panel now also warns outright when no reference band is set, s
 effect otherwise looks like a hardware limitation rather than a configuration one — which
 is exactly how it presented.
 
+**Confirmed on real air 2026-08-05**, against the recording that produced the original
+report: 16 minutes of dual-channel Fobos capture through WNYC 820, the same session in
+which the Perseus22 fully nulled it and revealed a WJFN ID at 0100 UTC. Measured with the
+project's own `RefBand`/decorrelator code reading the actual file — not synthesised —
+solving `MODE_DECORR_MIN` from the whole recording's covariance and scoring the fixed
+result against a 2 kHz band centred on the station, the same metric `getNullDepth()`
+reports live:
+
+```
+wideband-solved weight:   14.1 dB null (2 kHz band)
+2 kHz-band-solved weight: 23.1 dB null (2 kHz band)     -- +9.0 dB from the fix alone
+1 kHz-band-solved weight: 23.2 dB null (2 kHz band)     -- narrower buys almost nothing
+```
+
+Two things worth separating. The 9 dB gap between wideband and reference-banded is the bug
+from this section, confirmed on the exact air that motivated the report. The remaining
+distance to what sounded like a full Perseus22 null is a different, honest thing: 1 kHz and
+2 kHz land within 0.15 dB of each other, so this is not under-scoped — 23 dB looks like the
+practical ceiling for a *single complex weight* on this station, which is precisely the
+frequency-flat-ratio limitation §2.5 already names. Decorrelation does not have access to
+the wideband multi-tap solver (`wideband` is forced false whenever `decorrelating` is true)
+— extending it there is the natural next place to look if 23 dB turns out not to be enough
+in practice.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
