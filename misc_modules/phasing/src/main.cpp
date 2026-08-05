@@ -541,6 +541,17 @@ private:
             // to it, rather than "common" from "uncommon".
             ImGui::TextWrapped("Splits the strongest arrival from everything else. "
                                "Null it to hear what it was covering; peak it to favour it.");
+            if (!_this->refEnabled) {
+                // Without it, "strongest" means strongest across the whole tuned span --
+                // on a crowded band that is rarely the one station being listened to, and
+                // it is why this can look unrelated to what is on the dial. See the
+                // Reference band control below; the Perseus22 manual makes the same point
+                // for its own decorrelation feature, recommending 1-2 kHz for AM.
+                ImGui::TextWrapped("No reference band is set, so this is finding the "
+                                   "strongest arrival across the whole tuned span, not "
+                                   "necessarily the station on the dial. Turn on "
+                                   "Reference band below and narrow it onto one carrier.");
+            }
 
             ImGui::LeftLabel("Rate");
             ImGui::FillWidth();
@@ -638,10 +649,22 @@ private:
                 ImGui::TextWrapped("More taps null across a wider span but take longer to "
                                    "settle and cost more CPU.");
             }
+        }
 
-            // Adapting on the whole band nulls whatever is loudest, which when the DX
-            // peaks is the DX. Pointing the solver at a stretch containing only the pest
-            // is the thing an SDR can do that an analogue phasing box cannot.
+        // -- Reference band ------------------------------------------------------
+        // Shared by every mode that consults refEnabled downstream -- MODE_AUTO,
+        // both decorrelation modes, and the null-depth meter in manual mode -- so this
+        // used to live inside the Adaptation block above and was consequently unreachable
+        // whenever Decorrelate was selected. That meant decorrelation always ran on the
+        // *whole* tuned span rather than one station: not a math bug, but the solver being
+        // asked a different question than the one intended. Nulling the dominant arrival
+        // across a crowded band nulls whatever is loudest anywhere in view, which is
+        // usually not the station on the dial, and standing signals elsewhere can swap
+        // which mode looks "stronger" without anything actually being wrong. Adapting on
+        // the whole band nulls whatever is loudest, which when the DX peaks is the DX.
+        // Pointing the solver at a stretch containing only the pest is the thing an SDR can
+        // do that an analogue phasing box cannot.
+        if (combining) {
             if (ImGui::Checkbox(CONCAT("Reference band##_phasing_refen_", _this->name), &_this->refEnabled)) {
                 _this->applyReferenceBand();
                 _this->saveSettings();
@@ -668,7 +691,10 @@ private:
                     _this->saveSettings();
                 }
                 ImGui::TextWrapped("Band-limiting is approximate; strong signals just "
-                                   "outside it still pull on the estimate.");
+                                   "outside it still pull on the estimate. For one AM "
+                                   "carrier, 1-2 kHz is a reasonable starting width -- the "
+                                   "Perseus22 manual recommends the same for its own "
+                                   "decorrelation.");
             }
         }
 
