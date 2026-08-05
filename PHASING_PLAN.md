@@ -417,6 +417,58 @@ the wideband multi-tap solver (`wideband` is forced false whenever `decorrelatin
 — extending it there is the natural next place to look if 23 dB turns out not to be enough
 in practice.
 
+**That extension was built and tested 2026-08-05, with a mixed result worth stating
+plainly rather than rounding up.** `dsp::combine::WidebandDecorrelator`
+(`wideband_decorrelator.h/.cpp`) solves the same eigendecomposition independently per FFT
+bin instead of once for the whole span — three spectra (`Saa`, `Sbb`, `Sab`) accumulated per
+bin, `solveEigen2`/`combineCoefficients` reused unchanged bin by bin, two N-tap FIRs
+extracted by the same IFFT-and-taper route `WidebandSolver` already uses. Because each bin
+only ever sees its own frequency's energy, it needs no reference band at all — the FFT does
+the separation the reference band exists to approximate — and it can null more than one
+station at once, each according to its own arrival direction, where a single complex weight
+structurally can only ever describe one.
+
+**On synthetic data this is decisive.** The same three-station crowded-band scene as
+`test_crowded_band.cpp` (a station L, a weak DX signal D under it, a louder unrelated
+station X 70 kHz away), with no reference band set at all:
+
+```
+scalar, no reference band:                L -0.1 dB   X -22.3 dB
+wideband (per-bin), no reference band:    L -34.8 dB  X -51.1 dB
+```
+
+Both stations nulled simultaneously, deeper than even the *reference-band-scoped* scalar
+result from §2.6a's own reproduction (-21.6 dB). Kept as
+`core/test/test_wideband_decorrelation.cpp`, including a run through the real `Phaser`
+class end to end, not just the standalone solver.
+
+**On the real WNYC recording, it did not hold up as a reliable improvement.** Solving over
+the first 30 s of the same file used above: 23.0 dB, matching the scalar's 26.1 dB on the
+same window. Over the first 60 s: 26.4 dB against the scalar's 24.8 dB — briefly ahead. But
+solving over a 30 s window starting at minute 6.3 gave only **16.2 dB**, and this was
+checked against a shared-propagation explanation before being accepted: solving the
+*scalar* method over that exact same window gave **22.2 dB** — stable, not degraded. Early
+evening is when MW skywave from a co-channel station starts developing, which was the
+first, more comfortable explanation; it does not survive the control, since the scalar
+method sees the same air and does not collapse. Whatever went wrong in that window is
+specific to the per-bin approach — mean coherence stayed above 0.995 throughout, so it is
+not simply "nothing to null" — and is not yet diagnosed. Plausible candidates, untested:
+a mismatch between the fine per-bin frequency resolution (488 Hz bins at this fftSize) and
+the far coarser realized filter (64 taps resolves only to ~125 kHz), which could make
+individual bins' solutions noise-sensitive; or genuine per-bin SNR varying with WNYC's own
+modulation content minute to minute, which a wider, more heavily averaged scalar estimate
+would not show as sharply.
+
+**Where this leaves the feature.** The multi-station capability is real and proven, both
+synthetically and by construction — nothing about it depends on the part that misbehaved.
+Depth and reliability on a *single* targeted station is not yet trustworthy enough to
+prefer over the scalar reference-banded approach, which stayed stable across the exact
+window where wideband did not. Shipped anyway, reachable from the Decorrelation panel,
+because the failure mode is a shallower null rather than a wrong or dangerous one, and the
+UI says plainly that switching modes costs nothing — but it should be treated as
+experimental for single-station use until the real-air instability is actually understood,
+not assumed fixed by the synthetic result alone.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline

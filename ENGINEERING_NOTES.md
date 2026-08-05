@@ -214,6 +214,45 @@ implementation *against that note* is a distinct step from checking that the alg
 implemented correctly, and skipping it is how a component can be simultaneously
 well-tested and unusable.
 
+### 2.6b A promising synthetic result that did not survive real air, and the control that caught it
+
+**The setup:** asked to try wideband multi-tap decorrelation, on the reasoning that §2.5's
+frequency-flat-ratio limitation applies to decorrelation too and a per-bin solve should
+subsume it the same way the Wiener multi-tap solver already does for auto-null. Built,
+tested synthetically first (the discipline this project has followed throughout), and the
+synthetic result was unambiguous: two stations nulled simultaneously, no reference band
+needed, deeper than even the scoped scalar result. A clean, decisive win.
+
+**Then it was run against real air**, the WNYC recording from §2.6a, in short windows so a
+result could be had in seconds rather than minutes. The first two windows (0–30 s, 0–60 s)
+matched or modestly beat the scalar. A window starting at minute 6.3 gave 16.2 dB, well
+below the scalar's 23 dB ceiling from the same recording.
+
+**The comfortable explanation arrived immediately, and was wrong.** Early evening is
+exactly when medium-wave skywave starts developing, so "a co-channel station is fading in
+and degrading the null" was the obvious story, and it would have been easy to write down
+and move on — it fit, it required no further work, and it did not implicate the new code.
+**It was checked rather than accepted**, by running the *scalar* method over the identical
+30-second window. If propagation were the cause, both methods see the same air and both
+should degrade. The scalar gave 22.2 dB — stable, not degraded. Whatever went wrong in
+that window belongs to the per-bin solver specifically, not to conditions outside it.
+
+**What this is really about:** an explanation that requires no further investigation is
+not thereby more likely to be correct, and "the physics would predict this" is exactly the
+kind of explanation that stops a check before it starts, because it is plausible and
+external to the code just written. The fix here was not clever — reuse the working scalar
+implementation as a control on the same data — but reaching for it instead of the tidier
+propagation story is the entire difference between an honest result and a wrong one shipped
+with a good story attached. The root cause of the per-bin instability is still not
+diagnosed; what is settled is that it is real, and that finding out cost one extra
+five-line program rather than a false confirmation.
+
+**Shipped anyway, labelled honestly.** The multi-station capability the synthetic test
+proved is real and does not depend on whatever is unstable about single-station depth. The
+UI says outright that single-station use is experimental and may underperform a well-scoped
+reference band, rather than presenting a feature whose one real-world measurement was a
+clean win when the actual record is mixed.
+
 ### 2.7 Smaller ones
 
 - **Phase clamp before scaling.** Clamping to 179.99° before scaling to a 16-bit value

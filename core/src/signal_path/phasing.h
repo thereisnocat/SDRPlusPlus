@@ -71,6 +71,8 @@ public:
     void setWideband(bool enabled, int taps);
     void getWideband(bool& enabled, int& taps);
     bool isWidebandActive();
+    bool isWidebandDecorrelating();
+    float getWidebandCoherence();
     void setReferenceBand(bool enabled, double offsetHz, double widthHz);
     void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz);
 

@@ -33,6 +33,7 @@ LINKED="$REPO/core/test/test_phaser.cpp
 $REPO/core/test/test_phasing.cpp
 $REPO/core/test/test_wav_meta.cpp
 $REPO/core/test/test_decorrelation.cpp
+$REPO/core/test/test_wideband_decorrelation.cpp
 $REPO/source_modules/phasing_test_source/test/test_worker.cpp"
 
 # Suites with no dependency beyond the standard library.

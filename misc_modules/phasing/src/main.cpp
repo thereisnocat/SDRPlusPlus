@@ -454,7 +454,12 @@ private:
         // decorrelation modes it still draws, showing where the solver has gone, which is
         // worth seeing: a weight parked somewhere implausible is the first sign that the
         // covariance estimate is being pulled by the wrong signal.
-        if (combining) {
+        // Wideband decorrelation has no single (gain, phase) it is meaningfully doing --
+        // y = k0(f)*A + k1(f)*B varies across the band, and getCombineCoefficients() only
+        // reflects the scalar path, which is not running while this mode is active. Rather
+        // than show a frozen, misleading dot left over from before it was switched on, skip
+        // the pad here outright.
+        if (combining && !sigpath::phasing.isWidebandDecorrelating()) {
             float padGain = _this->effectiveGain();
             float padPhase = _this->effectivePhase();
 
@@ -560,17 +565,62 @@ private:
                 _this->saveSettings();
             }
 
+            // Solves the same eigen split independently per FFT bin instead of once for
+            // the whole span. Each bin sees only its own frequency's energy, which is why
+            // this needs no reference band the way the scalar solver does -- and why it
+            // can null more than one station at once, each according to its own arrival
+            // direction, where a single complex weight can only ever describe one.
+            if (ImGui::Checkbox(CONCAT("Wideband (multi-tap, per-bin)##_phasing_dwb_", _this->name), &_this->wideband)) {
+                sigpath::phasing.setWideband(_this->wideband, _this->wbTaps);
+                _this->saveSettings();
+            }
+            if (_this->wideband) {
+                ImGui::LeftLabel("  taps");
+                ImGui::FillWidth();
+                if (ImGui::SliderInt(CONCAT("##_phasing_dwbtaps_", _this->name), &_this->wbTaps, 8, 96)) {
+                    sigpath::phasing.setWideband(_this->wideband, _this->wbTaps);
+                    _this->saveSettings();
+                }
+                ImGui::TextWrapped("Solves separately per frequency bin, so it does not "
+                                   "need a reference band and can null several stations "
+                                   "in the observed span at once. More taps follow a "
+                                   "sharper frequency dependence but take longer to settle. "
+                                   "No single gain/phase describes this, so the pad below "
+                                   "does not show while it is active.");
+                // Measured, not assumed: on real air this beat the scalar approach in some
+                // windows and fell well short in others -- see PHASING_PLAN.md section
+                // 2.6a. Multi-station nulling is the proven win; depth on one station is
+                // not yet reliable enough to prefer over a well-scoped reference band.
+                ImGui::TextWrapped("Experimental for a single station: real-air testing "
+                                   "found it can be shallower than a well-scoped reference "
+                                   "band, unpredictably. Its proven strength is nulling "
+                                   "several stations at once without one.");
+            }
+
+            if (_this->wideband) {
+                // A single scalar rho describes a frequency-dependent decomposition
+                // poorly, so this is a separate, power-weighted mean across bins rather
+                // than the reference-band figure below it.
+                const float wrho = sigpath::phasing.getWidebandCoherence();
+                ImGui::Text("Mean coherence across bins: %.3f", wrho);
+                ImGui::FillWidth();
+                ImGui::VolumeMeter(std::clamp(wrho, 0.0f, 1.0f), std::clamp(wrho, 0.0f, 1.0f), 0, 1);
+            }
+
             const float rho = sigpath::phasing.getCoherence();
             const float sep = sigpath::phasing.getComponentSeparation();
-            ImGui::Text("Coherence %.3f, separation %.1f dB", rho, sep);
+            ImGui::Text("%sCoherence %.3f, separation %.1f dB",
+                        _this->wideband ? "Scalar (reference-band) " : "", rho, sep);
             ImGui::FillWidth();
             ImGui::VolumeMeter(std::clamp(rho, 0.0f, 1.0f), std::clamp(rho, 0.0f, 1.0f), 0, 1);
-            if (rho < 0.5f) {
+            if (rho < 0.5f && !_this->wideband) {
                 // Low coherence means there is no single dominant arrival to separate, so
-                // whatever the solver returns is arbitrary.
+                // whatever the solver returns is arbitrary. Not shown in wideband mode --
+                // a low SCALAR coherence there is expected and not the relevant number.
                 ImGui::TextWrapped("Low coherence: no single arrival dominates here, so "
                                    "there is little to separate. Narrow the reference band "
-                                   "onto one signal.");
+                                   "onto one signal, or try Wideband above, which needs no "
+                                   "reference band at all.");
             }
 
             // Whitening, so that peaking the strongest arrival maximises signal to noise

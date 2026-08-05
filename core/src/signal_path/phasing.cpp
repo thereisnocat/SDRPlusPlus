@@ -190,6 +190,8 @@ void Phasing::setSampleRate(double sampleRate) { phaser.setSampleRate(sampleRate
 void Phasing::setWideband(bool enabled, int taps) { phaser.setWideband(enabled, taps); }
 void Phasing::getWideband(bool& enabled, int& taps) { phaser.getWideband(enabled, taps); }
 bool Phasing::isWidebandActive() { return phaser.isWidebandActive(); }
+bool Phasing::isWidebandDecorrelating() { return phaser.isWidebandDecorrelating(); }
+float Phasing::getWidebandCoherence() { return phaser.getWidebandCoherence(); }
 void Phasing::setReferenceBand(bool enabled, double offsetHz, double widthHz) { phaser.setReferenceBand(enabled, offsetHz, widthHz); }
 void Phasing::getReferenceBand(bool& enabled, double& offsetHz, double& widthHz) { phaser.getReferenceBand(enabled, offsetHz, widthHz); }
 void Phasing::captureNoise(double seconds) { phaser.captureNoise(seconds); }

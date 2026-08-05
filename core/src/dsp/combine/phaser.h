@@ -6,6 +6,7 @@
 #include "ref_band.h"
 #include "decorrelator.h"
 #include "wideband_solver.h"
+#include "wideband_decorrelator.h"
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -239,8 +240,21 @@ namespace dsp::combine {
 
         bool isWidebandActive() {
             std::lock_guard<std::mutex> lck(paramMtx);
-            return _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
+            return _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD || isDecorrelating(_mode));
         }
+
+        // True when the active combination is the per-bin decorrelator rather than the
+        // scalar eigendecomposition -- distinct from isWidebandActive() because the UI
+        // shows different things for it (no single coherence/separation figure means much
+        // once the split is frequency-dependent).
+        bool isWidebandDecorrelating() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _wideband && isDecorrelating(_mode);
+        }
+
+        // Weighted-by-power mean coherence across bins, from the wideband decorrelator.
+        // Meaningful only while isWidebandDecorrelating() is true.
+        float getWidebandCoherence() { return wbDecorrCoherence.load(std::memory_order_relaxed); }
 
         // Needed only by the reference band, to place its mixer.
         void setSampleRate(double sampleRate) {
@@ -418,6 +432,7 @@ namespace dsp::combine {
             float adaptRate;
             bool refEnabled;
             bool wideband;
+            bool widebandDecorr;
             bool decorrelating;
             {
                 std::lock_guard<std::mutex> lck(paramMtx);
@@ -426,13 +441,20 @@ namespace dsp::combine {
                 delay = _delay;
                 adaptRate = _adaptRate;
                 refEnabled = _refEnabled;
-                wideband = _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
                 decorrelating = isDecorrelating(_mode);
-                if (decorrelating) { wideband = false; }
+                wideband = _wideband && (_mode == MODE_AUTO || _mode == MODE_HOLD);
+                widebandDecorr = _wideband && decorrelating;
                 if (_wbDirty) {
                     wbSolver.configure(1024, _wbTaps, (std::max)(_adaptRate, 0.02f));
                     wbHist.assign((std::max)(_wbTaps - 1, 0), complex_t{ 0.0f, 0.0f });
                     wbTapsRev.clear();
+                    // A larger FFT than the Wiener path's: resolving one station out of
+                    // several sharing the observed span needs bins finer than the ~10 kHz
+                    // spacing between broadcast channels, which is the whole reason this
+                    // mode needs no reference band -- see wideband_decorrelator.h.
+                    wbDecorr.configure(4096, _wbTaps, (std::max)(_adaptRate, 0.02f));
+                    wbDecorrHistA.clear();
+                    wbDecorrHistB.clear();
                     _wbDirty = false;
                 }
                 if (_refDirty) {
@@ -448,7 +470,17 @@ namespace dsp::combine {
             // the lines entirely, which is what keeps bypass bit-identical to the input.
             if (isCombining(mode)) {
                 if ((int)dlyA.size() < count) { dlyA.resize(count); dlyB.resize(count); }
-                if (wideband) {
+                if (widebandDecorr) {
+                    // Neither channel is privileged here the way Wiener's A is -- y is
+                    // k0(f)*A + k1(f)*B, both frequency-dependent -- so both get the same
+                    // centring delay rather than only one. See wideband_decorrelator.h.
+                    const float align = (float)wbDecorr.alignmentDelay();
+                    delayA.process(a, dlyA.data(), count, align, align);
+                    delayB.process(b, dlyB.data(), count, align, align);
+                    a = dlyA.data();
+                    b = dlyB.data();
+                }
+                else if (wideband) {
                     // The taps span both signs of lag, so A is held back by half the span
                     // and B is left alone -- the filter absorbs any timing difference,
                     // which is why the scalar delay control is retired here.
@@ -485,6 +517,24 @@ namespace dsp::combine {
                     _phaseDeg = (float)(std::arg(wNew) * 180.0 / DB_M_PI);
                     target = _target;
                 }
+            }
+
+            if (widebandDecorr) {
+                wbDecorr.feed(a, b, count);
+                wbDecorr.copyTaps(mode == MODE_DECORR_MIN, wbDecorrK0Rev, wbDecorrK1Rev);
+                // Kept alive so the scalar coherence/separation meters, the noise capture
+                // for whitening, and the reference-band null-depth reading still mean
+                // something if the operator switches back to scalar mode -- this mode has
+                // its own coherence readout (getWidebandCoherence()) but does not touch
+                // whitening or the reference band scalar path itself.
+                if (decorrelating || _capturingNoise) {
+                    updateCovariance(count, a, b, refEnabled, adaptRate);
+                }
+                applyWidebandDecorrelation(count, a, b, outBuf);
+                wbDecorrCoherence.store(wbDecorr.meanCoherence(), std::memory_order_relaxed);
+                updateMetrics(count, a, b, outBuf);
+                if (refEnabled) { updateBandDepth(count, a, outBuf); }
+                return;
             }
 
             if (wideband) {
@@ -571,6 +621,42 @@ namespace dsp::combine {
             }
 
             memcpy(wbHist.data(), wbLine.data() + count, (n - 1) * sizeof(complex_t));
+        }
+
+        // Y[n] = sum_k k0[k] A[n-k] + sum_k k1[k] B[n-k]. Two filters rather than one,
+        // because neither channel is privileged the way applyWideband()'s A is -- see
+        // wideband_decorrelator.h. If a solution has not landed yet (still filling its
+        // first analysis window), pass A through so there is no discontinuity to click.
+        void applyWidebandDecorrelation(int count, const complex_t* a, const complex_t* b, complex_t* outBuf) {
+            const int n = (int)wbDecorrK0Rev.size();
+            if (n < 1) {
+                memcpy(outBuf, a, count * sizeof(complex_t));
+                return;
+            }
+            if ((int)wbDecorrHistA.size() != n - 1) {
+                wbDecorrHistA.assign(n - 1, complex_t{ 0.0f, 0.0f });
+                wbDecorrHistB.assign(n - 1, complex_t{ 0.0f, 0.0f });
+            }
+
+            wbLineA.resize(n - 1 + count);
+            wbLineB.resize(n - 1 + count);
+            memcpy(wbLineA.data(), wbDecorrHistA.data(), (n - 1) * sizeof(complex_t));
+            memcpy(wbLineA.data() + (n - 1), a, count * sizeof(complex_t));
+            memcpy(wbLineB.data(), wbDecorrHistB.data(), (n - 1) * sizeof(complex_t));
+            memcpy(wbLineB.data() + (n - 1), b, count * sizeof(complex_t));
+
+            for (int i = 0; i < count; i++) {
+                lv_32fc_t accA, accB;
+                volk_32fc_x2_dot_prod_32fc(&accA, (const lv_32fc_t*)(wbLineA.data() + i),
+                                           (const lv_32fc_t*)wbDecorrK0Rev.data(), n);
+                volk_32fc_x2_dot_prod_32fc(&accB, (const lv_32fc_t*)(wbLineB.data() + i),
+                                           (const lv_32fc_t*)wbDecorrK1Rev.data(), n);
+                outBuf[i].re = lv_creal(accA) + lv_creal(accB);
+                outBuf[i].im = lv_cimag(accA) + lv_cimag(accB);
+            }
+
+            memcpy(wbDecorrHistA.data(), wbLineA.data() + count, (n - 1) * sizeof(complex_t));
+            memcpy(wbDecorrHistB.data(), wbLineB.data() + count, (n - 1) * sizeof(complex_t));
         }
 
         // Accumulate the 2x2 covariance, over the reference band when one is set so the
@@ -691,6 +777,8 @@ namespace dsp::combine {
         RefBand metricBand;
         WidebandSolver wbSolver;
         std::vector<complex_t> wbTapsRev, wbHist, wbLine;
+        WidebandDecorrelator wbDecorr;
+        std::vector<complex_t> wbDecorrK0Rev, wbDecorrK1Rev, wbDecorrHistA, wbDecorrHistB, wbLineA, wbLineB;
         std::vector<complex_t> dlyA, dlyB;
 
         std::mutex paramMtx;
@@ -731,5 +819,6 @@ namespace dsp::combine {
         std::atomic<float> separationValue{ 0.0f };
         std::atomic<float> coefA_re{ 1.0f }, coefA_im{ 0.0f };
         std::atomic<float> coefB_re{ 0.0f }, coefB_im{ 0.0f };
+        std::atomic<float> wbDecorrCoherence{ 0.0f };
     };
 }
