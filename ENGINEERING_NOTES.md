@@ -253,6 +253,27 @@ UI says outright that single-station use is experimental and may underperform a 
 reference band, rather than presenting a feature whose one real-world measurement was a
 clean win when the actual record is mixed.
 
+**The next request tested the leading hypothesis, and it failed the same way the propagation
+story did.** The candidate explanation was a coarse-filter problem: 64 taps resolves to about
+125 kHz, far blunter than the 488 Hz bins the covariance was actually solved at, so a bin's
+fine solution could not be realized. That predicts more taps should help, roughly
+monotonically. Swept 16 through 256 at the exact window that had measured 16.2 dB:
+12.0, 27.6, 16.2, 18.0, 6.6 dB. No trend either direction, and the one tap count that briefly
+looked promising (32, giving 27.6 dB on this window) failed on three further independent
+windows at the same setting — 23.1, 34.5, 16.2, 15.2 dB, no more stable than 64 had been.
+
+**The value of this run was the negative result, and it needed the same discipline as the
+propagation check to get to.** It would have been easy to report "32 taps improved it" from
+the first data point and stop — a single measurement that confirms a hypothesis is exactly as
+tempting to accept without a second look as a single measurement that fits a plausible outside
+cause. Testing the SAME setting against independent windows before believing it is the same
+move as running the scalar control: check whether an apparent fix generalizes before crediting
+it, not only whether an apparent cause does. What the sweep actually shows is a per-bin
+estimate that swings by more than 20 dB depending on which 30 seconds of real air it is asked
+to describe, largely independent of how many taps the result is truncated to — which points
+away from a filter-resolution problem and toward the covariance estimate itself being fragile
+on real noise, an open question rather than a closed one.
+
 ### 2.7 Smaller ones
 
 - **Phase clamp before scaling.** Clamping to 179.99° before scaling to a 16-bit value

@@ -452,12 +452,29 @@ evening is when MW skywave from a co-channel station starts developing, which wa
 first, more comfortable explanation; it does not survive the control, since the scalar
 method sees the same air and does not collapse. Whatever went wrong in that window is
 specific to the per-bin approach — mean coherence stayed above 0.995 throughout, so it is
-not simply "nothing to null" — and is not yet diagnosed. Plausible candidates, untested:
-a mismatch between the fine per-bin frequency resolution (488 Hz bins at this fftSize) and
-the far coarser realized filter (64 taps resolves only to ~125 kHz), which could make
-individual bins' solutions noise-sensitive; or genuine per-bin SNR varying with WNYC's own
-modulation content minute to minute, which a wider, more heavily averaged scalar estimate
-would not show as sharply.
+not simply "nothing to null" — and is not yet diagnosed.
+
+**The resolution-mismatch hypothesis was tested 2026-08-05 and ruled out.** The leading
+candidate had been that 64 taps (resolving only to ~125 kHz) was too coarse to realize what
+a 488 Hz-wide bin actually solved for. If true, more taps should help monotonically. Swept
+16 through 256 at the exact window that gave 16.2 dB:
+
+```
+16 taps: 12.0 dB   32 taps: 27.6 dB   64 taps: 16.2 dB   128 taps: 18.0 dB   256 taps: 6.6 dB
+```
+
+No trend in either direction — 32 taps briefly looked like a fix, then failed on three other
+independent windows at that same tap count (23.1, 34.5, 16.2, 15.2 dB across 5.3/8/10/12
+minutes), no better calibrated than 64 was. Ruling out resolution mismatch matters as much
+as finding a fix would have: it means the instability is not a knob to be tuned away, and
+whatever is actually happening has to be found before this can be trusted for single-station
+work. The pattern across both taps and time — swinging between comfortably beating the
+scalar and falling ten-plus dB short, with no parameter yet found that tames it — reads more
+like the per-bin estimate itself being fragile on real, noisy air than like a tuning problem.
+Untested candidates: the forgetting factor (0.05, unchanged since the Wiener path) giving too
+short an effective average for a per-bin estimate with far less data per bin than the scalar's
+single wide accumulation; or some form of bin-power-weighted regularization, shrinking a
+bin's contribution toward the scalar solution when that bin's own power is too low to trust.
 
 **Where this leaves the feature.** The multi-station capability is real and proven, both
 synthetically and by construction — nothing about it depends on the part that misbehaved.
