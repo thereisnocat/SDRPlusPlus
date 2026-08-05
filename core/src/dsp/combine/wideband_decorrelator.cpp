@@ -172,7 +172,18 @@ namespace dsp::combine {
         std::vector<std::complex<double>> K0min(_fftSize), K1min(_fftSize);
         std::vector<std::complex<double>> K0max(_fftSize), K1max(_fftSize);
 
+        // The gate threshold is relative to the median bin's power -- an estimate of the
+        // noise floor that self-calibrates to whatever the source's gain and bandwidth
+        // happen to be, rather than an absolute level that would need retuning per radio.
+        std::vector<double> power(_fftSize);
+        for (int i = 0; i < _fftSize; i++) { power[i] = _saa[i] + _sbb[i]; }
+        std::vector<double> sortedPower = power;
+        std::nth_element(sortedPower.begin(), sortedPower.begin() + sortedPower.size() / 2, sortedPower.end());
+        const double medianPower = sortedPower[sortedPower.size() / 2];
+        const double gateThreshold = medianPower * std::pow(10.0, _gateDb / 10.0);
+
         double coherenceSum = 0.0, weightSum = 0.0;
+        int active = 0;
         const Matrix2 noWhitening;
 
         for (int i = 0; i < _fftSize; i++) {
@@ -181,10 +192,20 @@ namespace dsp::combine {
             cov.rbb = _sbb[i];
             cov.rab = _sab[i];
 
-            if (!cov.valid()) {
-                K0min[i] = K1min[i] = K0max[i] = K1max[i] = { 0.0, 0.0 };
+            // Below the gate: pass A through unchanged rather than solving. A bin with no
+            // real signal still has SOME apparent correlation from block to block -- noise
+            // is not literally zero-coherence, just randomly varying -- and solving it
+            // anyway means every one of potentially thousands of such bins contributes an
+            // arbitrary, momentary direction to the taps via the inverse FFT. Measured on
+            // real air: leaving them in is what made the achieved null swing by 20 dB
+            // between otherwise similar windows of the same recording. See
+            // PHASING_PLAN.md section 2.6c.
+            if (!cov.valid() || power[i] < gateThreshold) {
+                K0min[i] = K0max[i] = { 1.0, 0.0 };
+                K1min[i] = K1max[i] = { 0.0, 0.0 };
                 continue;
             }
+            active++;
 
             const Eigen2 e = solveEigen2(cov);
             std::complex<double> k0, k1;
@@ -195,11 +216,11 @@ namespace dsp::combine {
 
             // Weight by bin power so a handful of noise-only bins with a spuriously high
             // ratio-of-nothing coherence do not dominate the average the meter shows.
-            const double power = cov.raa + cov.rbb;
-            coherenceSum += coherence(cov) * power;
-            weightSum += power;
+            coherenceSum += coherence(cov) * power[i];
+            weightSum += power[i];
         }
 
+        _activeBins = active;
         _meanCoherence = (weightSum > 0.0) ? (float)(coherenceSum / weightSum) : 0.0f;
 
         extractTaps(K0min, _fftSize, _taps, _bufW, _bufH, _planInv, _window, _k0MinRev);

@@ -587,14 +587,22 @@ private:
                                    "sharper frequency dependence but take longer to settle. "
                                    "No single gain/phase describes this, so the pad below "
                                    "does not show while it is active.");
-                // Measured, not assumed: on real air this beat the scalar approach in some
-                // windows and fell well short in others -- see PHASING_PLAN.md section
-                // 2.6a. Multi-station nulling is the proven win; depth on one station is
-                // not yet reliable enough to prefer over a well-scoped reference band.
-                ImGui::TextWrapped("Experimental for a single station: real-air testing "
-                                   "found it can be shallower than a well-scoped reference "
-                                   "band, unpredictably. Its proven strength is nulling "
-                                   "several stations at once without one.");
+                // Real-air testing (PHASING_PLAN.md 2.6a) first found this could be
+                // shallower than a well-scoped reference band, unpredictably. Traced to
+                // noise-floor bins across the observed span each contributing an arbitrary
+                // momentary direction to the taps; gating bins by power before solving
+                // (2.6c) fixed it on the recording that exposed it, re-validated across
+                // five independent windows and the original multi-station synthetic case.
+                // Left cautious below rather than declared solved outright -- one
+                // recording, one location, is not the same as broad field use.
+                int activeBins = 0, totalBins = 1;
+                sigpath::phasing.getWidebandActiveBins(activeBins, totalBins);
+                ImGui::Text("%d / %d bins had enough signal to solve", activeBins, totalBins);
+                ImGui::TextWrapped("A power gate excludes noise-floor bins from the "
+                                   "combine, which fixed a real instability found testing "
+                                   "on air -- validated on one recording so far, so still "
+                                   "worth comparing against a well-scoped reference band "
+                                   "if the result looks off.");
             }
 
             if (_this->wideband) {

@@ -192,6 +192,7 @@ void Phasing::getWideband(bool& enabled, int& taps) { phaser.getWideband(enabled
 bool Phasing::isWidebandActive() { return phaser.isWidebandActive(); }
 bool Phasing::isWidebandDecorrelating() { return phaser.isWidebandDecorrelating(); }
 float Phasing::getWidebandCoherence() { return phaser.getWidebandCoherence(); }
+void Phasing::getWidebandActiveBins(int& active, int& total) { phaser.getWidebandActiveBins(active, total); }
 void Phasing::setReferenceBand(bool enabled, double offsetHz, double widthHz) { phaser.setReferenceBand(enabled, offsetHz, widthHz); }
 void Phasing::getReferenceBand(bool& enabled, double& offsetHz, double& widthHz) { phaser.getReferenceBand(enabled, offsetHz, widthHz); }
 void Phasing::captureNoise(double seconds) { phaser.captureNoise(seconds); }

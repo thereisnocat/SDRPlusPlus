@@ -256,6 +256,16 @@ namespace dsp::combine {
         // Meaningful only while isWidebandDecorrelating() is true.
         float getWidebandCoherence() { return wbDecorrCoherence.load(std::memory_order_relaxed); }
 
+        // How many of the FFT bins had enough power to be actively solved on the last
+        // pass, versus passed through untouched by the power gate (see
+        // wideband_decorrelator.h). A handful active means the gate is behaving like a
+        // de-facto reference band around one strong signal; many active means real signal
+        // was found across much of the observed span.
+        void getWidebandActiveBins(int& active, int& total) {
+            active = wbDecorrActiveBins.load(std::memory_order_relaxed);
+            total = wbDecorrTotalBins.load(std::memory_order_relaxed);
+        }
+
         // Needed only by the reference band, to place its mixer.
         void setSampleRate(double sampleRate) {
             std::lock_guard<std::mutex> lck(paramMtx);
@@ -532,6 +542,8 @@ namespace dsp::combine {
                 }
                 applyWidebandDecorrelation(count, a, b, outBuf);
                 wbDecorrCoherence.store(wbDecorr.meanCoherence(), std::memory_order_relaxed);
+                wbDecorrActiveBins.store(wbDecorr.activeBinCount(), std::memory_order_relaxed);
+                wbDecorrTotalBins.store(wbDecorr.fftSize(), std::memory_order_relaxed);
                 updateMetrics(count, a, b, outBuf);
                 if (refEnabled) { updateBandDepth(count, a, outBuf); }
                 return;
@@ -820,5 +832,7 @@ namespace dsp::combine {
         std::atomic<float> coefA_re{ 1.0f }, coefA_im{ 0.0f };
         std::atomic<float> coefB_re{ 0.0f }, coefB_im{ 0.0f };
         std::atomic<float> wbDecorrCoherence{ 0.0f };
+        std::atomic<int> wbDecorrActiveBins{ 0 };
+        std::atomic<int> wbDecorrTotalBins{ 1 };
     };
 }

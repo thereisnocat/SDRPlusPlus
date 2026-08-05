@@ -2,6 +2,7 @@
 #include "../types.h"
 #include <vector>
 #include <complex>
+#include <cmath>
 
 namespace dsp::combine {
 
@@ -45,6 +46,25 @@ namespace dsp::combine {
         void configure(int fftSize, int tapCount, float forgetting);
         void reset();
 
+        // Bins whose total power sits below (median bin power + gateDb) are excluded from
+        // the solve and treated as pass-through (k0=1, k1=0) rather than actively combined.
+        // Found necessary 2026-08-05, on real air: without it, every one of the thousands
+        // of noise-floor bins across a wide observed span gets its own eigendecomposition
+        // -- on pure noise, that decomposition is not "no answer", it is an ARBITRARY
+        // answer, since noise is still technically "coherent" with itself to some randomly
+        // varying degree from block to block. Those bins' contributions all leak into every
+        // realized tap via the inverse FFT, and which particular noise realization was
+        // present at solve time is what made the result swing by 20 dB between otherwise
+        // similar windows of the same real recording. Gating by POWER rather than by
+        // frequency distance from any one target preserves the feature's real advantage --
+        // several genuinely strong, unrelated stations still each pass the gate on their
+        // own merits, wherever they sit in the span -- which a reference-band-style
+        // frequency window could not do. 20 dB is not derived from anything more principled
+        // than what measured best on one real recording; treat it as a starting point.
+        // See PHASING_PLAN.md section 2.6c.
+        void setGateThresholdDb(float db) { _gateDb = db; }
+        float getGateThresholdDb() const { return _gateDb; }
+
         // Accumulate spectra. Both channels must already carry the alignment delay
         // reported by alignmentDelay() -- unlike the Wiener solver, neither channel is the
         // privileged reference here, so both need the same centring delay.
@@ -66,6 +86,34 @@ namespace dsp::combine {
         // describes a frequency-dependent decomposition.
         float meanCoherence() const { return _meanCoherence; }
 
+        // How many of fftSize bins passed the power gate on the last solve. Mostly a
+        // sanity readout: a handful of bins means the gate is behaving like a de-facto
+        // reference band around one strong signal; a large fraction means most of the
+        // observed span had real signal in it.
+        int activeBinCount() const { return _activeBins; }
+
+        // Diagnostic: one bin's current covariance estimate, updated every hop rather than
+        // only at each solve() -- for watching how fast a single bin's estimate actually
+        // moves, which is what distinguishes real non-stationarity from a settling
+        // transient. Added investigating the real-air instability in section 2.6b; not
+        // used by the production combining path.
+        bool getBinStats(int bin, double& saa, double& sbb, std::complex<double>& sab) const {
+            if (bin < 0 || bin >= (int)_saa.size()) { return false; }
+            saa = _saa[bin];
+            sbb = _sbb[bin];
+            sab = _sab[bin];
+            return true;
+        }
+
+        // Bin index nearest a given offset from centre, for pointing getBinStats() at a
+        // station without the caller re-deriving FFT bin arithmetic.
+        int binForOffset(double offsetHz, double sampleRate) const {
+            int bin = (int)std::lround(offsetHz / sampleRate * _fftSize);
+            bin %= _fftSize;
+            if (bin < 0) { bin += _fftSize; }
+            return bin;
+        }
+
     private:
         void processFrame();
         void solve();
@@ -73,9 +121,11 @@ namespace dsp::combine {
         int _fftSize = 4096;
         int _taps = 32;
         float _forgetting = 0.1f;
+        float _gateDb = 20.0f;
         bool _solved = false;
         int _framesSinceSolve = 0;
         float _meanCoherence = 0.0f;
+        int _activeBins = 0;
 
         void* _planFwdA = nullptr;
         void* _planFwdB = nullptr;

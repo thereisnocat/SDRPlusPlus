@@ -138,6 +138,13 @@ int main() {
     }
     check(wbd.hasSolution(), "the solver converges given enough data");
 
+    // The power gate (section 2.6c) must be doing something, not compiled in as a no-op --
+    // and with two real signals plus a lot of empty spectrum in this scene, it should
+    // exclude most bins while still keeping enough active to describe both L and X.
+    printf("  active bins: %d / %d\n", wbd.activeBinCount(), wbd.fftSize());
+    check(wbd.activeBinCount() < wbd.fftSize(), "the gate excludes at least some bins (not a no-op)");
+    check(wbd.activeBinCount() >= 4, "and still leaves enough active to describe two stations");
+
     std::vector<complex_t> k0Rev, k1Rev;
     check(wbd.copyTaps(true, k0Rev, k1Rev), "MIN taps are available");
 

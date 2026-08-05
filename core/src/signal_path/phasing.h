@@ -73,6 +73,7 @@ public:
     bool isWidebandActive();
     bool isWidebandDecorrelating();
     float getWidebandCoherence();
+    void getWidebandActiveBins(int& active, int& total);
     void setReferenceBand(bool enabled, double offsetHz, double widthHz);
     void getReferenceBand(bool& enabled, double& offsetHz, double& widthHz);
 

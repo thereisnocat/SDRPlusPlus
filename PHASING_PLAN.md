@@ -503,15 +503,75 @@ timescale, in a way the scalar's simpler single-band estimate is not vulnerable 
 taps nor forgetting is the lever; what is not yet known is why the per-bin problem has this
 extra time structure that the scalar's problem does not.
 
-**Where this leaves the feature.** The multi-station capability is real and proven, both
-synthetically and by construction — nothing about it depends on the part that misbehaved.
-Depth and reliability on a *single* targeted station is not yet trustworthy enough to
-prefer over the scalar reference-banded approach, which stayed stable across the exact
-window where wideband did not. Shipped anyway, reachable from the Decorrelation panel,
-because the failure mode is a shallower null rather than a wrong or dangerous one, and the
-UI says plainly that switching modes costs nothing — but it should be treated as
-experimental for single-station use until the real-air instability is actually understood,
-not assumed fixed by the synthetic result alone.
+### 2.6c Found and fixed: noise-floor bins poisoning the taps, via a per-bin power gate
+
+**Watched a single bin's trajectory over time first, as planned.** The carrier bin itself
+— the one nearest WNYC's exact frequency — turned out to be almost perfectly behaved:
+coherence above 0.999 throughout, solved weight settling within about 2 ms and staying
+within a 2 dB / 13° box for the entire 5-second log. That ruled out the carrier bin as the
+source of the instability outright. A sideband bin 2–4 kHz off the carrier (carrying
+WNYC's actual audio, much lower power) was noisier — coherence dipping to 0.6–0.7 at
+times, phase swinging by tens of degrees — but not by enough on its own to explain a 7+ dB
+collapse in the final result.
+
+**That pointed away from "which bin is unstable" and toward "how many bins are being
+asked to answer a question they have no signal to answer."** The realized 64-tap filter is
+the inverse FFT of *all* 16384 bins' solutions, truncated — every bin, including thousands
+that see nothing but the noise floor across the rest of the 8 MHz span, contributes to
+every one of those 64 taps. A bin with no real signal is not thereby "no answer": noise is
+not literally zero-coherence from block to block, so its eigendecomposition returns some
+arbitrary direction that happens to fit that block's particular noise realization. Which
+direction that happened to be, for thousands of irrelevant bins simultaneously, is exactly
+the kind of thing that would differ between two 30-second windows of the same recording
+without differing in anything a person would call "the signal."
+
+**Tested directly by re-solving with everything outside a window around WNYC forced to
+pass-through**, at the window that had measured 16.2 dB (reproduced independently at
+15.9 dB by the check harness — close enough to confirm the reimplementation was faithful):
+
+```
+no gate (all 16384 bins):    15.9 dB
+gated to  20 kHz (83 bins):  14.1 dB   -- WORSE: something specific is polluting this band
+gated to  10 kHz (41 bins):  22.2 dB
+gated to   5 kHz (21 bins):  27.9 dB
+gated to   2 kHz  (9 bins):  35.5 dB
+gated to 500 Hz   (3 bins):  45.7 dB   -- too tight to trust: likely overfitting one window
+```
+
+Monotonic and decisive — narrower is better, right up to a point suspicious enough to
+distrust on its own (3 bins fitting one 30-second window almost too well). The 2 kHz gate
+was checked against four further independent windows before being believed: 35.48, 35.47,
+35.24, 34.92, 35.65 dB — a *tighter* spread than the scalar method's own 22–26 dB range
+across the same windows, not just a deeper number on one lucky draw.
+
+**A frequency window is the wrong shape for the real fix, though, and would have quietly
+undone the feature's actual point.** Gating by distance from one target frequency is a
+reference band by another name — exactly what this mode exists to not need, and it would
+have broken the proven multi-station case (X, 70 kHz from L, would sit outside any gate
+centred on L). The generalisation that preserves both properties is a **power threshold**:
+exclude a bin if its total power sits too far below the median bin's power, with no
+reference to *where* in the span it is. Swept the threshold (10–40 dB above median) at the
+same window — 24.6, 26.1, 31.2, 31.6, 37.2, 40.6 dB, comparably decisive — and confirmed on
+the two-station synthetic scene that a +20 dB threshold keeps *both* L's and X's bins
+active (`bin(L) gated=IN`, `bin(X) gated=IN`) while nulling each by over 30 dB, unlike a
+frequency gate ever could.
+
+**Implemented as `WidebandDecorrelator`'s default behaviour** (`setGateThresholdDb`, 20 dB
+above the median bin power by default), verified against the production class itself —
+not the diagnostic reimplementation — across the same five real-recording windows:
+28.8, 30.2, 25.5, 29.1, 38.0 dB. Every one of the previously-bad windows (6.3, 8, 10 min,
+which had measured 16.2, 16.4 and similar) now clears 25 dB. `activeBinCount()` exposes
+how many bins passed the gate, shown in the UI as a sanity readout. Covered by
+`core/test/test_wideband_decorrelation.cpp`, which now asserts the gate excludes at least
+some bins (catching a silent no-op) while leaving enough active to still describe two
+stations.
+
+**Where this leaves the feature.** Both the multi-station capability and single-station
+depth are now backed by real measurement, not just the earlier synthetic result. Still
+only one recording, one location, one radio, so the UI keeps a cautious note rather than
+declaring the question closed — but the specific instability that made single-station use
+untrustworthy has a real, understood, tested cause, not merely a workaround that happens to
+help.
 
 ### 2.5 Wideband nulling (the honest limitation)
 

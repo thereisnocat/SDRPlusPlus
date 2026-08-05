@@ -274,6 +274,63 @@ to describe, largely independent of how many taps the result is truncated to —
 away from a filter-resolution problem and toward the covariance estimate itself being fragile
 on real noise, an open question rather than a closed one.
 
+### 2.6c The instability, found by watching a bin instead of sweeping more constants
+
+**Told to stop sweeping scalar knobs and go look directly at what was moving.** Two
+substantial constants had already been ruled out by measurement — taps, then the
+forgetting factor — and both rulings were negative results with no next lever obviously
+implied. The next step was qualitatively different: log one FFT bin's covariance and
+solved weight over time within a single window, and see with actual numbers whether it
+oscillates, drifts, or jumps, rather than guessing at a third parameter to sweep.
+
+**The answer was not what the hypothesis-in-progress expected, and that mattered.** The
+carrier bin — the strongest, cleanest signal available, the one most likely to misbehave
+if anything about the per-bin approach were fundamentally unsound — turned out to be
+almost perfectly stable: coherence above 0.999, solved weight settled within 2 ms and
+barely moving for the full five seconds logged. If the instability lived in individual
+bins failing to converge, the carrier bin should have shown it, and it did not. That result
+by itself killed the leading mental model (fragile per-bin estimates generally) and forced
+a different question: not "which bin is wrong" but "what happens to bins that have nothing
+to say."
+
+**The mechanism, once looked at directly, was simple enough to have been guessed sooner —
+but guessing it would have been exactly the kind of unchecked plausible story that had
+already misled twice.** Every one of 16384 bins gets solved and IFFT'd into the same
+64 taps, including thousands with no real signal at all. A noise-only bin's
+eigendecomposition does not return "nothing" — noise still has SOME momentary, randomly
+varying coherence from block to block, so the solver returns an arbitrary direction that
+fits that block's particular noise. Thousands of arbitrary directions, all folded into the
+same handful of realized taps via the inverse FFT, is a plausible way for a result to
+depend on exactly which 30 seconds of air happened to be sampled — which is precisely the
+symptom on record.
+
+**Verified by intervention, not just by a story that fit.** Re-solved the same window with
+everything outside a shrinking distance from WNYC forced to pass-through: 15.9 dB with
+nothing excluded, climbing monotonically to 35.5 dB at a 2 kHz window, 45.7 dB at 500 Hz.
+The 500 Hz result was distrusted on sight — three bins fitting one specific window
+suspiciously well is the shape of overfitting, not of a real fix — and the 2 kHz setting
+was checked against four more independent windows before being credited, the same
+discipline as every other claim in this section: 35.2 to 35.7 dB, tighter than the scalar
+method's own spread on the same windows.
+
+**Caught the fix's own naive form before committing to it.** A frequency window is a
+reference band wearing a different name, and this feature's entire point was not needing
+one — a gate centred on WNYC would have silently broken the multi-station win the moment it
+shipped, the same way the reference-band bug two sections earlier broke decorrelation by
+having a real capability sitting behind an unreachable switch. Recognising that before
+writing the production version, rather than after someone noticed the regression, is what
+the frequency-vs-power distinction in section 2.6c is actually about. A power threshold —
+excluded a bin if it sits far enough below the median bin's power, regardless of where it
+sits — was checked on the same two-station synthetic scene that proved the original win,
+confirmed both stations' bins still passed the gate, and only then implemented as the real
+default.
+
+**What made this investigation work, in order:** a concrete diagnostic instead of another
+parameter sweep; a result that contradicted the working hypothesis, taken seriously instead
+of explained away; a mechanism simple enough to verify by direct intervention rather than
+just narrated; the fix's most obvious form checked against the exact case it would have
+broken, before shipping it as the default rather than after.
+
 ### 2.7 Smaller ones
 
 - **Phase clamp before scaling.** Clamping to 179.99° before scaling to a 16-bit value
