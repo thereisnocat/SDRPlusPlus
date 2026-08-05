@@ -476,6 +476,33 @@ short an effective average for a per-bin estimate with far less data per bin tha
 single wide accumulation; or some form of bin-power-weighted regularization, shrinking a
 bin's contribution toward the scalar solution when that bin's own power is too low to trust.
 
+**The forgetting factor was tested next, and ruled out differently from taps -- not by
+instability but by a flat line that reveals something new.** Swept 0.2 down to 0.0001 (a
+2000x range in effective memory, from ~5 ms to several seconds) at the same 16.2 dB window:
+
+```
+0.2: 16.0   0.1: 16.6   0.05: 16.2   0.02: 16.6   0.01: 17.1   0.005: 17.4
+0.001: 15.4   0.0005: 15.4   0.0002: 15.4   0.0001: 15.4  (dB, all at the same window)
+```
+
+Remarkably stable, unlike the taps sweep -- not a convergence problem, since it settles to
+the same floor whether averaged over milliseconds or seconds and does not move once the
+average is long enough to span most of the window. But that floor sits at ~15.4 dB, still
+well short of the scalar's 22.2 dB on the identical data, so more averaging does not close
+the gap either. And checked against the window that HAD looked good: at forgetting=0.0001,
+the 5.3-minute window's result fell from ~23 dB (matching the scalar) to 18.6 dB -- long
+averaging made a working case worse, not better, ruling out "needs more data" as cleanly as
+the flat line ruled out "hasn't converged yet."
+
+**What this adds:** the true optimum a bin should be solving for is evidently changing
+faster than a 30-second window -- long enough averaging blurs across that change and lands
+at a worse compromise on both windows tested, rather than converging toward one right
+answer as more data arrives. That is a different, and harder, kind of instability than a
+mistuned constant: something in the covariance itself appears non-stationary on a sub-window
+timescale, in a way the scalar's simpler single-band estimate is not vulnerable to. Neither
+taps nor forgetting is the lever; what is not yet known is why the per-bin problem has this
+extra time structure that the scalar's problem does not.
+
 **Where this leaves the feature.** The multi-station capability is real and proven, both
 synthetically and by construction — nothing about it depends on the part that misbehaved.
 Depth and reliability on a *single* targeted station is not yet trustworthy enough to
