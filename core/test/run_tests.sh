@@ -39,7 +39,8 @@ $REPO/source_modules/phasing_test_source/test/test_worker.cpp"
 STANDALONE="$REPO/source_modules/phasing_test_source/test/test_signal_model.cpp
 $REPO/source_modules/rsr200_source/test/test_protocol.cpp
 $REPO/source_modules/rsr200_source/test/test_device.cpp
-$REPO/core/test/test_linrad_raw.cpp"
+$REPO/core/test/test_linrad_raw.cpp
+$REPO/core/test/test_crowded_band.cpp"
 
 fail=0
 

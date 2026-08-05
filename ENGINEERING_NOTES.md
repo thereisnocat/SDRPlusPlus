@@ -156,6 +156,64 @@ The wideband solver was fed the already-delayed channel A, so its impulse respon
 sat at the right lag, and `solve()` shifted it a second time. Found by the numbers being
 wrong in a way that scaled with tap count.
 
+### 2.6a The reference band that was written into the design and left out of the UI
+
+**Symptom, reported from real use:** on WNYC 820, the Perseus22 fully nulls the local and
+reveals a distant station underneath; the same station on the Fobos with this software left
+WNYC still strongly audible, with the distant signal a bare echo. Separately, "Decorrelate:
+null strongest" sometimes left a station *louder* than "Decorrelate: peak strongest" did —
+backward from what either name promises.
+
+**Where the check started, and where it didn't stop.** The obvious first move was the
+eigendecomposition itself — `solveEigen2`, `combineCoefficients`, `inverseSqrt` — and it
+checked out completely: correct closed-form 2×2 Hermitian solution, unit-norm orthogonal
+eigenvectors, and `test_decorrelation.cpp` already proves it lifts a station 26 dB under a
+local to 43 dB above it. A wrong finding here would have been the easy, wrong stopping
+point: "confirmed, the math is right," case closed, symptom unexplained. The actual fault
+was one layer up — not *how* the covariance is decomposed, but *what band it is measured
+over* — and `PHASING_PLAN.md` §2.6 had already specified the answer: "the covariance is
+estimated over the reference band." The implementation had quietly stopped doing that.
+
+**The bug:** `misc_modules/phasing` put the "Reference band" checkbox inside
+`if (combining && !decorrelating)` — the Adaptation section. Decorrelation is drawn from a
+separate block that never included it. `refEnabled` defaults to false. So decorrelation had
+no reachable path to anything but `RefBand::accumulateWideband()` — the covariance measured
+over the *entire tuned span*, not the one carrier the operator is trying to null. On a
+receiver viewing a slice of the MW band, that is dozens of other stations folding into a
+single number.
+
+**Why that produces exactly the reported symptoms, and not some other kind of wrongness:**
+with several coherent arrivals in view, "the dominant one" is whichever single station is
+loudest across the *whole* span — not necessarily, and often not, the one on the dial. Null
+the dominant arrival and you may null a station you never heard; the one you were listening
+to is barely touched, because it was never what the eigenvector represented. Which of Null
+or Peak sounds louder on any given station becomes a matter of how that station's own
+gain/phase ratio happens to project onto whichever direction the *actually*-dominant signal
+defined — which is exactly the kind of thing that can look "backward" for one station and
+correct for another, with no code error anywhere in sight.
+
+**How this got settled rather than argued:** reproduced with the project's own
+`RefBand`/decorrelator code, not a re-derivation, on a three-signal scene — a station on the
+dial, a weak one buried under it, and a louder unrelated one elsewhere in the span:
+
+```
+wideband:              L via Null  -0.1 dB   L via Peak  -2.9 dB   (X via Null -22.3 dB)
+4 kHz band centred on L:  L via Null -21.6 dB   L via Peak  +1.7 dB
+```
+
+Wideband nulls X and leaves L *louder* under Null than Peak — the reported backward result,
+reproduced on demand rather than described from memory. Narrowing the band fixes both.
+Kept as `core/test/test_crowded_band.cpp` so this cannot silently regress.
+
+**The lesson, stated plainly:** correct math wired to the wrong input is indistinguishable,
+from the output alone, to a user, from wrong math — and it is tempting to stop checking the
+moment the equations turn out fine. The plan document already contained the fix; nobody had
+compared the shipped UI against what §2.6 said the UI was supposed to let the operator do.
+When a feature has a design note describing how it's meant to be used, checking the
+implementation *against that note* is a distinct step from checking that the algorithm is
+implemented correctly, and skipping it is how a component can be simultaneously
+well-tested and unusable.
+
 ### 2.7 Smaller ones
 
 - **Phase clamp before scaling.** Clamping to 179.99° before scaling to a 16-bit value

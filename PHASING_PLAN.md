@@ -357,6 +357,42 @@ reference band (§2.4) and the resulting weights applied broadband. That is equi
 one VFO. Nulling a different local on each of several simultaneous VFOs needs the per-VFO
 channelisation change §2.5 sets aside.
 
+**Correction found 2026-08-05: the reference band this section assumes was unreachable
+from the UI whenever a decorrelation mode was selected.** `misc_modules/phasing` put the
+"Reference band" checkbox and its offset/width fields inside the Adaptation section, gated
+on `combining && !decorrelating`. Decorrelation was drawn from a separate block that never
+included it, and `refEnabled` defaults to false, so decorrelation always ran
+`RefBand::accumulateWideband()` over the whole tuned span rather than the narrow band this
+section describes — a design the implementation quietly drifted away from rather than one
+that was ever decided against.
+
+The eigen math was never in question — `solveEigen2`, `combineCoefficients` and
+`inverseSqrt` are exactly as above and `test_decorrelation.cpp` covers them (26 dB under a
+local to 43 dB above it). What was wrong is the question being asked of them: over what
+band the covariance gets measured. Reproduced with the project's own `RefBand`/decorrelator
+code against a scene with a station on the dial (L), a weak DX signal under it (D), and an
+unrelated *louder* station 70 kHz away (X) — the ordinary situation on a crowded MW band,
+not the clean two-signal scene the original test uses:
+
+```
+wideband (no reference band):   L via Null  −0.1 dB   L via Peak  −2.9 dB   X via Null −22.3 dB
+4 kHz band centred on L:        L via Null −21.6 dB   L via Peak  +1.7 dB
+```
+
+Wideband "null strongest" nulled X — the louder, irrelevant station — while L was barely
+touched, and Null even left L *louder* than Peak did: the exact backward result reported
+from the air, on a real WNYC 820 test where the Perseus22 fully nulled it and this did not.
+Narrowing the band onto L fixed both: an 18.5 dB null, and Null correctly quieter than
+Peak. Covered by `core/test/test_crowded_band.cpp`.
+
+Fixed by moving the Reference band block to its own section gated on `combining` alone, so
+it is reachable in Manual, Auto-null and both Decorrelate modes — which is also what the
+DSP layer already assumed: `MODE_AUTO`, decorrelation, and the null-depth meter in manual
+mode all read `refEnabled` regardless of which mode's block happened to draw the control.
+The Decorrelation panel now also warns outright when no reference band is set, since the
+effect otherwise looks like a hardware limitation rather than a configuration one — which
+is exactly how it presented.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
