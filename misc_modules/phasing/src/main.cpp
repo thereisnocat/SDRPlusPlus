@@ -67,6 +67,31 @@ namespace {
     }
 }
 
+// Holds a live value still long enough to read. The DSP side updates every block -- tens
+// of times a second -- and a meter or number that redraws at that rate never settles long
+// enough for a person to read it before it has already changed again. Feed it the raw
+// value every frame regardless; it only accepts a new one once per `period`, so the
+// displayed figure holds steady between updates rather than jittering with every block.
+//
+// Deliberately not used for anything that needs to stay responsive on its own terms: the
+// null-depth peak-hold tracks the raw live value so a brief good result during a drag is
+// never missed, and the heat map paints from the raw depth for the same reason. Damping
+// belongs at the point something is READ, not at the point something is MEASURED.
+template<typename T>
+struct Damped {
+    T value{};
+    double last = -1e18;
+
+    T sample(T fresh, double period = 1.0) {
+        const double now = ImGui::GetTime();
+        if (now - last >= period) {
+            value = fresh;
+            last = now;
+        }
+        return value;
+    }
+};
+
 // Remembers how deep the null got at each point the operator has visited, so a sweep
 // leaves a map behind. Nothing can predict the depth at an unvisited setting -- it has to
 // be tried -- but there is no reason to make someone re-find a spot they already passed
@@ -399,9 +424,17 @@ private:
         }
 
         // While adapting, the weight belongs to the algorithm; the controls become a
-        // readout. Editing them would be overwritten within a block anyway.
+        // readout. Editing them would be overwritten within a block anyway. Damped to
+        // about once a second, or the sliders and the Exact boxes below gyrate with every
+        // block the solver processes. Freeze and Copy to manual are unaffected by the
+        // damping: Freeze works by switching the Phaser itself to MODE_HOLD, which keeps
+        // its own last-computed weight regardless of what this UI copy shows, and Copy to
+        // manual fetches the live weight fresh at the moment of the click.
         if (adapting) {
-            sigpath::phasing.getWeight(_this->gainCoarse, _this->phaseCoarse);
+            float liveGain, livePhase;
+            sigpath::phasing.getWeight(liveGain, livePhase);
+            _this->gainCoarse = _this->dampGain.sample(liveGain);
+            _this->phaseCoarse = _this->dampPhase.sample(livePhase);
             _this->gainFine = 0.0f;
             _this->phaseFine = 0.0f;
         }
@@ -485,14 +518,18 @@ private:
             if (decorrelating) {
                 // Decorrelation applies a pair, y = k0*A + k1*B, rather than a single
                 // weight. The equivalent of "A - w*B" is w = -k1/k0, which puts the
-                // solver's answer on the same picture as a hand-set one.
+                // solver's answer on the same picture as a hand-set one. Damped for the
+                // same reason as the Auto-null readout above -- the raw coefficients move
+                // every block, and a pad dot that jumps 60 times a second shows nothing.
                 dsp::complex_t k0, k1;
                 sigpath::phasing.getCombineCoefficients(k0, k1);
                 const std::complex<float> c0(k0.re, k0.im), c1(k1.re, k1.im);
                 if (std::abs(c0) > 1e-12f) {
                     const std::complex<float> w = -c1 / c0;
-                    padGain = std::clamp(20.0f * std::log10((std::max)(std::abs(w), 1e-6f)), -40.0f, 40.0f);
-                    padPhase = std::arg(w) * (float)(180.0 / DB_M_PI);
+                    const float liveGain = std::clamp(20.0f * std::log10((std::max)(std::abs(w), 1e-6f)), -40.0f, 40.0f);
+                    const float livePhase = std::arg(w) * (float)(180.0 / DB_M_PI);
+                    padGain = _this->dampDecorrGain.sample(liveGain);
+                    padPhase = _this->dampDecorrPhase.sample(livePhase);
                 }
             }
 
@@ -614,8 +651,10 @@ private:
                 // five independent windows and the original multi-station synthetic case.
                 // Left cautious below rather than declared solved outright -- one
                 // recording, one location, is not the same as broad field use.
-                int activeBins = 0, totalBins = 1;
-                sigpath::phasing.getWidebandActiveBins(activeBins, totalBins);
+                int liveActive = 0, liveTotal = 1;
+                sigpath::phasing.getWidebandActiveBins(liveActive, liveTotal);
+                const int activeBins = _this->dampActiveBins.sample(liveActive);
+                const int totalBins = _this->dampTotalBins.sample(liveTotal);
                 ImGui::Text("%d / %d bins had enough signal to solve", activeBins, totalBins);
                 ImGui::TextWrapped("A power gate excludes noise-floor bins from the "
                                    "combine, which fixed a real instability found testing "
@@ -628,14 +667,14 @@ private:
                 // A single scalar rho describes a frequency-dependent decomposition
                 // poorly, so this is a separate, power-weighted mean across bins rather
                 // than the reference-band figure below it.
-                const float wrho = sigpath::phasing.getWidebandCoherence();
+                const float wrho = _this->dampWidebandCoherence.sample(sigpath::phasing.getWidebandCoherence());
                 ImGui::Text("Mean coherence across bins: %.3f", wrho);
                 ImGui::FillWidth();
                 ImGui::VolumeMeter(std::clamp(wrho, 0.0f, 1.0f), std::clamp(wrho, 0.0f, 1.0f), 0, 1);
             }
 
-            const float rho = sigpath::phasing.getCoherence();
-            const float sep = sigpath::phasing.getComponentSeparation();
+            const float rho = _this->dampCoherence.sample(sigpath::phasing.getCoherence());
+            const float sep = _this->dampSeparation.sample(sigpath::phasing.getComponentSeparation());
             ImGui::Text("%sCoherence %.3f, separation %.1f dB",
                         _this->wideband ? "Scalar (reference-band) " : "", rho, sep);
             ImGui::FillWidth();
@@ -766,10 +805,14 @@ private:
         }
 
         // -- Null depth --------------------------------------------------------
-        const float depth = sigpath::phasing.getNullDepth();
-        if (depth > _this->peakDepth) { _this->peakDepth = depth; }
+        // Peak-hold tracks the RAW live figure, undamped -- a brief good result while
+        // exploring the pad must still register even between the damped display's own
+        // once-a-second updates. Only the "now" number and its bar are damped.
+        const float depthRaw = sigpath::phasing.getNullDepth();
+        if (depthRaw > _this->peakDepth) { _this->peakDepth = depthRaw; }
         else { _this->peakDepth -= 0.25f; }   // slow decay so the best result stays visible
         _this->peakDepth = (std::max)(_this->peakDepth, 0.0f);
+        const float depth = _this->dampNullDepth.sample(depthRaw);
 
         const bool banded = sigpath::phasing.isNullDepthBandLimited();
         ImGui::LeftLabel(banded ? "Null depth (band)" : "Null depth (wide)");
@@ -877,6 +920,17 @@ private:
     bool wideband = false;
     int wbTaps = 32;
     NullHeat heat;
+
+    // Display-only damping for the meters and readouts below -- see Damped's comment.
+    // Every one of these holds a figure that is genuinely a live DSP output updating many
+    // times a second; without this they gyrate too fast to read, which is what these exist
+    // to fix rather than something to solve by changing the underlying estimate's own rate.
+    Damped<float> dampGain, dampPhase;                 // Auto-null's readout, while adapting
+    Damped<float> dampDecorrGain, dampDecorrPhase;      // decorrelation's pad position
+    Damped<float> dampCoherence, dampSeparation;        // scalar coherence/separation
+    Damped<float> dampWidebandCoherence;
+    Damped<int> dampActiveBins, dampTotalBins;
+    Damped<float> dampNullDepth;                        // the "now" figure only -- see below
     bool padDirty = false;
 
     std::vector<Memory> memories;
