@@ -241,7 +241,9 @@ private:
         if (c.contains("delay")) { delay = c["delay"]; }
         if (c.contains("adaptRate")) { adaptRate = c["adaptRate"]; }
         if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
-        if (c.contains("refOffset")) { refOffset = c["refOffset"]; }
+        // refOffset is deliberately not loaded -- it now always tracks the current VFO,
+        // set fresh every frame in menuHandler. Restoring a stale saved value here would
+        // just show it for one frame before being overwritten anyway.
         if (c.contains("refWidth")) { refWidth = c["refWidth"]; }
         if (c.contains("wideband")) { wideband = c["wideband"]; }
         if (c.contains("wbTaps")) { wbTaps = c["wbTaps"]; }
@@ -277,7 +279,7 @@ private:
         c["delay"] = delay;
         c["adaptRate"] = adaptRate;
         c["refEnabled"] = refEnabled;
-        c["refOffset"] = refOffset;
+        // refOffset is not persisted -- see loadSettings().
         c["refWidth"] = refWidth;
         c["wideband"] = wideband;
         c["wbTaps"] = wbTaps;
@@ -378,6 +380,23 @@ private:
         const bool combining = dsp::combine::Phaser::isCombining((dsp::combine::Phaser::Mode)_this->mode);
         const bool adapting = (_this->mode == dsp::combine::Phaser::MODE_AUTO);
         const bool decorrelating = dsp::combine::Phaser::isDecorrelating((dsp::combine::Phaser::Mode)_this->mode);
+
+        // The reference band offset tracks the selected VFO automatically, every frame --
+        // there is no legitimate reason to null a frequency based on where the dial used
+        // to be, and a manual "From VFO" button is exactly the kind of control that gets
+        // forgotten after retuning, silently pointing the solver at the wrong signal.
+        // Guarded to only push the change into the Phaser when the value actually moves:
+        // setReferenceBand() marks the band-limiting filter dirty unconditionally, and
+        // calling that every frame would reset its internal decimator state continuously,
+        // so it would never finish accumulating a term.
+        {
+            const double liveOffset = gui::waterfall.selectedVFO.empty() ? 0.0
+                                     : gui::waterfall.vfos[gui::waterfall.selectedVFO]->generalOffset;
+            if (liveOffset != _this->refOffset) {
+                _this->refOffset = liveOffset;
+                if (_this->refEnabled) { _this->applyReferenceBand(); }
+            }
+        }
 
         // While adapting, the weight belongs to the algorithm; the controls become a
         // readout. Editing them would be overwritten within a block anyway.
@@ -728,23 +747,13 @@ private:
                 _this->saveSettings();
             }
             if (_this->refEnabled) {
-                ImGui::LeftLabel("  offset");
-                ImGui::FillWidth();
-                if (ImGui::InputDouble(CONCAT("##_phasing_refoff_", _this->name), &_this->refOffset, 1000.0, 10000.0, "%.0f Hz")) {
-                    _this->applyReferenceBand();
-                    _this->saveSettings();
-                }
+                // Offset is display-only: it always follows the selected VFO, tracked
+                // continuously above. Nothing to type in and nothing to forget to update.
+                ImGui::Text("Centred on VFO: %+.3f kHz", _this->refOffset / 1000.0);
                 ImGui::LeftLabel("  width");
                 ImGui::FillWidth();
                 if (ImGui::InputDouble(CONCAT("##_phasing_refwid_", _this->name), &_this->refWidth, 1000.0, 10000.0, "%.0f Hz")) {
                     _this->refWidth = (std::max)(_this->refWidth, 100.0);
-                    _this->applyReferenceBand();
-                    _this->saveSettings();
-                }
-                if (ImGui::Button(CONCAT("From VFO##_phasing_refvfo_", _this->name))) {
-                    // Point it at whatever the user is looking at.
-                    _this->refOffset = gui::waterfall.selectedVFO.empty() ? 0.0
-                                     : gui::waterfall.vfos[gui::waterfall.selectedVFO]->generalOffset;
                     _this->applyReferenceBand();
                     _this->saveSettings();
                 }
