@@ -95,6 +95,40 @@ RJ-45 jack, so a copper 1000BASE-T SFP is needed. On order alongside the radio.
 SDK, no install step, and it works on every platform SDR++ targets. USB is now a definite
 follow-on rather than a maybe.
 
+**2026-08-06: USB confirmed unusable on this Mac specifically, not a radio or cable
+problem.** With the RSR200 connected, `FT_CreateDeviceInfoList` consistently reports zero
+devices, but the system log tells a more specific story than "not detected": macOS *does*
+see the FT601Q attach — logged by `icdd` as `[USB][ FTDI SuperSpeed-FIF]`, vendor-specific
+class `(ff,ff,ff)`, the right signature for this chip — and it stays enumerated for almost
+exactly one second before dropping, every time. Ruled out one variable at a time, each with
+a real retest rather than assumed: two different USB cables, two different Mac ports
+(confirmed genuinely different via the USB location ID changing between attempts, not a
+stale log entry), and the radio's power source, already on a linear supply used
+successfully for other radios. `FT_SetVIDPID(0x0403, 0x601F)` was tried in case the OEM
+unit used a non-default product ID — `0x601F` turned out to already be the header's own
+documented default for the FT601, so this was never the cause. Decisive cross-check: the
+same radio, same cable, enumerates cleanly on a Windows machine and shows correctly in
+Device Manager as "FTDI SuperSpeed-FIFO Bridge" with FTDI's driver bound. That rules out
+the radio's USB interface entirely — what's left is this Mac's USB 3.0 SuperSpeed stack
+specifically failing to sustain the FT601Q's link past about a second, most likely an
+Apple Silicon USB-C/XHCI compatibility quirk rather than anything a cable or port swap can
+fix. Phase 6 is blocked on this Mac until that is resolved or a different Mac/adapter path
+is found; it is not blocked on the radio, and USB development can happen on the Windows
+machine where the hardware is already known to work. LAN (Phase 2) depends on none of this
+and is the immediate next step.
+
+**Worth retrying before that conclusion is treated as final.** The Windows session's own
+Phase 6 work (ENGINEERING_NOTES.md §4) independently found this exact radio's USB
+SuperSpeed link can get stuck — there, downgraded to Hi-Speed rather than dropping outright
+— in a way that no cable or port change cleared, only **a full power cycle of the radio
+itself**. That was never tried here: every retest above changed the cable, the Mac port, or
+confirmed the power *supply*, but the radio was never fully powered off and back on while
+connected to this Mac. Given a second, independent host has now shown this chip's link
+training can wedge in a way only the radio's own power state clears, the Mac symptom (drops
+after ~1 s rather than negotiating down) may be the same underlying fragility presenting
+differently, not a distinct Apple Silicon incompatibility. Worth a full radio power cycle
+on the Mac before spending more effort on a macOS-specific fix.
+
 ## 2. What the radio is
 
 - Direct-digitising receiver, 1 kHz – 66 MHz on HF1 and HF2, 66 – 150 MHz on VHF.
@@ -415,10 +449,10 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **0** | **Done** — D3XX confirmed universal and user-space, SFP module ordered (§1). Remaining: install D3XX to `/usr/local` (needs sudo). | No |
 | **1** | **Done** — `src/rsr200_protocol.h`: block geometry, USB packet geometry, status header, 16/24-bit unpacking, block resynchronisation, all nine PC→radio commands, reply parsing, port/DSP mode bytes, hardware diversity weight packing, Nyquist zone mapping. `test/test_protocol.cpp` checks every documented figure and the manual's worked examples; wired into `core/test/run_tests.sh`. | No |
 | **1b** | **Done** — `src/rsr200_device.h`: the transport-agnostic device layer. Configuration ordering, command numbering, acknowledgement and fresh-number retry, embedded reply extraction, sequence-gap detection, sample delivery. Covered by `test/test_device.cpp` against a fake transport. Phase 2 is now mostly plugging in a socket. | No |
-| **2** | LAN transport: TCP connect, version query, block resync, UDP reassembly. It implements one interface — `sendCommand` and `nextFrame`. First live IQ. | Yes |
+| **2** | **Transport built and tested, not yet proven against the radio** — `src/rsr200_lan_transport.h`: TCP connect, block resync from an arbitrary byte stream (garbage prefix, split blocks, glued blocks all covered), command send. Implements `Transport` (`sendCommand`/`nextFrame`) so the device layer needs no changes to use it. `test/test_lan_transport.cpp` proves this against a synthetic loopback server, the same "known-correct source before hardware" approach used throughout this project; not yet run against a real radio — it was on the Windows machine it is known to work on over USB when this was written (§1). First live IQ and the version-query open question (§10) are still open. | No for what's built; yes for what's left |
 | **3** | Full single-channel control: ADC clock, decimation, attenuators, input switching, 24-bit, Nyquist zone display and spectrum inversion. | Yes |
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
-| **5** | UDP transport for higher rates; block reassembly and loss reporting. | Yes |
+| **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
 | **6** | **Done and verified on Windows; compiles on Linux/macOS, not yet run there.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout) — abstracted behind two small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic; verified by downloading and diffing FTDI's actual Linux and macOS SDK headers rather than guessing (they're identical to each other, both genuinely different from the Windows one). CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions and how the Mac side already had it installed for phase 0. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. Needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4. The Linux/macOS path has not been build- or run-tested on those platforms — only checked line-by-line against the real headers on a Windows machine with no Linux/macOS toolchain available. `main.cpp` wires it into a working single-channel SDR++ source module. | Yes |
 | **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. | Yes |
 

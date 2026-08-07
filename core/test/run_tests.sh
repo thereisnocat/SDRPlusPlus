@@ -36,10 +36,12 @@ $REPO/core/test/test_decorrelation.cpp
 $REPO/core/test/test_wideband_decorrelation.cpp
 $REPO/source_modules/phasing_test_source/test/test_worker.cpp"
 
-# Suites with no dependency beyond the standard library.
+# Suites with no dependency beyond the standard library (and BSD sockets/pthreads, which
+# count as "standard library" on every platform this actually runs on locally).
 STANDALONE="$REPO/source_modules/phasing_test_source/test/test_signal_model.cpp
 $REPO/source_modules/rsr200_source/test/test_protocol.cpp
 $REPO/source_modules/rsr200_source/test/test_device.cpp
+$REPO/source_modules/rsr200_source/test/test_lan_transport.cpp
 $REPO/core/test/test_linrad_raw.cpp
 $REPO/core/test/test_crowded_band.cpp"
 
@@ -72,7 +74,7 @@ run_one() {
 echo "Compiling and running suites..."
 for src in $STANDALONE; do
     name=$(basename "$src" .cpp)
-    c++ -std=c++17 -O2 -I"$REPO/core/src" -o "$OUT/$name" "$src" || { echo "  $name: COMPILE FAILED"; fail=1; continue; }
+    c++ -std=c++17 -O2 -pthread -I"$REPO/core/src" -o "$OUT/$name" "$src" || { echo "  $name: COMPILE FAILED"; fail=1; continue; }
     run_one "$src"
 done
 
