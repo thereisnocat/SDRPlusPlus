@@ -619,3 +619,16 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    BCD-encoded value, not a raw integer — so the fix is almost certainly in how the field is
    decoded, not just how it's formatted for display. Not yet fixed; noted here so the next
    pass at it starts from the right file and line instead of re-finding them.
+6. **Resampler predecimation overflow, hit live during clock/decimation testing.** Caught in
+   the log during the same live session, right after item 1/2's imprecise-clock and
+   opaque-rate-relationship issues would have been in play: a burst of rapid Start/Stop and
+   sample-rate changes around 12:14 ended with `[Resamp] predec: -2147483648, interp: 2,
+   decim: 1, inacc: 0.000000%, taps: 152` on two consecutive lines, immediately after a
+   `Start!`. `-2147483648` is `INT32_MIN` — a signed 32-bit underflow in the predecimation
+   calculation, not a plausible real value. This is core SDR++'s resampler code, not
+   RSR200-specific, so some reachable ADC-clock/decimation/software-decimation combination
+   from items 1-2 produces a degenerate rate that overflows it. The app itself did not crash
+   and kept running. Not yet reproduced deliberately or root-caused — worth trying to hit it
+   again with a known rate/decimation combination once the alternate rate-control interface
+   from item 2 exists, since that would make the triggering combination reproducible instead
+   of an accident of a testing sequence.
