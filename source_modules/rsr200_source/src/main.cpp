@@ -1,0 +1,484 @@
+#include <imgui.h>
+#include <module.h>
+#include <gui/gui.h>
+#include <gui/smgui.h>
+#include <signal_path/signal_path.h>
+#include <core.h>
+#include <utils/flog.h>
+#include "rsr200_protocol.h"
+#include "rsr200_device.h"
+#include "transport_usb.h"
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+SDRPP_MOD_INFO{
+    /* Name:            */ "rsr200_source",
+    /* Description:     */ "Reuter RSR200B source module (USB)",
+    /* Author:          */ "Ralph Brandi",
+    /* Version:         */ 0, 1, 0,
+    /* Max instances    */ 1
+};
+
+ConfigManager config;
+
+#define CONCAT(a, b) ((std::string(a) + b).c_str())
+
+// SDR++ module shell around rsr200::Device (RSR200_PLAN.md phases 0/1/1b) and
+// rsr200::UsbTransport (phase 6). Only USB is wired up here -- transport_lan.cpp (phase 2)
+// doesn't exist yet, so this module is Windows-only until it does; see CMakeLists.txt.
+//
+// Everything protocol- and framing-specific lives in rsr200_protocol.h/rsr200_device.h/
+// transport_usb.*, all covered by their own tests or (for the USB transport) a live-hardware
+// smoke test (test/test_usb_live.cpp). This file is just the GUI/config/threading shell:
+// menu controls set an rsr200::Config, applyConfig() sequences the commands the documents
+// require, and a worker thread turns rsr200::Device::pump() into SDR++ stream writes.
+
+using namespace rsr200;
+
+class RSR200SourceModule : public ModuleManager::Instance {
+public:
+    RSR200SourceModule(std::string name) {
+        this->name = name;
+
+        loadConfig();
+
+        handler.ctx = this;
+        handler.selectHandler = menuSelected;
+        handler.deselectHandler = menuDeselected;
+        handler.menuHandler = menuHandler;
+        handler.startHandler = start;
+        handler.stopHandler = stop;
+        handler.tuneHandler = tune;
+        handler.stream = &out;
+
+        // Two coherent channels, offered to core for the phasing front end -- the payoff
+        // described in RSR200_PLAN.md section 7. Only registered while dual channel mode is
+        // selected; otherwise this is an ordinary single-stream source.
+        channels.count = 2;
+        channels.streams = { &outA, &outB };
+        channels.names = { "HF1", "HF2" };
+        channels.phaseCoherent = true;
+        channels.sampleAligned = true;
+
+        sigpath::sourceManager.registerSource("RSR200", &handler);
+        if (dualChannel) { sigpath::sourceManager.registerChannels("RSR200", &channels); }
+    }
+
+    ~RSR200SourceModule() {
+        stop(this);
+        sigpath::sourceManager.unregisterChannels("RSR200");
+        sigpath::sourceManager.unregisterSource("RSR200");
+    }
+
+    void postInit() {}
+    void enable() { enabled = true; }
+    void disable() { enabled = false; }
+    bool isEnabled() { return enabled; }
+
+private:
+    // Build the Config the menu currently describes.
+    Config buildConfig() {
+        Config c;
+        c.adcClockHz = (double)adcClockMHz * 1e6;
+        c.gpsDiscipline = gpsDiscipline;
+        c.decimationExp = decimExp;
+        c.format.channels = dualChannel ? 2 : 1;
+        c.format.bits = bits24 ? 24 : 16;
+        c.opMode = dualChannel ? OP_INDEPENDENT : OP_PARALLEL_ADD;
+        c.swapChannels = swapChannels;
+        c.tunedHz = tunedHz;
+        c.switchRegister = (useVhf ? SW_ADC1_TO_VHF : 0) | (vhfPreamp ? SW_VHF_PREAMP : 0) |
+                            (dualChannel ? SW_ADC2_TO_HF2 : 0);
+        c.attenuator1 = atten1;
+        c.attenuator2 = atten2;
+        c.autoAttEnabled = false;   // not yet exposed -- see RSR200_PLAN.md phase 7
+        return c;
+    }
+
+    static void menuSelected(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        core::setInputSampleRate(_this->buildConfig().sampleRateHz());
+        flog::info("RSR200SourceModule '{0}': Menu Select!", _this->name);
+    }
+
+    static void menuDeselected(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        flog::info("RSR200SourceModule '{0}': Menu Deselect!", _this->name);
+    }
+
+    static void start(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        if (_this->running) { return; }
+
+        _this->lastError.clear();
+        std::string err;
+        if (!_this->usb.open(0, err)) {
+            _this->lastError = "open failed: " + err;
+            flog::error("RSR200SourceModule '{0}': {1}", _this->name, _this->lastError);
+            return;
+        }
+
+        _this->device.setTransport(&_this->usb);
+        _this->device.onError = [_this](const std::string& msg) {
+            std::lock_guard<std::mutex> lck(_this->statusMtx);
+            _this->lastError = msg;
+            flog::error("RSR200SourceModule '{0}': {1}", _this->name, msg);
+        };
+        _this->device.onReply = [_this](const Reply& r) {
+            if (r.kind != REPLY_VERSION) { return; }
+            std::lock_guard<std::mutex> lck(_this->statusMtx);
+            _this->verSerial = r.serial;
+            _this->verFirmware = r.firmware;
+            _this->haveVersion = true;
+        };
+        _this->device.onSamples = [_this](const SampleBlock& b) { _this->deliver(b); };
+
+        const uint64_t now = nowMs();
+        const Config cfg = _this->buildConfig();
+        if (!_this->device.applyConfig(cfg, now)) {
+            _this->lastError = "initial configuration failed";
+            _this->usb.close();
+            return;
+        }
+
+        // OM section 6.2: channel 2's diversity magnitude/phase weight (command 0xB0,
+        // selector 9) sits in the signal path even in Sep mode -- the official software sets
+        // it to unity (magnitude 1.0, phase 0) when switching to Sep, and the DP documents
+        // adjustable values as defaulting to zero on power-up. Without this, channel 2 reads
+        // as a clean, exact zero: real ADC2 data multiplied by a zero weight looks identical
+        // to no data at all. Confirmed against real hardware in test/test_usb_dual_live.cpp
+        // (RSR200_PLAN.md section 10) -- omitting this was the entire cause of the "ADC2 is
+        // dead" misdiagnosis earlier in that section.
+        if (cfg.format.channels == 2) {
+            if (!_this->device.setHardwareDiversity(1.0, 0.0, now)) {
+                _this->lastError = "failed to set channel 2 to unity gain";
+                _this->usb.close();
+                return;
+            }
+        }
+
+        // A cheap, read-only probe -- not modelled on Device (which has no "send an
+        // unsolicited command" method), so sent directly through the transport. The reply
+        // arrives embedded in the stream like any other (DP 3.3), and Device::onReply above
+        // already watches for REPLY_VERSION regardless of who sent the command.
+        auto verCmd = cmdReadVersion(9999, /*lan=*/false);
+        _this->usb.sendCommand(verCmd.data(), verCmd.size());
+
+        if (!_this->device.startStream(now)) {
+            _this->lastError = "Start Stream failed";
+            _this->usb.close();
+            return;
+        }
+
+        _this->run = true;
+        _this->workerThread = std::thread(&RSR200SourceModule::worker, _this);
+
+        _this->running = true;
+        flog::info("RSR200SourceModule '{0}': Start!", _this->name);
+    }
+
+    static void stop(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        if (!_this->running) { return; }
+        _this->running = false;
+
+        // Interrupt the worker's blocked read before touching anything it might still be
+        // using (see transport_usb.h's abortReads() -- releasing the buffer/OVERLAPPED pool
+        // out from under a thread still waiting on it is a race), then join, then a full
+        // close(). DP 3.3: Stop Stream closes the USB endpoint entirely regardless, so the
+        // next Start has to reopen and reconfigure from scratch either way.
+        _this->run = false;
+        _this->usb.abortReads();
+        _this->out.stopWriter();
+        _this->outA.stopWriter();
+        _this->outB.stopWriter();
+        if (_this->workerThread.joinable()) { _this->workerThread.join(); }
+        _this->out.clearWriteStop();
+        _this->outA.clearWriteStop();
+        _this->outB.clearWriteStop();
+
+        auto stopCmd = cmdStopStream(9998, /*lan=*/false, PORT_USB);
+        _this->usb.sendCommand(stopCmd.data(), stopCmd.size());
+        _this->usb.close();
+        _this->device.setTransport(nullptr);
+
+        flog::info("RSR200SourceModule '{0}': Stop!", _this->name);
+    }
+
+    static void tune(double freq, void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        _this->tunedHz = freq;
+        if (_this->running) { _this->device.tune(freq, nowMs()); }
+    }
+
+    static uint64_t nowMs() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Runs on the worker thread (the same thread Device::onSamples/onReply/onError fire on,
+    // since they're called synchronously out of pump()).
+    void worker() {
+        while (run) {
+            if (!device.pump()) { break; }
+            device.service(nowMs());
+        }
+    }
+
+    // Device hands back pointers into its own internal buffers, already unpacked to
+    // interleaved float re/im and Auto-ATT compensated -- copy straight into the stream's
+    // write buffer and swap, the same shape as every other source module's worker.
+    void deliver(const SampleBlock& b) {
+        {
+            std::lock_guard<std::mutex> lck(statusMtx);
+            lastStatus = b.status;
+            lastSequenceGap = b.sequenceGap;
+            if (b.sequenceGap) { gapCount++; }
+        }
+
+        if (b.chB) {
+            memcpy(outA.writeBuf, b.chA, (size_t)b.frames * sizeof(dsp::complex_t));
+            memcpy(outB.writeBuf, b.chB, (size_t)b.frames * sizeof(dsp::complex_t));
+            if (!outA.swap(b.frames)) { run = false; }
+            if (!outB.swap(b.frames)) { run = false; }
+        }
+        else {
+            memcpy(out.writeBuf, b.chA, (size_t)b.frames * sizeof(dsp::complex_t));
+            if (!out.swap(b.frames)) { run = false; }
+        }
+    }
+
+    static void menuHandler(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        bool dirty = false;
+
+        if (_this->running) { SmGui::BeginDisabled(); }
+
+        SmGui::LeftLabel("ADC clock (MHz)");
+        SmGui::FillWidth();
+        if (SmGui::SliderFloatWithSteps(CONCAT("##_rsr200_clk_", _this->name), &_this->adcClockMHz,
+                                        70.0f, 200.0f, 0.1f, SmGui::FMT_STR_FLOAT_ONE_DECIMAL)) {
+            // Affects sampleRateHz() -- core has to be told immediately, not just whenever
+            // dirty next gets handled, or it keeps demodulating at whatever rate was in
+            // effect when the source was first selected.
+            core::setInputSampleRate(_this->buildConfig().sampleRateHz());
+            dirty = true;
+        }
+
+        if (SmGui::Checkbox(CONCAT("GPS discipline##_rsr200_gps_", _this->name), &_this->gpsDiscipline)) {
+            dirty = true;
+        }
+
+        SmGui::LeftLabel("Decimation");
+        SmGui::FillWidth();
+        SmGui::ForceSync();
+        char decItems[256];
+        {
+            // "2\0004\0008\00016\00032\00064\000" but built from the real formula (DP 3.3)
+            // rather than hand-copied, so it can't drift from decimationRate().
+            int off = 0;
+            for (int e = 0; e <= 5; e++) {
+                off += snprintf(decItems + off, sizeof(decItems) - off, "%d", decimationRate(e));
+                decItems[off++] = '\0';
+            }
+            decItems[off] = '\0';
+        }
+        if (SmGui::Combo(CONCAT("##_rsr200_dec_", _this->name), &_this->decimExp, decItems)) {
+            core::setInputSampleRate(_this->buildConfig().sampleRateHz());
+            dirty = true;
+        }
+
+        if (SmGui::Checkbox(CONCAT("24-bit##_rsr200_24_", _this->name), &_this->bits24)) {
+            dirty = true;
+        }
+
+        if (!_this->running) { SmGui::ForceSync(); }
+        if (SmGui::Checkbox(CONCAT("Dual channel (HF1 + HF2, phasing)##_rsr200_dual_", _this->name), &_this->dualChannel)) {
+            if (_this->dualChannel) {
+                sigpath::sourceManager.registerChannels("RSR200", &_this->channels);
+            }
+            else {
+                sigpath::sourceManager.unregisterChannels("RSR200");
+            }
+            dirty = true;
+        }
+        if (_this->dualChannel) {
+            SmGui::Text("HF1 -> channel A (ADC1), HF2 -> channel B (ADC2).");
+        }
+
+        if (SmGui::Checkbox(CONCAT("Swap channels##_rsr200_swap_", _this->name), &_this->swapChannels)) {
+            dirty = true;
+        }
+
+        SmGui::Text("Channel 1 antenna input");
+        if (SmGui::Checkbox(CONCAT("Use VHF input (else HF1)##_rsr200_vhf_", _this->name), &_this->useVhf)) {
+            dirty = true;
+        }
+        if (SmGui::Checkbox(CONCAT("VHF preamp##_rsr200_preamp_", _this->name), &_this->vhfPreamp)) {
+            dirty = true;
+        }
+
+        SmGui::LeftLabel("Attenuator 1 (0 = +7dB gain, 35 = -28dB)");
+        SmGui::FillWidth();
+        if (SmGui::SliderInt(CONCAT("##_rsr200_att1_", _this->name), &_this->atten1, 0, 35)) {
+            dirty = true;
+        }
+        if (_this->dualChannel) {
+            SmGui::LeftLabel("Attenuator 2");
+            SmGui::FillWidth();
+            if (SmGui::SliderInt(CONCAT("##_rsr200_att2_", _this->name), &_this->atten2, 0, 35)) {
+                dirty = true;
+            }
+        }
+
+        if (_this->running) { SmGui::EndDisabled(); }
+
+        const Config cur = _this->buildConfig();
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Sample rate: %.3f MSp/s", cur.sampleRateHz() / 1e6);
+        SmGui::Text(buf);
+
+        // -- Status, updated from the worker thread --------------------------------
+        SmGui::Text("Status");
+        if (_this->running) {
+            std::lock_guard<std::mutex> lck(_this->statusMtx);
+            if (_this->haveVersion) {
+                snprintf(buf, sizeof(buf), "Serial %u, firmware %u", _this->verSerial, _this->verFirmware);
+            }
+            else {
+                snprintf(buf, sizeof(buf), "Serial/firmware: waiting for reply...");
+            }
+            SmGui::Text(buf);
+
+            if (_this->lastStatus.autoAttActive) {
+                SmGui::Text("Temperature: Auto-ATT active");
+            }
+            else {
+                snprintf(buf, sizeof(buf), "Temperature: %d C", _this->lastStatus.temperatureC);
+                SmGui::Text(buf);
+            }
+            snprintf(buf, sizeof(buf), "Overload: CH1 %s  CH2 %s",
+                     _this->lastStatus.overloadCh1 ? "YES" : "no",
+                     _this->lastStatus.overloadCh2 ? "YES" : "no");
+            SmGui::Text(buf);
+            snprintf(buf, sizeof(buf), "Sequence gaps seen: %llu", (unsigned long long)_this->gapCount);
+            SmGui::Text(buf);
+            if (!_this->lastError.empty()) {
+                snprintf(buf, sizeof(buf), "Error: %s", _this->lastError.c_str());
+                SmGui::Text(buf);
+            }
+        }
+        else {
+            SmGui::Text("Not running.");
+            if (!_this->lastError.empty()) {
+                snprintf(buf, sizeof(buf), "Last error: %s", _this->lastError.c_str());
+                SmGui::Text(buf);
+            }
+        }
+
+        // core::setInputSampleRate() for the rate-affecting controls (ADC clock, decimation)
+        // is called right where they change, above -- not here. Every rate-affecting control
+        // is disabled while running (see BeginDisabled/EndDisabled above), so `dirty` can
+        // never be set by them while running; gating a repeat of that call on `running` here
+        // would be unreachable dead code, not a real second code path.
+        if (dirty) { _this->saveConfig(); }
+    }
+
+    void loadConfig() {
+        config.acquire();
+        json& c = config.conf;
+        if (c.contains("adcClockMHz")) { adcClockMHz = c["adcClockMHz"]; }
+        if (c.contains("gpsDiscipline")) { gpsDiscipline = c["gpsDiscipline"]; }
+        if (c.contains("decimExp")) { decimExp = c["decimExp"]; }
+        if (c.contains("bits24")) { bits24 = c["bits24"]; }
+        if (c.contains("dualChannel")) { dualChannel = c["dualChannel"]; }
+        if (c.contains("swapChannels")) { swapChannels = c["swapChannels"]; }
+        if (c.contains("useVhf")) { useVhf = c["useVhf"]; }
+        if (c.contains("vhfPreamp")) { vhfPreamp = c["vhfPreamp"]; }
+        if (c.contains("atten1")) { atten1 = c["atten1"]; }
+        if (c.contains("atten2")) { atten2 = c["atten2"]; }
+        config.release();
+    }
+
+    void saveConfig() {
+        config.acquire();
+        json& c = config.conf;
+        c["adcClockMHz"] = adcClockMHz;
+        c["gpsDiscipline"] = gpsDiscipline;
+        c["decimExp"] = decimExp;
+        c["bits24"] = bits24;
+        c["dualChannel"] = dualChannel;
+        c["swapChannels"] = swapChannels;
+        c["useVhf"] = useVhf;
+        c["vhfPreamp"] = vhfPreamp;
+        c["atten1"] = atten1;
+        c["atten2"] = atten2;
+        config.release(true);
+    }
+
+    std::string name;
+    bool enabled = true;
+    bool running = false;
+
+    SourceManager::SourceHandler handler;
+    dsp::stream<dsp::complex_t> out;
+
+    // Dual channel mode: the two raw channels, plus the set describing them to core.
+    dsp::stream<dsp::complex_t> outA;
+    dsp::stream<dsp::complex_t> outB;
+    ChannelSet channels;
+
+    // GUI-facing, persisted settings.
+    float adcClockMHz = 125.0f;
+    bool gpsDiscipline = true;
+    int decimExp = 3;             // rate 16, matching rsr200::Config's own default
+    bool bits24 = false;
+    bool dualChannel = false;
+    bool swapChannels = false;
+    bool useVhf = false;
+    bool vhfPreamp = false;
+    int atten1 = 0;
+    int atten2 = 0;
+    double tunedHz = 10e6;
+
+    // Transport + protocol layer.
+    UsbTransport usb;
+    Device device;
+
+    // Worker thread and the status it publishes, guarded by statusMtx since the GUI thread
+    // reads it while the worker thread (running Device's callbacks) writes it.
+    std::thread workerThread;
+    std::atomic<bool> run = false;
+    std::mutex statusMtx;
+    Status lastStatus;
+    bool lastSequenceGap = false;
+    uint64_t gapCount = 0;
+    bool haveVersion = false;
+    uint32_t verSerial = 0;
+    uint32_t verFirmware = 0;
+    std::string lastError;
+};
+
+MOD_EXPORT void _INIT_() {
+    json def = json({});
+    config.setPath(core::args["root"].s() + "/rsr200_config.json");
+    config.load(def);
+    config.enableAutoSave();
+}
+
+MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) {
+    return new RSR200SourceModule(name);
+}
+
+MOD_EXPORT void _DELETE_INSTANCE_(void* instance) {
+    delete (RSR200SourceModule*)instance;
+}
+
+MOD_EXPORT void _END_() {
+    config.disableAutoSave();
+    config.save();
+}

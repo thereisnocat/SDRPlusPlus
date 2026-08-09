@@ -5,6 +5,7 @@ build/
 *.old
 *.dll
 *.exe
+*.obj
 *.zip
 *.wav
 .DS_Store
