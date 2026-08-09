@@ -1,11 +1,10 @@
 cmake_minimum_required(VERSION 3.13)
 project(rsr200_source)
 
-# transport_usb.cpp is Windows-only (it's built directly on the D3XX WinUSB API), and no
-# other transport exists yet -- transport_lan.cpp is RSR200_PLAN.md phase 2, not started.
-# So for now the whole module is Windows-only; see the option's guard in the top-level
-# CMakeLists.txt. main.cpp only ever constructs rsr200::UsbTransport, so nothing here needs
-# an #ifdef for platform: the module simply isn't offered to build elsewhere yet.
+# transport_usb.cpp compiles on Windows, Linux and macOS -- Windows against FTDI's WinUSB
+# D3XX SDK (FTD3XX.h), the other two against FTDI's POSIX D3XX SDK (ftd3xx.h), which is a
+# different library with a different async-I/O call for the same job (see transport_usb.cpp).
+# No other transport exists yet -- transport_lan.cpp is RSR200_PLAN.md phase 2, not started.
 set(SRC "src/main.cpp" "src/transport_usb.cpp")
 
 include(${SDRPP_MODULE_CMAKE})
@@ -17,4 +16,14 @@ if (MSVC)
     target_include_directories(rsr200_source PRIVATE "C:/Program Files/FTD3XX/include")
     target_link_directories(rsr200_source PRIVATE "C:/Program Files/FTD3XX/lib")
     target_link_libraries(rsr200_source PRIVATE FTD3XXWU)
+else ()
+    # FTDI ships the Linux and macOS D3XX SDK as a bare tarball, not a package -- no
+    # pkg-config .pc file, no Homebrew formula. Its own install instructions (both
+    # platforms, identically) put ftd3xx.h/Types.h under /usr/local/include and
+    # libftd3xx.{so,dylib} under /usr/local/lib; that's the only convention there is to
+    # follow, matching how the Mac side of this project already had it installed for
+    # phase 0 (see ENGINEERING_NOTES.md's note on libftd3xx.dylib's install name).
+    target_include_directories(rsr200_source PRIVATE "/usr/local/include")
+    target_link_directories(rsr200_source PRIVATE "/usr/local/lib")
+    target_link_libraries(rsr200_source PRIVATE ftd3xx)
 endif ()

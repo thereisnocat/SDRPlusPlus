@@ -1,5 +1,6 @@
 #include "transport_usb.h"
 #include <cstring>
+#include <cstdint>
 
 namespace rsr200 {
 
@@ -7,6 +8,32 @@ namespace rsr200 {
         std::string statusStr(FT_STATUS st) {
             return "status " + std::to_string((unsigned)st);
         }
+
+        // FT_ReadPipeEx means two different things on the two D3XX SDKs: on Windows it's the
+        // overlapped/async call (what we want for the queued read pipe); on Linux/macOS that
+        // name is a *synchronous* call with a millisecond timeout, and the overlapped call is
+        // named FT_ReadPipeAsync instead. Wrapped here so the rest of the file reads the same
+        // regardless of platform. FT_WritePipe's last parameter has the same split -- an
+        // LPOVERLAPPED on Windows (nullptr for a plain blocking write), a DWORD timeout in
+        // milliseconds on Linux/macOS -- wrapped for the same reason.
+#ifdef _WIN32
+        inline FT_STATUS queueOverlappedRead(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len,
+                                             PULONG got, LPOVERLAPPED ov) {
+            return FT_ReadPipeEx(h, pipe, buf, len, got, ov);
+        }
+        inline FT_STATUS blockingWrite(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len, PULONG written) {
+            return FT_WritePipe(h, pipe, buf, len, written, nullptr);
+        }
+#else
+        constexpr DWORD WRITE_TIMEOUT_MS = 1000;
+        inline FT_STATUS queueOverlappedRead(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len,
+                                             PULONG got, LPOVERLAPPED ov) {
+            return FT_ReadPipeAsync(h, pipe, buf, len, got, ov);
+        }
+        inline FT_STATUS blockingWrite(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len, PULONG written) {
+            return FT_WritePipe(h, pipe, buf, len, written, WRITE_TIMEOUT_MS);
+        }
+#endif
 
         // FT_Create needs FT_CreateDeviceInfoList to have run first -- undocumented in the
         // function reference, but present in every FTDI sample (DRV_DriverInterface.cpp in
@@ -56,8 +83,11 @@ namespace rsr200 {
             return false;
         }
 
+        // uintptr_t, not ULONG_PTR: the latter is a Windows-only type, and FT_OPEN_BY_INDEX's
+        // convention (the index packed directly into the pointer-sized argument) is the same
+        // on every D3XX SDK.
         FT_HANDLE h = nullptr;
-        FT_STATUS st = FT_Create((PVOID)(ULONG_PTR)index, FT_OPEN_BY_INDEX, &h);
+        FT_STATUS st = FT_Create((PVOID)(uintptr_t)index, FT_OPEN_BY_INDEX, &h);
         return openHandle(st, h, err);
     }
 
@@ -124,12 +154,12 @@ namespace rsr200 {
 
     bool UsbTransport::queueRead(size_t slot, std::string& err) {
         ULONG got = 0;
-        FT_STATUS st = FT_ReadPipeEx(handle, USB_ENDPOINT_IN, buffers[slot].data(),
-                                     CHUNK_BYTES, &got, &overlapped[slot]);
+        FT_STATUS st = queueOverlappedRead(handle, USB_ENDPOINT_IN, buffers[slot].data(),
+                                           CHUNK_BYTES, &got, &overlapped[slot]);
         // Overlapped reads report their real completion through FT_GetOverlappedResult;
         // FT_IO_PENDING here is success, not an error.
         if (st != FT_IO_PENDING && FT_FAILED(st)) {
-            err = "FT_ReadPipeEx failed (" + statusStr(st) + ")";
+            err = "queued read failed (" + statusStr(st) + ")";
             return false;
         }
         return true;
@@ -164,7 +194,7 @@ namespace rsr200 {
     bool UsbTransport::sendCommand(const uint8_t* data, size_t len) {
         if (!handle) { return false; }
         ULONG written = 0;
-        FT_STATUS st = FT_WritePipe(handle, USB_ENDPOINT_OUT, (PUCHAR)data, (ULONG)len, &written, nullptr);
+        FT_STATUS st = blockingWrite(handle, USB_ENDPOINT_OUT, (PUCHAR)data, (ULONG)len, &written);
         return FT_SUCCESS(st) && written == len;
     }
 

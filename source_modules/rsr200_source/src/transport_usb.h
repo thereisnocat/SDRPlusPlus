@@ -1,6 +1,12 @@
 #pragma once
 #include "rsr200_device.h"
-#include <FTD3XX.h>
+#ifdef _WIN32
+    #include <FTD3XX.h>       // Windows WinUSB D3XX: FT_ReadPipeEx is the overlapped call.
+#else
+    #include <ftd3xx.h>       // Linux/macOS D3XX (identical header, both platforms): same
+#endif                        // OVERLAPPED-shaped API, but the overlapped read is named
+                              // FT_ReadPipeAsync there, and FT_ReadPipeEx is a *synchronous*
+                              // call with a millisecond timeout instead -- see transport_usb.cpp.
 #include <string>
 #include <vector>
 
@@ -12,6 +18,12 @@
 // pattern for that (WU_DataStreamerApp/APP_ReaderThread.cpp in the D3XX SDK): a stream pipe
 // set once, a ring of overlapped reads kept perpetually in flight, and each buffer
 // re-submitted the instant its read completes.
+//
+// Windows and Linux/macOS ship genuinely different D3XX SDKs (different async I/O call
+// names, not just different library paths), but both define Windows-shaped types --
+// OVERLAPPED, PVOID, DWORD, FT_HANDLE -- so the class below and everything in
+// rsr200_device.h stays platform-agnostic. Only transport_usb.cpp's handful of raw D3XX
+// calls need to know which SDK they're talking to.
 
 namespace rsr200 {
 
