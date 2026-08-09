@@ -3,7 +3,17 @@
 #ifdef _WIN32
     #include <FTD3XX.h>       // Windows WinUSB D3XX: FT_ReadPipeEx is the overlapped call.
 #else
+    // ftd3xx.h declares `typedef struct Event {...} Event;` at global scope -- an internal
+    // implementation-detail type (nothing in the public FT_* API takes or returns one) that
+    // happens to collide with core's own template class Event<T> from utils/event.h, which
+    // main.cpp pulls in transitively via signal_path.h. Renamed only for the duration of
+    // this one #include, tightly enough that it cannot touch core's Event anywhere else in
+    // this or any other translation unit. First surfaced building on macOS -- see
+    // RSR200_PLAN.md section 9, Phase 6: this path had only been checked line-by-line
+    // against the vendor headers, never actually compiled, on a non-Windows toolchain.
+    #define Event FT_D3XX_Event
     #include <ftd3xx.h>       // Linux/macOS D3XX (identical header, both platforms): same
+    #undef Event
 #endif                        // OVERLAPPED-shaped API, but the overlapped read is named
                               // FT_ReadPipeAsync there, and FT_ReadPipeEx is a *synchronous*
                               // call with a millisecond timeout instead -- see transport_usb.cpp.
