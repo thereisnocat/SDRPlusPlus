@@ -123,11 +123,71 @@ SuperSpeed link can get stuck — there, downgraded to Hi-Speed rather than drop
 — in a way that no cable or port change cleared, only **a full power cycle of the radio
 itself**. That was never tried here: every retest above changed the cable, the Mac port, or
 confirmed the power *supply*, but the radio was never fully powered off and back on while
-connected to this Mac. Given a second, independent host has now shown this chip's link
-training can wedge in a way only the radio's own power state clears, the Mac symptom (drops
-after ~1 s rather than negotiating down) may be the same underlying fragility presenting
-differently, not a distinct Apple Silicon incompatibility. Worth a full radio power cycle
-on the Mac before spending more effort on a macOS-specific fix.
+connected to this Mac.
+
+**2026-08-09: reversed — root cause was the D3XX driver version, not the Mac's USB stack.**
+The "Apple Silicon USB-C/XHCI compatibility quirk" conclusion above was wrong. Before a
+power cycle was tried, the radio's owner downgraded the installed D3XX driver from 1.1.8 to
+1.1.6 (confirmed via `otool -L`/`md5` against `libftd3xx.1.1.6.dylib`, byte-identical). With
+1.1.6 in place, `FT_CreateDeviceInfoList` reports the device stably rather than dropping
+after ~1 s, and — a stronger test than enumeration — `FT_Create` opens a real handle that
+was held open and re-checked every 2 s for a full 20 s window before closing cleanly, no
+drops at any point. The radio was never power-cycled in this test; the driver downgrade
+alone explains the fix. 1.1.8 evidently has a genuine regression against this chip/host
+combination that 1.1.6 does not share — this was a driver bug, not a hardware limitation of
+this Mac, so a different Mac or adapter path is not needed after all.
+
+Not yet proven: this is open-and-hold, not sustained high-throughput streaming. The actual
+`FT_SetStreamPipe`/`FT_ReadPipeEx` queued-read path `transport_usb.cpp` depends on has not
+been exercised against the radio on the Mac yet — that is the next real test before calling
+Phase 6 done here, not just enumeration/open. `FT_SetVIDPID` is also currently unavailable
+at 1.1.6 (`nm` shows no `_FT_SetVIDPID` symbol in this dylib version, unlike 1.1.8) — not
+needed for the fix above since the default VID/PID already matched, but worth knowing if
+anything later reaches for it on macOS specifically.
+
+**2026-08-09, same day: Phase 6 proven live on the Mac — real IQ, spectrum, signals
+received.** Getting there needed three more fixes, none of them the radio's fault:
+
+1. **Bare install name on the vendor dylib.** `/usr/local/lib/libftd3xx.dylib`'s own
+   `LC_ID_DYLIB` was just `libftd3xx.dylib`, no path — so anything linking against it (our
+   module) inherited that same bare reference, and `dlopen` couldn't find it outside the
+   directory it happened to be built in. Fixed at the source: `install_name_tool -id
+   /usr/local/lib/libftd3xx.dylib /usr/local/lib/libftd3xx.dylib` on the installed driver
+   itself, so every future link against it — not just this one module — gets a resolvable
+   absolute path automatically. Confirmed: a completely fresh `rsr200_source` rebuild after
+   this needed no manual patching.
+2. **`install_name_tool` invalidates the code signature it touches, and macOS kills on
+   sight.** Step 1 above left `libftd3xx.dylib`'s signature broken rather than absent, and
+   loading a dylib with an *invalid* (not just missing) signature is a hard `SIGKILL` from
+   the kernel — confirmed via the crash report: `CODESIGNING` / `Invalid Page` /
+   `EXC_BAD_ACCESS`, at `dlopen` inside `ModuleManager::loadModule`. Fixed with an ad-hoc
+   re-sign: `codesign -s - -f /usr/local/lib/libftd3xx.dylib`, and the same for the module
+   dylib itself after any local `install_name_tool` edit to it.
+3. **The real bug: `FT_ReadPipeAsync` takes a logical FIFO channel (0-3) on Linux/macOS, not
+   the raw USB endpoint address.** Once the module loaded, Start failed immediately with
+   `FT_INVALID_PARAMETER` (status 6) from the very first queued read. `FT_SetStreamPipe`,
+   `FT_ReadPipe`, `FT_WritePipe`, `FT_FlushPipe`, `FT_AbortPipe` all take the raw endpoint
+   byte (`0x82` for this device's bulk IN pipe) and all worked fine with it. But
+   `FT_ReadPipeEx`/`FT_ReadPipeAsync`/`FT_WritePipeEx`/`FT_WritePipeAsync` are different —
+   the header's own doc comment on exactly those four calls says `ucFifoID ... Valid values
+   are 0-3`, a different identifier space entirely. Confirmed by direct test rather than
+   inferred from the comment alone: a standalone probe
+   (`d3xx_readpipe_probe.c` in scratch) called `FT_ReadPipeAsync(h, 0x82, ...)` →
+   `FT_INVALID_PARAMETER`, then `FT_ReadPipeAsync(h, 0, ...)` → `FT_IO_PENDING`, completing
+   normally. `transport_usb.cpp`'s non-Windows `queueOverlappedRead` now converts via
+   `(endpointAddress & 0x0F) - 2` before calling `FT_ReadPipeAsync`, scoped to just that one
+   wrapper — `FT_SetStreamPipe` and the plain `FT_WritePipe` used for commands are untouched
+   since they already worked with the raw address. This is a genuine platform divergence
+   from Windows, not a guess: Windows' `FT_ReadPipeEx` takes the raw endpoint directly and is
+   already verified there (0.00% packet loss, `test/test_usb_live.cpp`), so the two D3XX SDKs
+   disagree on this parameter's meaning for the exact same call family.
+
+After all three fixes: the RSR200 Source module loads, initializes, opens the radio, and
+streams — confirmed by direct observation (spectrum and signals visible), not just clean
+logs. Phase 6 is genuinely done on this Mac now, not just on Windows. Not yet measured here:
+sustained throughput / packet-loss numbers over a long run, the way Windows has
+(`test_usb_live.cpp` hasn't been run on macOS). `FT_SetVIDPID`'s absence at 1.1.6 (noted
+above) remains unaddressed but still unneeded.
 
 ## 2. What the radio is
 
@@ -453,7 +513,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **3** | Full single-channel control: ADC clock, decimation, attenuators, input switching, 24-bit, Nyquist zone display and spectrum inversion. | Yes |
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
-| **6** | **Done and verified on Windows; compiles on Linux/macOS, not yet run there.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout) — abstracted behind two small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic; verified by downloading and diffing FTDI's actual Linux and macOS SDK headers rather than guessing (they're identical to each other, both genuinely different from the Windows one). CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions and how the Mac side already had it installed for phase 0. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. Needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4. The Linux/macOS path has not been build- or run-tested on those platforms — only checked line-by-line against the real headers on a Windows machine with no Linux/macOS toolchain available. `main.cpp` wires it into a working single-channel SDR++ source module. | Yes |
+| **6** | **Done and verified on Windows, and now proven live on macOS too (2026-08-09) — spectrum and signals received on the Mac over real USB.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout), **and a third, undocumented-until-now difference: the Linux/macOS `*_Ex`/`*_Async` read/write calls take a logical FIFO channel (0-3), not the raw USB endpoint address Windows and every other pipe call use** — see section 1's 2026-08-09 entries for the full diagnosis. All three abstracted behind small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic. CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. That Windows run needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4; on the Mac, the blocker turned out to be a driver version regression (fixed by downgrading to 1.1.6) plus the FIFO-channel bug above, not a power cycle. `main.cpp` wires it into a working single-channel SDR++ source module. Not yet measured on macOS: sustained packet-loss numbers over a long run, the way Windows has. | Yes |
 | **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully

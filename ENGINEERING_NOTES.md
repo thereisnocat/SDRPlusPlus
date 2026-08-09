@@ -391,7 +391,42 @@ in §3.
 **Vendor libraries with bare install names.** Both the SDRplay API (`libsdrplay_api.so.3`)
 and FTDI D3XX (`libftd3xx.dylib`) record install names that resolve only via dyld's
 *fallback* search path. Link by absolute path and rewrite the dependency with
-`install_name_tool -change`.
+`install_name_tool -change` — or better, fix the vendor library's own `LC_ID_DYLIB` with
+`install_name_tool -id` so every future thing that links against it inherits a resolvable
+path automatically, rather than patching each dependent binary by hand. Confirmed the
+difference matters: after `-id`-fixing `/usr/local/lib/libftd3xx.dylib` once, a completely
+fresh `rsr200_source` rebuild needed no patch of its own.
+
+**`install_name_tool` breaks the code signature it touches, and macOS kills on sight, not
+just warns.** Right after the `-id` fix above, the very next launch that tried to `dlopen`
+the patched dylib died with a silent `SIGKILL` and no application-level error at all — the
+process just vanished. The crash report told the real story: `CODESIGNING` / `Invalid Page`
+/ `EXC_BAD_ACCESS`, inside `dlopen` during `ModuleManager::loadModule`. A dylib with a
+*broken* signature (touched, not re-signed) is treated far more harshly than one with no
+signature at all — the kernel kills the *loading* process outright. Fix: ad-hoc re-sign
+anything `install_name_tool` touches, `codesign -s - -f <path>`, immediately after. Cheap,
+and the warning `install_name_tool` itself prints ("changes being made to the file will
+invalidate the code signature") is not decoration — treat it as a required follow-up step,
+not a caveat.
+
+**The same D3XX call name means a different *parameter*, not just a different signature,
+across platforms.** Beyond the already-known async-call-name split (`FT_ReadPipeEx` on
+Windows vs `FT_ReadPipeAsync` on Linux/macOS for the overlapped read), the Linux/macOS
+versions of the four `*_Ex`/`*_Async` pipe calls (`FT_ReadPipeEx`, `FT_ReadPipeAsync`,
+`FT_WritePipeEx`, `FT_WritePipeAsync`) take a **logical FIFO channel index (0-3)**, not the
+raw USB endpoint address — while `FT_SetStreamPipe`, `FT_ReadPipe`, `FT_WritePipe`,
+`FT_FlushPipe`, and `FT_AbortPipe` all keep taking the raw endpoint byte, and Windows'
+`FT_ReadPipeEx` also takes the raw endpoint byte (verified there: 0.00% packet loss against
+real hardware). Passing the endpoint address (`0x82`) where a channel was expected returned
+`FT_INVALID_PARAMETER` on every attempt, misleadingly generic — nothing about that error
+name points at "wrong identifier space." The header does document this, but only as a
+one-line comment on those four calls specifically ("`ucFifoID` ... Valid values are 0-3"),
+easy to read past when every neighbouring pipe call in the same header uses the raw address.
+Caught by writing a minimal standalone probe that tried both values against the real device
+rather than re-reading the header more carefully — `0x82` failed, `0` succeeded
+(`FT_IO_PENDING`, then completed) — turning a plausible-sounding header quote into a
+measured fact before changing the real code. `rsr200_source/src/transport_usb.cpp` converts
+with `(endpointAddress & 0x0F) - 2`, scoped to just the two Ex/Async wrapper functions.
 
 **A stuck USB SuperSpeed negotiation looks exactly like a cable or port problem, and isn't.**
 On Windows, bringing up `rsr200_source`'s USB transport against the real RSR200 showed

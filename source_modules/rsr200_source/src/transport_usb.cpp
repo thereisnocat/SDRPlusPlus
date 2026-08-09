@@ -26,9 +26,26 @@ namespace rsr200 {
         }
 #else
         constexpr DWORD WRITE_TIMEOUT_MS = 1000;
+
+        // A second, undocumented split beyond the function-name one above: on the Linux/macOS
+        // SDK, FT_ReadPipeAsync (and FT_ReadPipeEx/FT_WritePipeEx/FT_WritePipeAsync) take a
+        // logical FIFO *channel* index (0-3), not the raw USB endpoint address -- despite
+        // every other pipe call (FT_SetStreamPipe, FT_ReadPipe, FT_WritePipe, FT_FlushPipe,
+        // FT_AbortPipe) taking the raw endpoint byte, and despite the endpoint byte being what
+        // Windows' FT_ReadPipeEx wants too (verified there against real hardware: 0.00% packet
+        // loss). Confirmed against this radio, not assumed: FT_ReadPipeAsync(h, 0x82, ...)
+        // returns FT_INVALID_PARAMETER every time; FT_ReadPipeAsync(h, 0, ...) returns
+        // FT_IO_PENDING and completes normally -- see d3xx_readpipe_probe.c and
+        // RSR200_PLAN.md section 1's 2026-08-09 entry. The FT600/FT601's bulk IN endpoints are
+        // 0x82/0x83/0x84/0x85 for channels 0-3, so the conversion is just the low nibble minus
+        // 2; scoped to this one call, since FT_SetStreamPipe etc. above already work with the
+        // raw endpoint address as-is.
+        inline UCHAR toFifoChannel(UCHAR endpointAddress) {
+            return (UCHAR)((endpointAddress & 0x0F) - 2);
+        }
         inline FT_STATUS queueOverlappedRead(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len,
                                              PULONG got, LPOVERLAPPED ov) {
-            return FT_ReadPipeAsync(h, pipe, buf, len, got, ov);
+            return FT_ReadPipeAsync(h, toFifoChannel(pipe), buf, len, got, ov);
         }
         inline FT_STATUS blockingWrite(FT_HANDLE h, UCHAR pipe, PUCHAR buf, ULONG len, PULONG written) {
             return FT_WritePipe(h, pipe, buf, len, written, WRITE_TIMEOUT_MS);
