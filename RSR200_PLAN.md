@@ -588,3 +588,34 @@ Worth keeping a list, both to avoid re-deriving them and to send back to the man
 - OM §5.3 gives the default IP as 192.168.1.10 while DP §2.2 gives 191.168.1.10 — the
   latter is a typo (191.168/16 is not private address space), but worth knowing which the
   firmware actually uses before hunting for a radio that will not answer.
+
+## 12. UX issues found in live testing (2026-08-09)
+
+Notes from Ralph's first extended live session against the real radio over USB, once
+streaming worked. Recorded as a punch list, not designed or fixed yet.
+
+1. **ADC clock can't be set precisely.** The UI advertises 0.1 MHz resolution, but the
+   control's per-step jump is visibly larger than 0.1 MHz — the slider/drag granularity
+   doesn't match the value granularity it claims.
+2. **ADC clock × receiver decimation × software decimation gives a huge but opaque space of
+   bandwidth/sample-rate choices.** The three controls compose to determine the effective
+   rate, but nothing in the interface shows that relationship. Worth an alternate control
+   surface that exposes bandwidth or sample rate directly and derives the three underlying
+   parameters, rather than making the user reason through the composition themselves.
+3. **Receiver decimation = 2 in 24-bit mode produces choppy audio, even at the lowest clock
+   speed.** The manufacturer recommends 24-bit mode, but it isn't practical at the sample
+   rates the low decimation settings imply. Whatever alternate interface comes out of item 2
+   should surface 24-bit mode's effect on usable bandwidth alongside the rate controls, not
+   as a separate, disconnected checkbox.
+4. **Wants a small always-visible spectrum window zoomed to the current frequency.** The
+   existing zoom control does this to some extent but at limited resolution. Not yet clear
+   where this belongs in the layout — noted for later, no design started.
+5. **Firmware version still displays wrong — not BCD-decoded.** `main.cpp`'s status line
+   (`snprintf(buf, sizeof(buf), "Serial %u, firmware %u", ...)`, around line 350) prints
+   `verFirmware` as a plain decimal `uint32_t`, but `rsr200_protocol.h`'s version reply
+   parsing (`readU32` at the two call sites feeding `firmware`) reads it as straight binary
+   rather than packed BCD. DP calls out firmware "225" by that exact three-digit form
+   (`rsr200_protocol.h`'s own header comment cites "firmware 225"), which is the shape of a
+   BCD-encoded value, not a raw integer — so the fix is almost certainly in how the field is
+   decoded, not just how it's formatted for display. Not yet fixed; noted here so the next
+   pass at it starts from the right file and line instead of re-finding them.
