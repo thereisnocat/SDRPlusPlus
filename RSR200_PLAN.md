@@ -417,9 +417,9 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **1b** | **Done** — `src/rsr200_device.h`: the transport-agnostic device layer. Configuration ordering, command numbering, acknowledgement and fresh-number retry, embedded reply extraction, sequence-gap detection, sample delivery. Covered by `test/test_device.cpp` against a fake transport. Phase 2 is now mostly plugging in a socket. | No |
 | **2** | LAN transport: TCP connect, version query, block resync, UDP reassembly. It implements one interface — `sendCommand` and `nextFrame`. First live IQ. | Yes |
 | **3** | Full single-channel control: ADC clock, decimation, attenuators, input switching, 24-bit, Nyquist zone display and spectrum inversion. | Yes |
-| **4** | Dual channel Separate mode + `registerChannels()`. The phasing feature lights up. | Yes |
+| **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. | Yes |
-| **6** | USB transport via D3XX: `FT_SetStreamPipe` plus overlapped `FT_ReadPipeAsync` with many 4096-byte buffers queued, as DP §2.1 recommends. | Yes |
+| **6** | **Done (Windows)** — `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus overlapped `FT_ReadPipeEx` with a queue of chunked reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. Needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4. `main.cpp` wires it into a working single-channel SDR++ source module. | Yes |
 | **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully
@@ -452,6 +452,34 @@ carry that risk.
 - **Does 24-bit dual channel really halve the sample count per block** (§3.2), and is the
   effective sample rate therefore halved, or is the block rate doubled? The document states
   the block layout but not the timing.
+- ~~ADC2/HF2 produces no data in dual-channel "Separate" mode over USB~~ **RESOLVED.** The
+  investigation is worth keeping in full because of how it unfolded, not just the answer.
+  `test/test_usb_dual_live.cpp` first found channel B reading a clean, exact zero on every
+  packet, reproducibly, from a fresh power cycle, with port mode and DSP mode bytes confirmed
+  bit-correct against DP §3.3 and every command's acknowledgment confirming the exact value
+  sent. A swap-bit test (the dead slot moved with whichever logical channel the swap bit
+  assigned to ADC2, both directions, reproduced from a fresh power cycle) led to the wrong
+  conclusion that ADC2's hardware was dead — disproven when a recording made with Reinhard
+  Weiss' RSR200 Recorder, confirmed running over USB (LAN is not yet functional on this radio
+  at all, §1), showed both channels alive and strong for a full 255-second capture (verified
+  byte-for-byte against the file's Linrad dual-channel header with
+  `test/test_linrad_recording.cpp`). That left a real, narrower question: what does a working
+  USB command sequence send that ours didn't? **Reading the DP and OM in full, not just
+  grepping them, found it.** OM §6.2 (a changelog entry for a years-old bug-fix version, not
+  the main feature description) states outright that channel 2's diversity magnitude/phase
+  weight (DP §3.3's "Set frequency generators", command `0xB0`, selector 9) sits in the signal
+  path even in Sep mode, and the official software sets it to unity (magnitude 1.0, phase 0)
+  when switching there. DP §4 documents adjustable values as defaulting to zero on power-up.
+  We had never sent that command — `Device::setHardwareDiversity()` existed in
+  `rsr200_device.h` from phase 1b but nothing ever called it outside the (separate, later)
+  hardware-diversity feature. Real ADC2 data multiplied by a zero weight is indistinguishable
+  from no data at all, which is exactly what every prior test measured. Added the call to
+  `main.cpp`'s `start()` (unity weight, sent whenever `format.channels == 2`) and confirmed
+  live in the real app: both channels alive, phasing and decorrelation nulling local signals
+  by more than 30 dB, exactly as designed. Nothing about the earlier evidence was wrong — the
+  swap-bit test correctly showed the fault tracked *ADC2*, it just couldn't distinguish
+  "ADC2 is broken" from "ADC2 needs a command we never send," and only an independent working
+  implementation, followed by reading the primary documentation cover to cover, could.
 
 ## 11. Errata noticed in the documents
 

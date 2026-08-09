@@ -393,6 +393,74 @@ and FTDI D3XX (`libftd3xx.dylib`) record install names that resolve only via dyl
 *fallback* search path. Link by absolute path and rewrite the dependency with
 `install_name_tool -change`.
 
+**A stuck USB SuperSpeed negotiation looks exactly like a cable or port problem, and isn't.**
+On Windows, bringing up `rsr200_source`'s USB transport against the real RSR200 showed
+steady packet loss (~1-4.5% at the radio's default streaming rate) that no amount of
+host-side buffering fixed: `QUEUE_DEPTH` 8 → 64 roughly halved it, 64 → 256 changed nothing,
+moving the read loop to a dedicated `THREAD_PRIORITY_TIME_CRITICAL` thread changed nothing,
+and batching 8 packets per `FT_ReadPipeEx` call instead of 1 changed nothing — a flat
+plateau across every host-side lever is itself the diagnostic: it means the bottleneck isn't
+host-side. Measured throughput (~45 MB/s) matched a realistic USB 2.0 Hi-Speed ceiling, not
+the FT601's USB 3.0 SuperSpeed one, and `FT_DEVICE_LIST_INFO_NODE.Flags` confirmed it
+directly: `FT_FLAGS_SUPERSPEED` was not set. Swapping cables (including a checker-verified
+USB4/Thunderbolt4 cable) and trying every port on the host (two USB-C/Thunderbolt, one
+USB-A SuperSpeed) made no difference — the constant across every failing combination was the
+radio, not the host. **A full power cycle of the radio itself, not just a cable reseat, was
+what actually cleared it.** USB link training can get stuck at a downgraded speed in a way
+that a cable unplug/replug doesn't reach; the device's own power state does. If the RSR200
+ever reports Hi-Speed instead of SuperSpeed, power-cycle the radio before troubleshooting
+cables or ports — that plateau-across-every-host-side-change signature is the tell to look
+for before spending time on more cable/port swaps.
+
+**A control test that looked decisive had a blind spot, and the wrong conclusion got written
+down until an independent implementation disproved it.** Channel B on `rsr200_source`'s
+dual-channel USB mode read exact zero, every packet, reproducibly, from a fresh power cycle,
+despite port mode and DSP mode bytes confirmed bit-correct against DP §3.3 and every command's
+acknowledgment confirming the exact value sent. To tell "our code reads the wrong bytes" from
+"the radio isn't producing the bytes," the port mode's swap bit was flipped: a software offset
+bug would leave the zero in the same byte position regardless; a radio genuinely not producing
+channel 2 data would move the zero with whichever *logical* channel the swap bit assigns to
+ADC2. It moved with the swap bit, both directions, from a fresh power cycle each time.
+Physically swapping the antennas between the ports changed nothing either. That looked like a
+clean two-hypothesis test with a clear winner, and **"ADC2 hardware fault" got written down as
+the conclusion. It was wrong.** A recording made minutes later with independent third-party
+software (Reinhard Weiss' RSR200 Recorder, confirmed running over USB — LAN isn't functional
+on this radio at all) shows both channels alive and strong for the full length of a
+255-second capture. The swap-bit test's real flaw: it only ever distinguished *where the zero
+byte lived*, which cannot tell "ADC2 is physically dead" apart from "ADC2 needs some command
+or setting our sequence never sends" — both produce an identical result on that test, because
+in both cases nothing we do makes ADC2 stream. A test that looks like it cleanly separates two
+hypotheses can still be blind to a third one that was never on the list. **Lesson: when every
+internal control agrees on a conclusion, that is exactly the moment an external, independent,
+*working* implementation is worth the trouble of finding — it can rule out failure modes no
+amount of re-testing your own code against its own documentation ever can.** Recorded because
+Ralph said outright he was not convinced and intended to test it independently — that
+skepticism was the thing that actually caught this, not anything in the test suite.
+
+**And the missing command turned out to be sitting in a changelog entry, not a feature
+description, which is why grepping the documents for the obvious keywords never surfaced it.**
+The independent recording proved *that* the command sequence was missing something; it didn't
+say what. Repeated targeted searches of the DP for "Separate", "synchron", "dual-channel"
+found the byte layouts and the phase-synchronisation notes — both real, both already
+implemented correctly — but not the one paragraph that mattered. That paragraph was in the OM,
+not the DP, under "6.2 Version 1.0A," a fix-log entry for a years-old firmware release: channel
+2's diversity magnitude/phase weight sits in the signal path even in Sep mode, and the official
+software sets it to unity (magnitude 1.0, phase 0) when switching there. `rsr200_device.h` had
+`setHardwareDiversity()` since phase 1b — for the separate, later hardware-diversity feature —
+and nothing had ever called it for plain dual-channel Sep mode, because nothing in the DP's
+protocol description said to. Real ADC2 data multiplied by an unset (zero) weight reads as a
+clean, exact zero, indistinguishable from no data at all — which is exactly what every test in
+this section measured, right up until the fix. **Lesson: a keyword search finds what you
+already know to look for. A changelog entry from years before the feature you're debugging can
+contain the one operational detail the current feature description omits, because it was
+written to explain a fix, not to be complete.** When a document is unfamiliar and short enough
+to read in full — this pair was well under 4000 lines of extracted text between them — reading
+linearly beats searching, and it is what finally closed this out. RSR200_PLAN.md §10 has the
+corrected, complete account and the exact fix (`main.cpp`'s `start()`, `RSR200_PLAN.md`'s phase
+4 row). Confirmed live in the real app: both channels alive, phasing and decorrelation nulling
+local signals by more than 30 dB — the payoff `RSR200_PLAN.md` section 7 described at the very
+start of this module's design, working as specified.
+
 ---
 
 ## 5. Design decisions worth remembering
