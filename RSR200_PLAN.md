@@ -632,3 +632,37 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    again with a known rate/decimation combination once the alternate rate-control interface
    from item 2 exists, since that would make the triggering combination reproducible instead
    of an accident of a testing sequence.
+7. **Baseband recordings past ~4 GB come out unreadable — a real, pre-existing core bug,
+   not a reception problem.** A ~16-minute recording at these settings (24-bit, 4-channel
+   dual-IQ, 3.90625 MSp/s post-decimation ⇒ ~62.5 MB/s) grew to 80.9 GB and played back as
+   silence. Root cause, confirmed by hex-dumping the header: the `data` chunk's declared
+   size was a literal `0x00000000`. `core/src/utils/riff.h`'s `ChunkHeader::size` is a plain
+   `uint32_t`, which tops out around 4.29 GB — at this recording's rate that ceiling is hit
+   in about **65 seconds**, so any recording longer than roughly a minute at these settings
+   produces a file whose header can't state its own true size. `wav::Format::FORMAT_RF64`
+   (the standard fix for exactly this, using a 64-bit `ds64` chunk) exists as an enum value
+   in `core/src/utils/wav.h` but is never actually implemented anywhere in `wav.cpp` —
+   `_format` is stored and never read again — and is explicitly commented out in the
+   recorder's UI (`misc_modules/recorder/src/main.cpp:60`, `// Disabled for now`). Not
+   RSR200-specific, but RSR200's realistic recording rates make it trivial to hit where most
+   other sources rarely would. **The actual sample data survives intact** — confirmed by
+   reading real, varying, non-zero content from the start of the file through within 320 KB
+   of the end — only the size field was wrong. Recovered this specific file by patching the
+   RIFF and `data` chunk size fields (offsets 4 and 252) to `0xFFFFFFFF`, the standard
+   "unknown length, read to EOF" convention most tools (ffmpeg, Audacity, SoX) honor; that
+   is a manual per-file workaround, not a fix. A real fix means either implementing RF64
+   properly (the scaffolding is already half there) or having the recorder warn/split files
+   as the 4 GB boundary approaches.
+8. **Baseband recording bandwidth follows software decimation, not the full front-end
+   span — probably explains why this same recording looked like it covered only the empty
+   gap between 19m and 16m.** Confirmed in code: `misc_modules/recorder/src/main.cpp:181`
+   sets the recorder's rate from `sigpath::iqFrontEnd.getSampleRate()`, i.e. the
+   *post*-software-decimation rate, not the undecimated front-end bandwidth the display can
+   show. With 2x software decimation active, the recorder only ever sees half the spectral
+   width around the tuned center frequency that the full front end covers. Tuned between the
+   two broadcast bands, that halved window lands mostly in the gap between them, clipping
+   the very band edges where the signals were. Not corruption — a real, direct consequence
+   of the decimation setting doing what it's designed to do — but it's exactly the confusion
+   items 1-2 already predicted, and worth surfacing explicitly (e.g. in the recording
+   filename or a UI note) so "software decimation" being applied to recordings, not just the
+   display, isn't a surprise discovered after the fact.
