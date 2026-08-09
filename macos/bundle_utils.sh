@@ -29,6 +29,12 @@ bundle_is_not_to_be_installed() {
     if [ "$1" = "AppleFSCompression" ]; then echo 1; fi
     if [ "$1" = "libsdrplay_api.so.3.14" ]; then echo 1; fi
     if [ "$1" = "libsdrplay_api.so.3.15" ]; then echo 1; fi
+    # FTDI's D3XX dylib (rsr200_source) is a prebuilt fat binary with no headerpad room for
+    # install_name_tool to grow its load commands, so relocating it into the bundle fails
+    # outright ("larger updated load commands do not fit"). Same treatment as SDRplay's API
+    # above: leave it referencing the system install at /usr/local/lib, which the driver's
+    # own install instructions already put there and which RSR200 use requires regardless.
+    if [ "$1" = "libftd3xx.dylib" ]; then echo 1; fi
     if [ "$1" = "libxml2.2.dylib" ]; then echo 1; fi
 }
 
