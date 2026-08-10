@@ -172,6 +172,12 @@ private:
                     // not just wrong-sounding. The checkbox is left in place below as a manual
                     // override for files whose header might not be trustworthy.
                     _this->float32Mode = (_this->reader->getCodec() == 3);
+                    // PCM width when not float -- the Recorder's SampleType covers uint8/
+                    // int16/int32 (RSR200's 24-bit mode is padded into int32; there's no
+                    // separate 24-bit container), but worker()/dualWorker() used to assume
+                    // int16 unconditionally, hitting the exact same half-byte-stride bug as
+                    // the float case above for any file that wasn't actually 16-bit PCM.
+                    _this->pcmBits = _this->reader->getBitDepth();
                     _this->configureChannels();
                     std::string filename = std::filesystem::path(_this->fileSelect.path).filename().string();
                     _this->centerFreq = _this->getFrequency(filename);
@@ -229,20 +235,53 @@ private:
         }
 
         ImGui::Checkbox("Float32 Mode##_file_source", &_this->float32Mode);
+        if (_this->reader != NULL) {
+            ImGui::Text("Detected: %d-bit %s", _this->pcmBits, _this->float32Mode ? "float" : "PCM");
+        }
+    }
+
+    // Reads `count` interleaved PCM values (frames * channels) from the reader, converting
+    // whatever raw width the file actually uses into `out`. Centralised so worker() and
+    // dualWorker() can't drift out of sync on which PCM widths they support -- both used to
+    // silently assume 16-bit regardless of what the Recorder's SampleType (and RSR200's
+    // 24-bit-padded-into-32-bit output) actually wrote, misreading the byte stride the same
+    // way the float/int16 confusion this was found alongside did.
+    static void readPCM(FileSourceModule* _this, float* out, int count, std::vector<uint8_t>& rawBuf) {
+        switch (_this->pcmBits) {
+        case 32: {
+            rawBuf.resize((size_t)count * sizeof(int32_t));
+            _this->reader->readSamples(rawBuf.data(), rawBuf.size());
+            volk_32i_s32f_convert_32f(out, (const int32_t*)rawBuf.data(), 2147483647.0f, count);
+            break;
+        }
+        case 8: {
+            rawBuf.resize((size_t)count * sizeof(uint8_t));
+            _this->reader->readSamples(rawBuf.data(), rawBuf.size());
+            // Volk has no unsigned-int conversion kernel (wav.cpp's writer notes the same
+            // gap) -- exact inverse of the writer's (samples[i] * 127.0f) + 128.0f.
+            for (int i = 0; i < count; i++) { out[i] = ((float)rawBuf[i] - 128.0f) / 127.0f; }
+            break;
+        }
+        default: {   // 16-bit, and the fallback for any width we don't otherwise recognise
+            rawBuf.resize((size_t)count * sizeof(int16_t));
+            _this->reader->readSamples(rawBuf.data(), rawBuf.size());
+            volk_16i_s32f_convert_32f(out, (const int16_t*)rawBuf.data(), 32768.0f, count);
+            break;
+        }
+        }
     }
 
     static void worker(void* ctx) {
         FileSourceModule* _this = (FileSourceModule*)ctx;
         double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
         int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
-        int16_t* inBuf = new int16_t[blockSize * 2];
+        std::vector<uint8_t> rawBuf;
 
         while (true) {
             if (_this->seekPending.exchange(false)) {
                 _this->reader->seekToFraction(_this->seekFraction.load());
             }
-            _this->reader->readSamples(inBuf, blockSize * 2 * sizeof(int16_t));
-            volk_16i_s32f_convert_32f((float*)_this->stream.writeBuf, inBuf, 32768.0f, blockSize * 2);
+            readPCM(_this, (float*)_this->stream.writeBuf, blockSize * 2, rawBuf);
             uint64_t dataSize = _this->reader->getDataSize();
             if (dataSize > 0) {
                 size_t byteOff = _this->reader->getCurrentByteOffset();
@@ -251,8 +290,6 @@ private:
             }
             if (!_this->stream.swap(blockSize)) { break; };
         }
-
-        delete[] inBuf;
     }
 
     // Four WAV channels are two complex channels interleaved as I1 Q1 I2 Q2. Split them
@@ -262,7 +299,7 @@ private:
         FileSourceModule* _this = (FileSourceModule*)ctx;
         double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
         int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
-        std::vector<int16_t> inBuf(blockSize * 4);
+        std::vector<uint8_t> rawBuf;
         std::vector<float> fBuf(blockSize * 4);
 
         while (true) {
@@ -274,8 +311,7 @@ private:
                 _this->reader->readSamples(fBuf.data(), blockSize * 4 * sizeof(float));
             }
             else {
-                _this->reader->readSamples(inBuf.data(), blockSize * 4 * sizeof(int16_t));
-                volk_16i_s32f_convert_32f(fBuf.data(), inBuf.data(), 32768.0f, blockSize * 4);
+                readPCM(_this, fBuf.data(), blockSize * 4, rawBuf);
             }
 
             for (int i = 0; i < blockSize; i++) {
@@ -379,6 +415,9 @@ private:
     double centerFreq = 100000000;
 
     bool float32Mode = false;
+    int pcmBits = 16;   // 8, 16, or 32 -- which raw PCM width worker()/dualWorker() read
+                        // when float32Mode is false. Auto-detected from the file's own
+                        // bitDepth field on load; see menuHandler().
 };
 
 MOD_EXPORT void _INIT_() {
