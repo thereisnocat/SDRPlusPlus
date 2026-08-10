@@ -65,6 +65,14 @@ namespace wav {
         void setFormat(Format format);
         void setSampleType(SampleType type);
 
+        // Overwrites len bytes at offsetInChunk within a chunk previously added via
+        // addChunk(), identified by its id -- e.g. correcting a recording's real stop time
+        // in an "auxi" chunk once it's actually known, which is after the chunk had to be
+        // queued (addChunk() must run before open()). No-op if no chunk with that id was
+        // added, or the file isn't open. Like the RIFF/data chunk sizes this mirrors, only
+        // meaningful before close() -- there is nothing left open to seek within afterward.
+        void patchChunk(const char id[4], size_t offsetInChunk, const void* data, size_t len);
+
         size_t getSamplesWritten() { return samplesWritten; }
 
         void write(float* samples, int count);
@@ -81,6 +89,9 @@ namespace wav {
         size_t bytesPerSamp;
 
         std::vector<std::pair<std::array<char, 4>, std::vector<uint8_t>>> extraChunks;
+        // Where each added chunk's payload landed once open() actually wrote it, for
+        // patchChunk() to seek back into. Empty (and patchChunk() a no-op) until open().
+        std::vector<std::pair<std::array<char, 4>, std::streampos>> extraChunkPositions;
 
         uint8_t* bufU8 = NULL;
         int16_t* bufI16 = NULL;

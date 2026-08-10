@@ -198,6 +198,20 @@ namespace riff {
         chunks.top().realSize += len;
     }
 
+    std::streampos Writer::tellp() {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        return file.tellp();
+    }
+
+    void Writer::patchAt(std::streampos pos, const void* data, size_t len) {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        if (!file.is_open()) { return; }
+        auto cur = file.tellp();
+        file.seekp(pos);
+        file.write((const char*)data, len);
+        file.seekp(cur);
+    }
+
     void Writer::beginRIFF(const char form[4]) {
         std::lock_guard<std::recursive_mutex> lck(mtx);
 

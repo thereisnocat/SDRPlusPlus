@@ -4,6 +4,7 @@
 #include <dsp/buffer/buffer.h>
 #include <dsp/stream.h>
 #include <map>
+#include <cstring>
 
 namespace wav {
     const char* WAVE_FILE_TYPE          = "WAVE";
@@ -40,6 +41,7 @@ namespace wav {
 
         // Reset work values
         samplesWritten = 0;
+        extraChunkPositions.clear();
 
         // Fill header
         bytesPerSamp = (SAMP_BITS[_type] / 8) * _channels;
@@ -84,6 +86,7 @@ namespace wav {
         // Any extra metadata chunks, which have to land between "fmt " and "data"
         for (auto& [id, data] : extraChunks) {
             rw.beginChunk(id.data());
+            extraChunkPositions.push_back({ id, rw.tellp() });
             if (!data.empty()) { rw.write(data.data(), data.size()); }
             rw.endChunk();
         }
@@ -126,6 +129,17 @@ namespace wav {
         if (bufI32) {
             dsp::buffer::free(bufI32);
             bufI32 = NULL;
+        }
+    }
+
+    void Writer::patchChunk(const char id[4], size_t offsetInChunk, const void* data, size_t len) {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        if (!rw.isOpen()) { return; }
+        for (auto& [cid, pos] : extraChunkPositions) {
+            if (memcmp(cid.data(), id, 4) == 0) {
+                rw.patchAt(pos + (std::streamoff)offsetInChunk, data, len);
+                return;
+            }
         }
     }
 

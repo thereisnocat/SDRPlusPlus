@@ -21,6 +21,7 @@
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <cstddef>
 
 static int failures = 0;
 
@@ -78,7 +79,7 @@ int main() {
         w.setSampleType(wav::SAMP_TYPE_FLOAT32);
         w.setSamplerate((uint64_t)sampleRate);
 
-        const std::time_t t0 = 1761763200;   // 2025-10-29 16:00:00 UTC
+        const std::time_t t0 = 1761763200;   // 2025-10-29 18:40:00 UTC
         wavmeta::AuxiChunk auxi = wavmeta::makeAuxi(centerFreq, sampleRate, t0, t0 + 42);
         w.addChunk("auxi", &auxi, sizeof(auxi));
 
@@ -187,6 +188,52 @@ int main() {
         printf("        peak |A| %.3f, peak |B| %.3f\n", peakA, peakB);
         check(std::abs(peakA - 0.5) < 1e-4 && std::abs(peakB - 0.25) < 1e-4,
               "channels land in the right slots, not swapped");
+    }
+
+    printf("\nauxi's real stop time can be patched in after the fact\n");
+    {
+        // Mirrors how the recorder actually has to use this: addChunk() runs before the
+        // real stop time is knowable at all (recording hasn't happened yet), so start()
+        // writes a placeholder -- here, deliberately equal to startTime, the same
+        // placeholder the recorder used to leave in forever -- and stop() is meant to
+        // patch in the real value once it's known, before close().
+        const std::string p3 = "/tmp/sdrpp_auxi_patch_test.wav";
+        const std::time_t t0 = 1761763200;         // 2025-10-29 18:40:00 UTC
+        const std::time_t realStop = t0 + 137;      // the value patchChunk() should produce
+
+        wav::Writer w;
+        w.setChannels(2);
+        w.setSampleType(wav::SAMP_TYPE_FLOAT32);
+        w.setSamplerate(48000);
+        wavmeta::AuxiChunk placeholder = wavmeta::makeAuxi(1000000.0, 48000.0, t0, t0);
+        w.addChunk("auxi", &placeholder, sizeof(placeholder));
+        check(w.open(p3), "file opens");
+
+        std::vector<float> buf(64 * 2, 0.1f);
+        w.write(buf.data(), 64);
+
+        wavmeta::SystemTime realStopSt = wavmeta::toSystemTime(realStop);
+        w.patchChunk("auxi", offsetof(wavmeta::AuxiChunk, stopTime), &realStopSt, sizeof(realStopSt));
+        w.close();
+
+        size_t off3 = 0;
+        uint32_t sz3 = 0;
+        auto c3 = readChunks(p3, &off3, &sz3);
+        check(c3.count("auxi") == 1, "auxi chunk present");
+        wavmeta::AuxiChunk got;
+        memcpy(&got, c3["auxi"].data(), sizeof(got));
+        // Compared against a fresh toSystemTime(t0) rather than a hardcoded guess at what
+        // t0 "should" be -- self-consistent regardless of what wall-clock time t0 actually
+        // is. (It turned out not to be the round 16:00:00 the dual-channel test's own
+        // comment originally claimed -- fixed above once checked with `date -u -r`.)
+        wavmeta::SystemTime expectedStart = wavmeta::toSystemTime(t0);
+        check(memcmp(&got.startTime, &expectedStart, sizeof(wavmeta::SystemTime)) == 0,
+              "startTime untouched by the patch");
+        check(got.stopTime.second == realStopSt.second && got.stopTime.minute == realStopSt.minute,
+              "stopTime shows the patched value, not the placeholder");
+        check(memcmp(&got.startTime, &got.stopTime, sizeof(wavmeta::SystemTime)) != 0,
+              "start and stop no longer read as the same instant");
+        remove(p3.c_str());
     }
 
     printf("\nA plain 2-channel recording is unaffected\n");

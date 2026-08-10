@@ -58,6 +58,19 @@ namespace riff {
 
         void write(const uint8_t* data, size_t len);
 
+        // The file position immediately after the header of whichever chunk is currently
+        // open -- i.e. where that chunk's payload starts. Meant to be called right after
+        // beginChunk(), so a caller can remember where a specific chunk's content landed
+        // and patch part of it later with patchAt(), the same way endChunk() already
+        // patches sizes after the fact.
+        std::streampos tellp();
+
+        // Overwrites len bytes at an already-written file position, then returns to wherever
+        // writing left off -- the same seek-back-and-restore pattern endChunk() already uses
+        // for chunk sizes, generalised to arbitrary content. Only meaningful before close();
+        // once the file is closed there is nothing open left to seek within.
+        void patchAt(std::streampos pos, const void* data, size_t len);
+
         // WAV-specific info riff::Writer has no way to derive on its own (it doesn't know
         // what a "sample" is, only bytes) but needs for the ds64 chunk's sampleCount field
         // if the file ends up needing RF64. Safe to call any time before close(); the value

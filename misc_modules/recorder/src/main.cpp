@@ -9,6 +9,7 @@
 #include <dsp/convert/stereo_to_mono.h>
 #include <thread>
 #include <ctime>
+#include <cstddef>
 #include <gui/gui.h>
 #include <filesystem>
 #include <signal_path/signal_path.h>
@@ -307,9 +308,19 @@ public:
             delete basebandStream;
         }
 
+        // Patch auxi's real stop time now that it's actually known -- start() had to write
+        // a placeholder (equal to startTime) since addChunk() runs before the recording
+        // that determines the real one has even happened. Must run before writer.close():
+        // patchChunk(), like the RIFF/data sizes it mirrors, only works while the file is
+        // still open to seek within.
+        if (recMode == RECORDER_MODE_BASEBAND) {
+            wavmeta::SystemTime stop = wavmeta::toSystemTime(std::time(NULL));
+            writer.patchChunk("auxi", offsetof(wavmeta::AuxiChunk, stopTime), &stop, sizeof(stop));
+        }
+
         // Close file
         writer.close();
-        
+
         recording = false;
     }
 
