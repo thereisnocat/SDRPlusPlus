@@ -59,10 +59,18 @@ public:
         // Define option lists
         containers.define("WAV", wav::FORMAT_WAV);
         // containers.define("RF64", wav::FORMAT_RF64); // Disabled for now
+        // Order and labels are deliberate, not just alphabetical -- see
+        // RECORDING_REFACTOR_PLAN.md section 3.4. Float32 is listed as the step up from
+        // Int16 (it's the interoperable choice for anything needing more than 16-bit
+        // precision -- SDR Console's own documented format is int16 or float32 only), with
+        // Int32 last and labeled with its interop gap so it isn't the obvious reach for
+        // "I want more precision" the way it was when RSR200's 24-bit mode first hit this.
+        // Defined by key (the enum value, not list position), so reordering here doesn't
+        // disturb anyone's already-saved sampleType preference.
         sampleTypes.define(wav::SAMP_TYPE_UINT8, "Uint8", wav::SAMP_TYPE_UINT8);
         sampleTypes.define(wav::SAMP_TYPE_INT16, "Int16", wav::SAMP_TYPE_INT16);
-        sampleTypes.define(wav::SAMP_TYPE_INT32, "Int32", wav::SAMP_TYPE_INT32);
-        sampleTypes.define(wav::SAMP_TYPE_FLOAT32, "Float32", wav::SAMP_TYPE_FLOAT32);
+        sampleTypes.define(wav::SAMP_TYPE_FLOAT32, "Float32 (recommended for >16-bit)", wav::SAMP_TYPE_FLOAT32);
+        sampleTypes.define(wav::SAMP_TYPE_INT32, "Int32 (not read by all tools, e.g. SDR Console)", wav::SAMP_TYPE_INT32);
 
         // Load default config for option lists
         timezoneId = timezones.valueId(TIME_ZONE_LOCAL);
@@ -426,6 +434,15 @@ private:
             config.acquire();
             config.conf[_this->name]["sampleType"] = _this->sampleTypes.key(_this->sampleTypeId);
             config.release(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Int16 is enough for any source whose real ADC resolution is 16 bits or\n"
+                "less (which covers everything here except RSR200's 24-bit mode). For a\n"
+                "source that genuinely exceeds 16 bits, use Float32, not Int32 -- Int32\n"
+                "isn't one of the sample formats every third-party tool reads (SDR Console's\n"
+                "own documented format, for instance, is int16 or float32 only)."
+            );
         }
 
         // Dual channel capture, offered only when the selected source actually has
