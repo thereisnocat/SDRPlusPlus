@@ -76,6 +76,13 @@ public:
         return fmt.bitDepth;
     }
 
+    // 1 = WAVE_FORMAT_PCM, 3 = WAVE_FORMAT_IEEE_FLOAT -- see wav.h's own Codec enum, which
+    // the writer populates from the same values. Lets a reader tell PCM and float samples
+    // apart from the file itself instead of requiring the user to know and set it by hand.
+    uint16_t getCodec() {
+        return fmt.codec;
+    }
+
     uint16_t getChannelCount() {
         return fmt.channelCount;
     }

@@ -162,6 +162,16 @@ private:
                     }
                     _this->sampleRate = _this->reader->getSampleRate();
                     core::setInputSampleRate(_this->sampleRate);
+                    // Trust the file's own fmt chunk over whatever the checkbox last said --
+                    // codec 3 is WAVE_FORMAT_IEEE_FLOAT. Previously this was a manual-only
+                    // toggle nothing set on load, so a float32 recording (e.g. the Recorder's
+                    // 32-bit sample type) opened with it left at its default (false, i.e.
+                    // int16) was read at half the correct byte stride: readSamples() pulled
+                    // half as many true bytes per block as the data actually needs, so the
+                    // file took roughly twice as long to play through -- audibly "half speed",
+                    // not just wrong-sounding. The checkbox is left in place below as a manual
+                    // override for files whose header might not be trustworthy.
+                    _this->float32Mode = (_this->reader->getCodec() == 3);
                     _this->configureChannels();
                     std::string filename = std::filesystem::path(_this->fileSelect.path).filename().string();
                     _this->centerFreq = _this->getFrequency(filename);
