@@ -19,6 +19,15 @@ namespace wav {
     };
     #pragma pack(pop)
 
+    // FORMAT_WAV (the default) always writes a completely ordinary RIFF/WAVE file, and
+    // upgrades it to RF64 automatically -- and only -- if the recording actually grows past
+    // what a 32-bit chunk size can hold. Small recordings never pay any RF64 cost or
+    // carry any RF64-specific bytes beyond one harmless, spec-legal "JUNK" placeholder
+    // chunk any RIFF reader already knows to skip. See RECORDING_REFACTOR_PLAN.md section
+    // 3.1 for the exact mechanism (riff::Writer's ds64 placeholder-then-backpatch).
+    // FORMAT_RF64 forces the RF64 header from the very first byte regardless of actual
+    // size -- not needed for normal recording, but useful for testing the RF64 path
+    // without needing to actually generate a multi-gigabyte file.
     enum Format {
         FORMAT_WAV,
         FORMAT_RF64

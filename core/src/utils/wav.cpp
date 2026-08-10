@@ -71,6 +71,11 @@ namespace wav {
         // Open file
         if (!rw.open(path, WAVE_FILE_TYPE)) { return false; }
 
+        // FORMAT_RF64 forces the RF64 header unconditionally; FORMAT_WAV (the default)
+        // leaves riff::Writer to upgrade automatically, and only, if the recording actually
+        // needs it -- see wav.h's Format doc comment.
+        if (_format == FORMAT_RF64) { rw.forceRF64(); }
+
         // Write format chunk
         rw.beginChunk(FORMAT_MARKER);
         rw.write((uint8_t*)&hdr, sizeof(FormatHeader));
@@ -98,6 +103,10 @@ namespace wav {
         std::lock_guard<std::recursive_mutex> lck(mtx);
         // Do nothing if the file is not open
         if (!rw.isOpen()) { return; }
+
+        // ds64's sampleCount field, if this ends up needing RF64 -- samplesWritten is
+        // already tracked in frames, the same unit ds64 wants.
+        rw.setDs64SampleCount((uint64_t)samplesWritten);
 
         // Finish data chunk
         rw.endChunk();
