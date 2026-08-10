@@ -700,3 +700,45 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    independent of sample format), and the embedded phasing metadata chunk (byte-identical
    between the two recordings compared). Convergence time was also ruled out directly by the
    reporter (played continuously from the start, null was stable after settling).
+
+## 13. Recording needs a sweeping fix, not more per-file patches
+
+Logged as open rather than fixed — explicitly not started. Every recording-related problem
+found in this session (2026-08-09) got its own one-off patch: hand-editing a broken header's
+size fields, hand-diagnosing which byte width a given file actually used, hand-adding pacing
+after the fact. That doesn't scale to "every time a recording is made" and isn't meant to —
+each fix was the right call for the specific file or bug at the time, but the pattern across
+all of them is the actual signal: the recording subsystem (`core/src/utils/riff.{h,cpp}`,
+`wav.{h,cpp}`, `misc_modules/recorder/`, `source_modules/file_source/`) needs one coherent
+pass, not more individual patches as each new symptom turns up. What that pass should cover,
+gathered from everything found so far rather than re-derived from scratch next time:
+
+- **The 4 GB ceiling (item 7).** `riff::ChunkHeader::size` is `uint32_t`; RSR200 recording
+  rates blow through it in about a minute. `wav::Format::FORMAT_RF64` is a stub — the enum
+  exists, `_format` is stored, and nothing in `wav.cpp` ever reads it back. Real fix is
+  either implementing RF64 properly (`ds64` chunk, per the spec, not the placeholder that's
+  there now) or having the recorder split/warn as the boundary approaches. Recovering an
+  already-broken file by hand (`0xFFFFFFFF` size fields) is a workaround, not this fix.
+- **Recorded bandwidth silently tracks software decimation (item 8).** Correct given how the
+  signal path is wired, but surprising and undocumented — worth surfacing in the UI or the
+  filename rather than only in this document.
+- **`file_source` had no real-time pacing (item 9, now fixed) and no bit-depth
+  auto-detection (also now fixed) until this session** — both were silent, `file_source`
+  would just play back wrong or slow with no error. Both are done, but they were only found
+  because specific files broke in specific ways; nothing structural stops the next gap in
+  the same family from being found the same way, one broken recording at a time.
+- **The `auxi` chunk's `stopTime` is never actually set.** `misc_modules/recorder/src/main.cpp`
+  calls `wavmeta::makeAuxi(freq, samplerate, now, now)` at `start()` — both `startTime` and
+  `stopTime` get the same value, and nothing patches `stopTime` when recording actually
+  stops, the way the RIFF/data chunk sizes correctly do get patched on close. Any tool that
+  trusts this chunk's stop time (this project's own cross-checks during this session
+  included) gets a lie by omission, not an error.
+- **No end-to-end test coverage for the record → playback round trip.** Every bug in this
+  section was found by a human noticing a recording sounded or looked wrong, then a human
+  and Claude tracing it by hand. `core/test/` has no test that writes a WAV with `wav::Writer`
+  across all four `SampleType`s and multiple channel counts, reads it back with `WavReader`,
+  and asserts the samples round-trip exactly — the kind of test that would have caught the
+  int32/uint8 gap and the float32 default before a real recording ever hit it.
+
+Not scoped further than this list — the point of this section is to make the next real pass
+start from a complete picture instead of the next single symptom.
