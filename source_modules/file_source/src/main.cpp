@@ -15,6 +15,8 @@
 #include <atomic>
 #include <stdexcept>
 #include <ctime>
+#include <chrono>
+#include <thread>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -271,15 +273,39 @@ private:
         }
     }
 
+    // Paces a worker loop to real time, exactly as phasing_test_source's generator already
+    // does (see its own worker() for the original). Without this, a file source has no
+    // reason at all to run at anything resembling the recording's real rate -- swap() only
+    // blocks on downstream backpressure, so the loop delivers blocks in whatever bursty,
+    // CPU-scheduling-dependent pattern backpressure happens to allow, rather than the even,
+    // predictably-paced cadence live hardware (or phasing_test_source's own synthetic
+    // generator) naturally provides. That mattered in practice, not just in theory: a real
+    // dual-channel RSR200 recording nulled 20+ dB shallower on playback than the same
+    // antennas nulled live, with reference band and gain settings confirmed identical
+    // between the two -- decorrelation's adaptive solve is sensitive to how evenly-spaced
+    // the blocks feeding it are, and unpaced playback wasn't delivering that. Resets to
+    // `now` after a seek, since the old schedule no longer means anything relative to the
+    // new position -- without that, a seek would either sleep out a long stale interval or
+    // spend a while blasting through blocks trying to "catch up" to a schedule that was
+    // never real to begin with.
+    static void paceToRealTime(std::chrono::steady_clock::time_point& nextBlock, int blockSize, double sampleRate) {
+        nextBlock += std::chrono::nanoseconds((int64_t)(1e9 * (double)blockSize / sampleRate));
+        const auto now = std::chrono::steady_clock::now();
+        if (nextBlock < now) { nextBlock = now; }
+        std::this_thread::sleep_until(nextBlock);
+    }
+
     static void worker(void* ctx) {
         FileSourceModule* _this = (FileSourceModule*)ctx;
         double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
         int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
         std::vector<uint8_t> rawBuf;
+        auto nextBlock = std::chrono::steady_clock::now();
 
         while (true) {
             if (_this->seekPending.exchange(false)) {
                 _this->reader->seekToFraction(_this->seekFraction.load());
+                nextBlock = std::chrono::steady_clock::now();
             }
             readPCM(_this, (float*)_this->stream.writeBuf, blockSize * 2, rawBuf);
             uint64_t dataSize = _this->reader->getDataSize();
@@ -289,6 +315,7 @@ private:
                 gui::playbackBar.currentTimeSec = (float)byteOff / (float)_this->reader->getBytesPerSecond();
             }
             if (!_this->stream.swap(blockSize)) { break; };
+            paceToRealTime(nextBlock, blockSize, sampleRate);
         }
     }
 
@@ -301,10 +328,12 @@ private:
         int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
         std::vector<uint8_t> rawBuf;
         std::vector<float> fBuf(blockSize * 4);
+        auto nextBlock = std::chrono::steady_clock::now();
 
         while (true) {
             if (_this->seekPending.exchange(false)) {
                 _this->reader->seekToFraction(_this->seekFraction.load());
+                nextBlock = std::chrono::steady_clock::now();
             }
 
             if (_this->float32Mode) {
@@ -329,6 +358,7 @@ private:
             // Swapped in the order the phaser reads them.
             if (!_this->streamA.swap(blockSize)) { break; }
             if (!_this->streamB.swap(blockSize)) { break; }
+            paceToRealTime(nextBlock, blockSize, sampleRate);
         }
     }
 
@@ -337,10 +367,12 @@ private:
         double sampleRate = std::max(_this->reader->getSampleRate(), (uint32_t)1);
         int blockSize = std::min((int)(sampleRate / 200.0f), (int)STREAM_BUFFER_SIZE);
         dsp::complex_t* inBuf = new dsp::complex_t[blockSize];
+        auto nextBlock = std::chrono::steady_clock::now();
 
         while (true) {
             if (_this->seekPending.exchange(false)) {
                 _this->reader->seekToFraction(_this->seekFraction.load());
+                nextBlock = std::chrono::steady_clock::now();
             }
             _this->reader->readSamples(_this->stream.writeBuf, blockSize * sizeof(dsp::complex_t));
             uint64_t dataSize = _this->reader->getDataSize();
@@ -350,6 +382,7 @@ private:
                 gui::playbackBar.currentTimeSec = (float)byteOff / (float)_this->reader->getBytesPerSecond();
             }
             if (!_this->stream.swap(blockSize)) { break; };
+            paceToRealTime(nextBlock, blockSize, sampleRate);
         }
 
         delete[] inBuf;
