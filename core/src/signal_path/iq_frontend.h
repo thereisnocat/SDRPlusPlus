@@ -40,7 +40,10 @@ public:
     // Reference-counted for the same reason SourceManager::lockTuning() is: the Recorder
     // module allows unlimited simultaneous instances, so one recording stopping must not
     // unlock decimation out from under a second one still running.
-    void lockDecimation(bool locked) { decimationLockCount = std::max(0, decimationLockCount + (locked ? 1 : -1)); }
+    // Parenthesised (std::max) -- windows.h's max() macro turns an unparenthesised
+    // std::max(...) in a header into error C2589 on MSVC. Same trap as bare M_PI; see
+    // ENGINEERING_NOTES.md / project memory for the others this has already caught.
+    void lockDecimation(bool locked) { decimationLockCount = (std::max)(0, decimationLockCount + (locked ? 1 : -1)); }
     bool isDecimationLocked() const { return decimationLockCount > 0; }
 
     void bindIQStream(dsp::stream<dsp::complex_t>* stream);

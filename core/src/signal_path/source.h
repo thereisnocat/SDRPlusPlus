@@ -66,7 +66,10 @@ public:
     // one that's still running. lockTuning(true)/lockTuning(false) is still call/release in
     // pairs from each caller's point of view -- only the internal representation cares that
     // more than one caller might hold it at once.
-    void lockTuning(bool locked) { tuningLockCount = std::max(0, tuningLockCount + (locked ? 1 : -1)); }
+    // Parenthesised (std::max) -- windows.h's max() macro turns an unparenthesised
+    // std::max(...) in a header into error C2589 on MSVC. Same trap as bare M_PI; see
+    // ENGINEERING_NOTES.md / project memory for the others this has already caught.
+    void lockTuning(bool locked) { tuningLockCount = (std::max)(0, tuningLockCount + (locked ? 1 : -1)); }
     bool isTuningLocked() const { return tuningLockCount > 0; }
 
     std::vector<std::string> getSourceNames();
