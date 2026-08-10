@@ -54,6 +54,13 @@ cp 'C:/Program Files/RFNM/bin/fmt.dll' sdrpp_windows_x64/
 
 cp $build_dir/source_modules/rfspace_source/Release/rfspace_source.dll sdrpp_windows_x64/modules/
 
+# RSR200: only present once OPT_BUILD_RSR200_SOURCE is actually on and the FTD3XX SDK step
+# in build_all.yml is filled in (see that file's TODO). DLL name/path assumed to match the
+# FTD3XXWU import lib's own naming convention -- not yet verified against the real SDK
+# layout, since the download itself is still a placeholder; check both once that lands.
+cp $build_dir/source_modules/rsr200_source/Release/rsr200_source.dll sdrpp_windows_x64/modules/ -ErrorAction SilentlyContinue
+cp 'C:/Program Files/FTD3XX/lib/FTD3XXWU.dll' sdrpp_windows_x64/ -ErrorAction SilentlyContinue
+
 cp $build_dir/source_modules/rtl_sdr_source/Release/rtl_sdr_source.dll sdrpp_windows_x64/modules/
 cp 'C:/Program Files/PothosSDR/bin/rtlsdr.dll' sdrpp_windows_x64/
 
