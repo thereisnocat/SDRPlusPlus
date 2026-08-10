@@ -1,8 +1,18 @@
 # Recording subsystem refactor plan
 
-Not started. This is a plan, not a change — see [RSR200_PLAN.md](RSR200_PLAN.md) section 13
+**Done, 2026-08-10 — all seven phases landed and the acceptance test (phase 6) passed.**
+Originally written as a plan, not a change — see [RSR200_PLAN.md](RSR200_PLAN.md) section 13
 for how this got scoped: a string of one-off patches to broken recordings in one session
-made clear the pattern needed one coherent pass, not more individual fixes.
+made clear the pattern needed one coherent pass, not more individual fixes. Left as a
+historical record of the reasoning and research rather than rewritten into a pure changelog.
+
+Final result against the three goals below: **goals 1 and 3 fully met**, verified against
+real, independent, third-party software rather than this project's own tests alone. **Goal
+2 met for WavViewDX** (the primary target, explicitly) — cross-platform (Mac and Windows),
+correct frequency, phasing/decorrelation intact through the record-and-replay round trip.
+**Goal 2 not met for SDR Console**, but not because of anything this project controls: SDR
+Console does not support dual-channel/multi-tuner recordings as a format at all, regardless
+of encoding — see phase 6.
 
 ## 1. Goals, in the order Ralph gave them
 
@@ -212,8 +222,60 @@ software decimation, as it does today.
 | **3** ✅ | **Done, 2026-08-09.** Fix `auxi`'s `stopTime` — patch it at `close()` the same way RIFF/data sizes already are. Generalized rather than special-cased: `riff::Writer` gained `tellp()`/`patchAt()`, `wav::Writer` built `patchChunk(id, offset, data, len)` on top, and the recorder's `stop()` now patches the real stop time in before `close()`. Verified with a new round-trip test mirroring exactly how the recorder uses it; full suite 13/13. | None — independent, small, can land anytime. |
 | ~~**4**~~ | ~~Move dual-channel baseband recording upstream of software decimation.~~ **Rejected 2026-08-09** — see section 4 above. Hardware and software decimation together are how a wide range of sample rates becomes reachable at all; recording after software decimation is the right behavior, not a fidelity compromise. No tap-point change planned. | — |
 | **5** ✅ (narrowed 2026-08-09, see 3.4) | **Done, 2026-08-09.** ~~Default the dual-channel recorder's sample type to `FLOAT32` globally.~~ Section 3.4 found the global default (`INT16`) is already correct and already interoperable for every other dual-stream source in this codebase (FobosSDR, RSPduo) — changing it for everyone would cost them file size for no benefit and fix nothing they have. Narrowed to a UI-only fix: dropdown reordered (Float32 now reads as the step up from Int16, Int32 moved last), Int32 relabeled to name its interop gap directly, and a tooltip explains when Int16 is already enough versus when to reach for Float32. Global default stays `INT16`. Verified reordering doesn't disturb existing saved preferences (`OptionList` stores/loads by enum value, not list position); full suite 13/13. | Phase 2 |
-| **6** | **Verify against real WavViewDX and real SDR Console** — both confirmed available. Record a real dual-channel RSR200 session past 4 GB, open it in each tool unmodified (no Linrad conversion step), confirm center frequency, channel count/order, and sample data all come through correctly. This is the actual acceptance test for goals 1 and 2 — nothing above is "done" until this passes, only "implemented." | Phases 1, 5 |
-| **7** (conditional on phase 6's result) | If phase 6 shows WavViewDX reading the native RF64 file directly and correctly: update `tools/wav2linrad.cpp` to at least not be silently wrong (currently `Int16`-only and inherits the pre-RF64 32-bit size read) — either fix it to match the current format properly, or mark it clearly as legacy/optional now that direct RF64 import works. If phase 6 shows it does *not* read the native file correctly: `wav2linrad.cpp` becomes load-bearing rather than optional, and fixing its gaps moves from "nice to have" to required. | Phase 6 |
+| **6** ✅ | **Done, 2026-08-10 — passed for WavViewDX, and SDR Console's dual-channel result turned out to be a tool limitation, not a defect in this format.** See 6.1 below for the full account, including a false alarm that briefly looked like a real RF64 bug and wasn't. | Phases 1, 5 |
+| **7** ✅ | **Done, 2026-08-10.** Phase 6 showed WavViewDX reading the native RF64 file directly and correctly (no Linrad conversion needed) — the condition under which this phase's plan said to mark `tools/wav2linrad.cpp` legacy/optional rather than fix it further. Doing that: it remains available for Linrad/older-WavViewDX-version compatibility if ever needed, but is no longer the load-bearing interop path this project depends on — direct RF64 import is. Its known gaps (`Int16`-only, inherits the pre-RF64 32-bit size read) are not being fixed as part of this refactor; note them if anyone reaches for it again. | Phase 6 |
+
+### 6.1 Phase 6 in full: what passed, a false alarm, and two real bugs found along the way
+
+**Dual-channel: passed.** Real dual-channel RSR200 recording, past 4 GB, opened unmodified
+(no Linrad conversion) in both tools. **WavViewDX: full pass** — read correctly on both Mac
+and Windows, center frequency accurate, phasing/decorrelation still functional against the
+recovered channels. That's the actual acceptance test for goals 1-3 passing, independently,
+on a third-party tool this project doesn't control. **SDR Console: does not open the file**
+— not a format compliance failure but because SDR Console does not support dual-channel/
+multi-tuner recordings *as a format* at all, regardless of encoding. Nothing in this
+project's control fixes that.
+
+**Single-channel: also tested, with a detour.** A small (<4 GB) single-channel recording
+opened correctly in SDR Console — right frequency, stations where they should be. A larger
+single-channel recording that should have exercised the RF64 path showed 0:00 duration and
+played nothing in SDR Console. That looked, briefly, like a real RF64 bug — until checking
+the file directly showed its header was still exactly as `open()` had left it: outer magic
+still `RIFF`, the `ds64` placeholder still an untouched `JUNK` chunk, `auxi`'s `stopTime`
+identical to `startTime`. **`close()` had never run at all.** Reproduced on demand with a
+synthetic Phasing Test Source recording (no RSR200/USB involved) through the real Recorder
+UI, which settled it: the cause was clicking **Stop on the source, not on the Recorder's own
+Stop control** — stopping the source silently starves the recording of new data without
+ever telling the writer to finalize, so the header stays frozen at whatever `open()` left it.
+**Not a bug in `riff::Writer`/`wav::Writer`** — separately confirmed by writing genuine
+multi-GB data through the *unforced* natural-overflow path in isolation, which produced a
+correct, valid RF64 file every time. The original file was recovered by hand afterward
+(a full `ds64` chunk constructed from the file's own true size, not just the earlier
+sentinel-only patch) and re-verified reading correctly through `WavReader`. **Its SDR
+Console result should be considered untested, not failed** — the file being tested was never
+actually valid RF64 at the time; a real single-channel RF64-vs-SDR-Console test is still
+open.
+
+**Two real bugs found by hitting this, unrelated to anything Phase 1-5 touched:**
+
+1. **Stopping a source while a recording is open never finalizes the recording**, and
+   nothing warns that this is about to happen. The Recorder currently has no hook into
+   source stop/start events at all. Matches what Ralph had already independently hit once
+   before this testing session, on a different (discarded) recording, where restarting the
+   radio "should have" stopped the recording and didn't.
+2. **Software decimation and center frequency can be changed while a recording is actively
+   in progress**, and shouldn't be — changing decimation mid-recording would write samples
+   at a new rate into a file whose header already declared the old one (the same class of
+   rate-mismatch corruption this whole refactor exists to fix, just from a different cause);
+   changing center frequency mid-recording invalidates `auxi`'s `centerFreq`. Worth checking
+   whether the disabling this file already does for other controls while recording
+   (`misc_modules/recorder/src/main.cpp`, the `style::beginDisabled()`/`endDisabled()` pair
+   around the settings block) already covers these two and just isn't reaching them, or
+   whether the lock needs to extend further up into the source/decimation controls
+   themselves.
+
+Neither bug is fixed yet — logged here rather than guessed at further; both are follow-up
+work, not blocking anything already marked done above.
 
 Phase numbers are kept as originally assigned, gaps included, rather than renumbered —
 matches this project's convention elsewhere of keeping corrected reasoning visible instead
@@ -226,5 +288,6 @@ of silently rewriting it away.
   Global default stays `INT16` (already correct for FobosSDR/RSPduo); only the >16-bit case
   (RSR200 today) gets nudged toward `FLOAT32` over `INT32`, and that's a UI-level nudge, not
   a default value change, so existing recordings and other sources are unaffected either way.
-- **Whether to keep the Linrad export path (`tools/wav2linrad.cpp`) as a going concern at
-  all**, resolved by phase 6's actual test result rather than guessed now.
+- ~~Whether to keep the Linrad export path as a going concern~~ — resolved by phase 6's
+  actual result: WavViewDX reads the native RF64 file directly, so `wav2linrad.cpp` is kept
+  but demoted to legacy/optional rather than fixed further, see phase 7.
