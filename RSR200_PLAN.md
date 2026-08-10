@@ -742,3 +742,9 @@ gathered from everything found so far rather than re-derived from scratch next t
 
 Not scoped further than this list — the point of this section is to make the next real pass
 start from a complete picture instead of the next single symptom.
+
+**2026-08-09, later the same day: scoped into a real plan.** See
+[RECORDING_REFACTOR_PLAN.md](RECORDING_REFACTOR_PLAN.md) — RF64 implementation approach
+(researched against WavViewDX and SDR Console's actual documented behavior, not assumed),
+a phased rollout, and the open questions that need a decision before Phase 1 starts. Not
+started; planning only.
