@@ -677,3 +677,26 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    items 1-2 already predicted, and worth surfacing explicitly (e.g. in the recording
    filename or a UI note) so "software decimation" being applied to recordings, not just the
    display, isn't a surprise discovered after the fact.
+9. **`file_source` had no playback pacing at all, and it measurably degraded decorrelation
+   quality on replay versus live.** `worker()`/`dualWorker()`/`floatWorker()` were gated only
+   by `swap()`'s downstream backpressure — nothing paced the loop to the recording's real
+   rate, so blocks were delivered in whatever bursty, CPU-scheduling-dependent pattern
+   backpressure happened to allow, unlike live hardware's naturally even cadence.
+   `phasing_test_source`'s own generator already paces itself to real time for exactly this
+   reason (its own comment: "without this the generator would spin as fast as downstream can
+   consume") — `file_source` never got the same treatment. Measured, not assumed: the same
+   dual-channel recording nulled 8-10 dB on playback against reference band width and gain
+   settings confirmed identical to a live session that nulled 20+ dB; after adding the same
+   real-time pacing pattern (`paceToRealTime()`, committed), the same file improved to
+   12-15 dB. A real, confirmed contributor — but not the whole gap, since 12-15 dB is still
+   short of the ~22-26 dB baseline this method has shown on real air elsewhere in this
+   project (see the WNYC 820 wideband-decorrelation writeup, section 1). **Open**: what
+   accounts for the remaining ~10 dB. Diagnostics already run and ruled out during this
+   investigation, so the next pass doesn't have to re-check them: the reference-band
+   auto-tracking fix from earlier the same day (confirmed via direct logging — only 6
+   legitimate VFO-driven changes across a full session, no reset-storm recurrence), the
+   resampler predecimation overflow from item 6 (no occurrence in the session logs checked),
+   dual-channel interleave order (`I1,Q1,I2,Q2`, identical on the write and read side,
+   independent of sample format), and the embedded phasing metadata chunk (byte-identical
+   between the two recordings compared). Convergence time was also ruled out directly by the
+   reporter (played continuously from the start, null was stable after settling).
