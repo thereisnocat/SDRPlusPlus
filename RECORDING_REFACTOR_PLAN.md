@@ -136,27 +136,33 @@ Sources: [WavViewDX (Arctic DX blog)](http://arcticdx.blogspot.com/2025/02/wavvi
 
 ## 4. Goal 3: accurately reproducing live conditions
 
-Two separate mechanisms, already partly addressed, partly not:
+**Corrected 2026-08-09, same day as the first draft.** The first draft of this plan treated
+bandwidth (recording upstream of software decimation, to preserve everything the hardware
+delivered regardless of what was displayed live) as the open question here. Ralph's
+correction: that reading was wrong. Receiver (hardware) decimation and software decimation
+*together* are what make a wide range of otherwise-unreachable sample rates available at
+all — using both is a deliberate, valuable feature of the current design, not a fidelity
+compromise to route around. Recording *after* software decimation is acceptable, and
+preferable: it records the rate that was actually chosen and actually usable, not an
+artificially inflated one nothing downstream asked for.
 
-**Timing fidelity — done.** `file_source`'s lack of real-time pacing was a confirmed,
-measured contributor to a shallower null on playback than live (8-10 dB vs 20+ dB live,
-with reference band width and gain confirmed identical; improved to 12-15 dB after adding
-pacing). That fix is already committed. What's still open, tracked in `RSR200_PLAN.md`
-section 12 item 9, is the remaining ~10 dB gap — a separate investigation from this refactor,
-not blocking it.
+What "accurately reproduce live conditions" actually means, restated correctly: **don't
+introduce rate errors** — no half-speed or double-speed playback, no misinterpreted sample
+width, nothing that makes a recording sound like anything other than the real signal at the
+real rate it was captured at. That's a timing/format-correctness concern, not a bandwidth
+one, and it's already substantially addressed:
 
-**Bandwidth fidelity — not yet addressed, and this plan needs a decision on it.** Dual-channel
-recording currently captures at the *post*-software-decimation rate
-(`sigpath::iqFrontEnd.getSampleRate()`). That means whatever bandwidth was chosen for display
-convenience during the live session becomes a hard ceiling on what a later re-phase or
-re-decorrelation attempt can ever recover — the opposite of "accurately reproduce live
-conditions" if the live antennas actually delivered more bandwidth than was displayed.
-**Recommended: dual-channel baseband recording should tap upstream of software decimation**,
-at the true front-end rate, so a recording always preserves everything the hardware actually
-delivered regardless of what the operator chose to look at live. Software decimation stays a
-display/CPU-load convenience; it should not silently also be a recording-fidelity decision.
-Tradeoff, stated plainly: recordings get larger (this is exactly why goal 1 has to land
-first) and use more CPU to write.
+- `file_source`'s lack of real-time pacing was a confirmed, measured contributor to a
+  shallower null on playback than live (8-10 dB vs 20+ dB live, with reference band width
+  and gain confirmed identical; improved to 12-15 dB after adding pacing). Fixed and
+  committed.
+- The float32/int16 misdetection and missing int32/uint8 support (RSR200_PLAN.md section 12,
+  items covering the two recordings that motivated this whole plan) are fixed and committed.
+
+What's still open (`RSR200_PLAN.md` section 12 item 9) is the remaining ~10 dB gap after the
+pacing fix — a separate DSP investigation, not a recording-format question, and not blocking
+this plan. **No bandwidth/tap-point change is planned.** Recording continues to happen after
+software decimation, as it does today.
 
 ## 5. Phased plan
 
@@ -165,17 +171,18 @@ first) and use more CPU to write.
 | **1** | Implement RF64 for real: `riff::Writer` gets the JUNK-placeholder-then-backpatch pattern (3.1); `wav::Writer` actually reads `_format`/decides RF64 vs plain WAV at close time based on real size, not a pre-selected format; `WavReader` (file_source's, currently already doing its own oversized-chunk workaround by trusting file size over declared chunk size) gets taught to recognize `"RF64"`/`"ds64"` properly rather than relying on that workaround indefinitely. | None — foundational, unblocks everything else. |
 | **2** | Round-trip test suite: write through `wav::Writer` across all four `SampleType`s (`UINT8`/`INT16`/`INT32`/`FLOAT32`) and channel counts (1, 2, 4), read back through `WavReader`, assert exact sample match. Include one test that deliberately crosses the 4 GB boundary (small `STREAM_BUFFER_SIZE`-scale synthetic run, not a real multi-GB CI artifact) to exercise the RF64 backpatch path specifically. | Phase 1 |
 | **3** | Fix `auxi`'s `stopTime` — patch it at `close()` the same way RIFF/data sizes already are. | None — independent, small, can land anytime. |
-| **4** | Move dual-channel baseband recording upstream of software decimation (4. above). Needs the "recommended" call above confirmed, since it changes file sizes and CPU cost by default. | Phase 1 (files get bigger; needs RF64 in place first) |
+| ~~**4**~~ | ~~Move dual-channel baseband recording upstream of software decimation.~~ **Rejected 2026-08-09** — see section 4 above. Hardware and software decimation together are how a wide range of sample rates becomes reachable at all; recording after software decimation is the right behavior, not a fidelity compromise. No tap-point change planned. | — |
 | **5** | Default the dual-channel recorder's sample type to `FLOAT32` for anything beyond 16-bit (3.3) — specifically, stop offering/defaulting to `INT32` for RSR200's 24-bit mode. Keep other `SampleType`s available for anyone who wants them; this is a default change, not a removal. | Phase 2 (need the round-trip tests covering float32 dual-channel before changing what ships by default) |
 | **6** | **Verify against real WavViewDX and real SDR Console** — both confirmed available. Record a real dual-channel RSR200 session past 4 GB, open it in each tool unmodified (no Linrad conversion step), confirm center frequency, channel count/order, and sample data all come through correctly. This is the actual acceptance test for goals 1 and 2 — nothing above is "done" until this passes, only "implemented." | Phases 1, 5 |
 | **7** (conditional on phase 6's result) | If phase 6 shows WavViewDX reading the native RF64 file directly and correctly: update `tools/wav2linrad.cpp` to at least not be silently wrong (currently `Int16`-only and inherits the pre-RF64 32-bit size read) — either fix it to match the current format properly, or mark it clearly as legacy/optional now that direct RF64 import works. If phase 6 shows it does *not* read the native file correctly: `wav2linrad.cpp` becomes load-bearing rather than optional, and fixing its gaps moves from "nice to have" to required. | Phase 6 |
 
+Phase numbers are kept as originally assigned, gaps included, rather than renumbered —
+matches this project's convention elsewhere of keeping corrected reasoning visible instead
+of silently rewriting it away.
+
 ## 6. Open questions for Ralph, not resolved by research
 
-- **Phase 4's tradeoff**: bigger files, more CPU, in exchange for recordings that can be
-  re-phased/re-decorrelated at full bandwidth regardless of what was displayed live. Worth
-  confirming this is the right default before it lands, since it's a real behavior change to
-  existing recording sizes.
+- ~~Phase 4's tradeoff~~ — resolved, rejected, see section 4.
 - **Phase 5's default change**: switching RSR200 dual-channel recording's default sample
   type away from `INT32` to `FLOAT32` changes file size (both are 4 bytes/sample, so this one
   is actually neutral) and — worth being explicit — means existing recordings made as INT32
