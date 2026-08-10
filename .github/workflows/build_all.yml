@@ -82,20 +82,24 @@ jobs:
         - name: Install libhydrasdr
           run: git clone https://github.com/hydrasdr/rfone_host; cd rfone_host/ ; mkdir build ; cd build ; cmake .. -DCMAKE_BUILD_TYPE=Release "-DLIBUSB_LIBRARIES=C:\Program Files\PothosSDR\lib\libusb-1.0.lib" "-DLIBUSB_INCLUDE_DIR=C:\Program Files\PothosSDR\include\libusb-1.0" "-DTHREADS_PTHREADS_WIN32_LIBRARY=C:\Program Files\PothosSDR\lib\pthreadVC2.lib" "-DTHREADS_PTHREADS_INCLUDE_DIR=C:\Program Files\PothosSDR\include" ; cmake --build . --config Release ; cmake --install .
 
-        # TODO: needs a verified download URL before this can succeed. FTDI's D3XX drivers
-        # page (ftdichip.com/drivers/d3xx-drivers/) is behind Cloudflare bot-detection, which
-        # blocked both a direct fetch and a real browser session when this was written, so
-        # the exact WinUSB D3XX SDK zip URL couldn't be confirmed automatically. Get it from
-        # that page directly (trivial for a real browser) and replace the Write-Host/exit 1
-        # below with the actual download + extract + install, matching the pattern every
-        # other vendor SDK step above already uses. source_modules/rsr200_source/CMakeLists.txt
-        # documents exactly where this needs to land: headers in
-        # "C:/Program Files/FTD3XX/include", FTD3XXWU.lib (+ matching .dll) in
-        # "C:/Program Files/FTD3XX/lib".
-        - name: Install FTD3XX SDK for RSR200 (TODO -- see comment)
+        # FTDI's D3XX drivers page (ftdichip.com) sits behind Cloudflare bot-detection that
+        # blocks non-interactive HTTP clients -- confirmed against both curl and the same
+        # Invoke-WebRequest pattern every other vendor SDK step above uses, even pointed
+        # directly at the wp-content/uploads file URL. Only a real interactive browser
+        # session got past it. So instead of an unreliable live download, the handful of
+        # files actually needed (header + import lib + runtime dll, ~177KB total) are
+        # vendored in-repo under third_party/ftd3xx_winusb -- see that folder's NOTICE.md
+        # for provenance, the WinUSB-vs-WDF package mixup that cost time here, and the
+        # license terms permitting redistribution. source_modules/rsr200_source/CMakeLists.txt
+        # expects headers in "C:/Program Files/FTD3XX/include" and FTD3XXWU.lib (+ matching
+        # .dll) in "C:/Program Files/FTD3XX/lib".
+        - name: Install FTD3XX SDK for RSR200
           run: |
-            Write-Host "TODO: install FTDI's WinUSB D3XX SDK to C:/Program Files/FTD3XX before OPT_BUILD_RSR200_SOURCE can succeed -- see the comment above this step in build_all.yml."
-            exit 1
+            mkdir "C:/Program Files/FTD3XX/include"
+            mkdir "C:/Program Files/FTD3XX/lib"
+            cp third_party/ftd3xx_winusb/FTD3XX.h "C:/Program Files/FTD3XX/include/"
+            cp third_party/ftd3xx_winusb/x64/FTD3XXWU.lib "C:/Program Files/FTD3XX/lib/"
+            cp third_party/ftd3xx_winusb/x64/FTD3XXWU.dll "C:/Program Files/FTD3XX/lib/"
 
         - name: Prepare CMake
           working-directory: ${{runner.workspace}}/build

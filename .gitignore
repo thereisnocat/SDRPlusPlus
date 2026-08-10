@@ -4,6 +4,9 @@ build/
 .idea/
 *.old
 *.dll
+# Exception: FTD3XXWU.dll is a vendored third-party SDK file the Windows RSR200 build needs
+# checked in, not a build artifact -- see third_party/ftd3xx_winusb/NOTICE.md.
+!third_party/ftd3xx_winusb/x64/FTD3XXWU.dll
 *.exe
 *.obj
 *.zip

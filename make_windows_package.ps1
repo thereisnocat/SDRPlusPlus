@@ -54,10 +54,10 @@ cp 'C:/Program Files/RFNM/bin/fmt.dll' sdrpp_windows_x64/
 
 cp $build_dir/source_modules/rfspace_source/Release/rfspace_source.dll sdrpp_windows_x64/modules/
 
-# RSR200: only present once OPT_BUILD_RSR200_SOURCE is actually on and the FTD3XX SDK step
-# in build_all.yml is filled in (see that file's TODO). DLL name/path assumed to match the
-# FTD3XXWU import lib's own naming convention -- not yet verified against the real SDK
-# layout, since the download itself is still a placeholder; check both once that lands.
+# RSR200: needs OPT_BUILD_RSR200_SOURCE on and the FTD3XX SDK installed to
+# C:/Program Files/FTD3XX first -- see the "Install FTD3XX SDK for RSR200" step in
+# build_all.yml and third_party/ftd3xx_winusb/NOTICE.md. FTD3XXWU.dll name/path confirmed
+# against the real Winusb_D3XX_Release_1.4.0.1 SDK layout.
 cp $build_dir/source_modules/rsr200_source/Release/rsr200_source.dll sdrpp_windows_x64/modules/ -ErrorAction SilentlyContinue
 cp 'C:/Program Files/FTD3XX/lib/FTD3XXWU.dll' sdrpp_windows_x64/ -ErrorAction SilentlyContinue
 

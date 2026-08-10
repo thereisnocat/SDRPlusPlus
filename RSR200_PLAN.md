@@ -749,7 +749,7 @@ start from a complete picture instead of the next single symptom.
 a phased rollout, and the open questions that need a decision before Phase 1 starts. Not
 started; planning only.
 
-## 14. Windows CI never actually builds RSR200 — found 2026-08-10, partially fixed
+## 14. Windows CI never actually builds RSR200 — found 2026-08-10, fixed
 
 The published Windows build (`sdrpp_windows_x64`) has never included RSR200 support, at
 all, on any platform, despite the module compiling and working live on both Mac (this
@@ -762,25 +762,37 @@ HydraSDR) is explicitly turned on in the Windows job's CMake configure step —
 package at all — the same "silently ships missing" trap this project's own memory already
 flags for exactly this reason (it previously happened to `phasing` on both platforms).
 
-**Partially fixed:**
+**Fixed:**
 - `make_windows_package.ps1`: added the missing copy entry for `rsr200_source.dll` and its
   runtime DLL dependency.
 - `build_all.yml`: added `-DOPT_BUILD_RSR200_SOURCE=ON` to the Windows job's CMake configure
   line.
+- The FTD3XX WinUSB SDK (header, import lib, runtime DLL) the module needs to build against
+  is now vendored in-repo at `third_party/ftd3xx_winusb/` and installed by a real
+  (non-placeholder) `Install FTD3XX SDK for RSR200` step in `build_all.yml`, rather than
+  downloaded live from FTDI at CI time.
 
-**Not yet fixed — genuinely blocked, not skipped:** the module also needs the FTD3XX WinUSB
-SDK (headers, import lib, DLL) installed on the CI runner before it can actually build,
-matching the install-a-vendor-SDK pattern every other optional module in that workflow
-already follows. FTDI's own drivers page (`ftdichip.com/drivers/d3xx-drivers/`) is behind
-Cloudflare bot-detection — confirmed blocked via both a direct fetch (403) and a real
-browser session (stuck on a "verifying you are not a bot" challenge page) — so the exact
-download URL couldn't be found and verified automatically. Rather than hardcode an unverified
-third-party mirror link into a public repo's CI workflow, `build_all.yml` has an explicit,
-loudly-failing placeholder step (`Install FTD3XX SDK for RSR200 (TODO -- see comment)`) with
-the exact paths the module's own `CMakeLists.txt` expects (`C:/Program Files/FTD3XX/include`,
-`C:/Program Files/FTD3XX/lib`, linking `FTD3XXWU`). **This means `build_windows` in CI will
-fail until someone gets the real SDK URL from FTDI's page directly (trivial for a real
-browser, since the bot-check is exactly the kind of thing a real human passes without
-noticing) and fills in that step.** Local Windows builds (the earlier Windows session's own
-dev machine) are unaffected — they already have the SDK installed locally, this gap is
-CI-specific.
+**Why vendored instead of downloaded, like every other SDK in this workflow:** FTDI's own
+drivers page (`ftdichip.com/drivers/d3xx-drivers/`) sits behind Cloudflare bot-detection that
+blocks non-interactive HTTP clients — confirmed against `curl` (even with a spoofed browser
+User-Agent) and separately confirmed the same would defeat GitHub Actions'
+`Invoke-WebRequest`, since both get served the Cloudflare JS challenge page instead of the
+file, even hitting the direct `wp-content/uploads/.../*.zip` URL. Only an actual interactive
+browser session got past it. Since a live download in CI would be exactly as unreliable, the
+handful of files actually needed (~177KB total) were extracted from the real SDK and
+committed directly instead. See `third_party/ftd3xx_winusb/NOTICE.md` for exact provenance
+and the redistribution license terms.
+
+**A real trap hit along the way, worth flagging for next time:** the URL initially supplied
+(`FTD3XXDriver_WHQLCertified_v1.3.0.10.zip`) looked plausible — WHQL-certified, x64, recent —
+but turned out to be FTDI's *other*, older Windows D3XX package: a WDF-based kernel driver
+(`ftdibus3.sys`/`.inf`, no `FTD3XXWU` import library at all), which FTDI's own page marks
+"soon to be deprecated". The module needs the *WinUSB* package specifically
+(`Winusb_D3XX_Release_1.4.0.1.zip`, marked "(Recommended)" / "*Latest Windows WinUSB based
+driver" on the same page) — confirmed by actually extracting both zips and comparing their
+contents rather than trusting either filename. `CMakeLists.txt`'s own comment already named
+the right package ("FTDI's Winusb_D3XX_Release package"); worth reading that literally next
+time instead of taking a supplied URL at face value.
+
+Local Windows builds (the earlier Windows session's own dev machine) were never affected by
+any of this — they already had the SDK installed locally; this was CI-only.
