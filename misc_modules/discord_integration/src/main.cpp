@@ -104,6 +104,9 @@ private:
                 else if (modeNum == RADIO_IFACE_MODE_LSB) {
                     strcpy(mode, "LSB");
                 }
+                else if (modeNum == RADIO_IFACE_MODE_SAM) {
+                    strcpy(mode, "SAM");
+                }
             }
         }
 

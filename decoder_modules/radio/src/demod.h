@@ -64,6 +64,7 @@ namespace demod {
 #include "demodulators/wfm.h"
 #include "demodulators/nfm.h"
 #include "demodulators/am.h"
+#include "demodulators/sam.h"
 #include "demodulators/usb.h"
 #include "demodulators/lsb.h"
 #include "demodulators/dsb.h"

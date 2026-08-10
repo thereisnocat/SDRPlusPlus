@@ -182,6 +182,12 @@ public:
         RADIO_DEMOD_CW,
         RADIO_DEMOD_LSB,
         RADIO_DEMOD_RAW,
+        // Appended rather than inserted next to AM/DSB where it logically belongs: this value
+        // is persisted as-is in config.conf[name]["selectedDemodId"], so inserting it earlier
+        // would silently renumber every mode after it and reassign existing users' saved demod
+        // selection to the wrong mode on their next launch. Must stay numerically equal to
+        // RADIO_IFACE_MODE_SAM in radio_interface.h -- see that file's comment.
+        RADIO_DEMOD_SAM,
         _RADIO_DEMOD_COUNT,
     };
 
@@ -204,6 +210,12 @@ private:
         ImGui::NextColumn();
         if (ImGui::RadioButton(CONCAT("AM##_", _this->name), _this->selectedDemodID == 2) && _this->selectedDemodID != 2) {
             _this->selectDemodByID(RADIO_DEMOD_AM);
+        }
+        // Grouped visually with AM/DSB since that's where a user would look for it, even though
+        // its enum value (and column position below) had to be appended at the end -- see the
+        // comment on RADIO_DEMOD_SAM's declaration.
+        if (ImGui::RadioButton(CONCAT("SAM##_", _this->name), _this->selectedDemodID == RADIO_DEMOD_SAM) && _this->selectedDemodID != RADIO_DEMOD_SAM) {
+            _this->selectDemodByID(RADIO_DEMOD_SAM);
         }
         if (ImGui::RadioButton(CONCAT("DSB##_", _this->name), _this->selectedDemodID == 3) && _this->selectedDemodID != 3) {
             _this->selectDemodByID(RADIO_DEMOD_DSB);
@@ -368,6 +380,7 @@ private:
             case DemodID::RADIO_DEMOD_NFM:  demod = new demod::NFM(); break;
             case DemodID::RADIO_DEMOD_WFM:  demod = new demod::WFM(); break;
             case DemodID::RADIO_DEMOD_AM:   demod = new demod::AM();  break;
+            case DemodID::RADIO_DEMOD_SAM:  demod = new demod::SAM(); break;
             case DemodID::RADIO_DEMOD_DSB:  demod = new demod::DSB(); break;
             case DemodID::RADIO_DEMOD_USB:  demod = new demod::USB(); break;
             case DemodID::RADIO_DEMOD_CW:   demod = new demod::CW();  break;

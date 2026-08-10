@@ -341,7 +341,8 @@ private:
         { RADIO_IFACE_MODE_USB, "USB" },
         { RADIO_IFACE_MODE_CW,  "CW"  },
         { RADIO_IFACE_MODE_LSB, "LSB" },
-        { RADIO_IFACE_MODE_RAW, "RAW" }
+        { RADIO_IFACE_MODE_RAW, "RAW" },
+        { RADIO_IFACE_MODE_SAM, "SAM" }
     };
 
     void commandHandler(std::string cmd) {
