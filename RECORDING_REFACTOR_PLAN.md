@@ -256,26 +256,39 @@ Console result should be considered untested, not failed** — the file being te
 actually valid RF64 at the time; a real single-channel RF64-vs-SDR-Console test is still
 open.
 
-**Two real bugs found by hitting this, unrelated to anything Phase 1-5 touched:**
+**Two real bugs found by hitting this, unrelated to anything Phase 1-5 touched — both fixed
+the same day (2026-08-10):**
 
-1. **Stopping a source while a recording is open never finalizes the recording**, and
-   nothing warns that this is about to happen. The Recorder currently has no hook into
-   source stop/start events at all. Matches what Ralph had already independently hit once
-   before this testing session, on a different (discarded) recording, where restarting the
-   radio "should have" stopped the recording and didn't.
-2. **Software decimation and center frequency can be changed while a recording is actively
-   in progress**, and shouldn't be — changing decimation mid-recording would write samples
-   at a new rate into a file whose header already declared the old one (the same class of
-   rate-mismatch corruption this whole refactor exists to fix, just from a different cause);
-   changing center frequency mid-recording invalidates `auxi`'s `centerFreq`. Worth checking
-   whether the disabling this file already does for other controls while recording
-   (`misc_modules/recorder/src/main.cpp`, the `style::beginDisabled()`/`endDisabled()` pair
-   around the settings block) already covers these two and just isn't reaching them, or
-   whether the lock needs to extend further up into the source/decimation controls
-   themselves.
+1. **Stopping a source while a recording is open never finalized the recording**, and
+   nothing warned that this was about to happen. Matches what Ralph had already
+   independently hit once before this testing session, on a different (discarded)
+   recording, where restarting the radio "should have" stopped the recording and didn't.
+   **Fixed**: `MainWindow::onPlayStateChange` (already emitted by the main play/pause
+   button, previously with no subscribers) is now handled by the Recorder — if a recording
+   is still open when the source stops, the Recorder finalizes it immediately instead of
+   leaving it dangling. Verified live: the log now shows `"source stopped while recording --
+   finalizing the file now instead of leaving it open"`, and the resulting file's header
+   (RIFF/data sizes, `auxi` stopTime) is correctly patched, confirmed both at the byte level
+   and by reading it back through `WavReader`.
+2. **Software decimation and center frequency could be changed while a recording was
+   actively in progress.** Root cause: the existing decimation control was only disabled
+   while the *source* was running (`core/src/gui/menus/source.cpp`), which says nothing
+   about whether a recording is independently still active once the source has been
+   stopped — exactly the gap bug 1 also lived in. **Fixed**: added reference-counted lock
+   mechanisms directly at the two choke points every retune/decimation change already funnels
+   through regardless of caller (GUI, rigctl, network server) — `SourceManager::tune()`
+   (`core/src/signal_path/source.h/.cpp`) and `IQFrontEnd::setDecimation()`
+   (`core/src/signal_path/iq_frontend.h/.cpp`). Reference-counted, not a flag, because the
+   Recorder allows unlimited simultaneous instances — one recording stopping must not unlock
+   a second, still-running one. The Recorder acquires both locks in `start()` and releases
+   them in `stop()` (including the auto-finalize path from bug 1's fix), with the decimation
+   lock scoped to baseband/IQ recording specifically since audio recording's rate doesn't
+   come from decimation. The decimation dropdown is now also visually disabled while locked,
+   matching the existing pattern for the source-running case. Verified live: attempting to
+   change decimation while recording is confirmed disabled in the UI.
 
-Neither bug is fixed yet — logged here rather than guessed at further; both are follow-up
-work, not blocking anything already marked done above.
+Both fixes verified against the full `core/test/run_tests.sh` suite (13/13 unchanged) and a
+full project build.
 
 Phase numbers are kept as originally assigned, gaps included, rather than renumbered —
 matches this project's convention elsewhere of keeping corrected reasoning visible instead

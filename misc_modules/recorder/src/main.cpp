@@ -142,6 +142,7 @@ public:
         deselectStream();
         sigpath::sinkManager.onStreamRegistered.unbindHandler(&onStreamRegisteredHandler);
         sigpath::sinkManager.onStreamUnregister.unbindHandler(&onStreamUnregisterHandler);
+        gui::mainWindow.onPlayStateChange.unbindHandler(&playStateChangeHandlerEv);
         meter.stop();
     }
 
@@ -160,6 +161,17 @@ public:
         onStreamUnregisterHandler.ctx = this;
         onStreamUnregisterHandler.handler = streamUnregisterHandler;
         sigpath::sinkManager.onStreamUnregister.bindHandler(&onStreamUnregisterHandler);
+
+        // Stopping the source used to leave an active recording open indefinitely --
+        // writer.close() (and the RF64/auxi backpatch it does) only ran if the Recorder's
+        // own Stop was clicked specifically, so stopping the source instead (the main
+        // play/pause button, a source crash, anything that fires this event) silently
+        // starved the recording of new data without ever finalizing the file. See
+        // RECORDING_REFACTOR_PLAN.md section 6.1 -- found via a file that looked like a
+        // real RF64 bug and turned out to be exactly this.
+        playStateChangeHandlerEv.ctx = this;
+        playStateChangeHandlerEv.handler = playStateChangeHandler;
+        gui::mainWindow.onPlayStateChange.bindHandler(&playStateChangeHandlerEv);
 
         // Select the stream
         selectStream(selectedStreamName);
@@ -281,6 +293,15 @@ public:
             }
         }
 
+        // Lock out changes that would corrupt this recording partway through -- retuning
+        // changes what's actually being received/sampled regardless of mode; decimation
+        // additionally means writing samples at a new rate into a file whose header already
+        // declared the old one, which only applies to baseband/IQ recording (audio's rate
+        // comes from the audio sink, not decimation). See RECORDING_REFACTOR_PLAN.md
+        // section 6.1.
+        sigpath::sourceManager.lockTuning(true);
+        if (recMode == RECORDER_MODE_BASEBAND) { sigpath::iqFrontEnd.lockDecimation(true); }
+
         recording = true;
     }
 
@@ -328,6 +349,14 @@ public:
 
         // Close file
         writer.close();
+
+        // Release exactly the locks start() took -- must mirror its condition exactly.
+        // These are reference-counted (RECORDING_REFACTOR_PLAN.md section 6.1, multiple
+        // recorder instances can run at once), so releasing a lock this instance never
+        // actually acquired would decrement a count a *different*, still-recording instance
+        // is relying on, unlocking decimation out from under it.
+        sigpath::sourceManager.lockTuning(false);
+        if (recMode == RECORDER_MODE_BASEBAND) { sigpath::iqFrontEnd.lockDecimation(false); }
 
         recording = false;
     }
@@ -615,6 +644,16 @@ private:
         }
     }
 
+    // The source just stopped (main play/pause button, or anything else that fires this).
+    // If a recording is still open, finalize it now rather than leaving it dangling with a
+    // header that never gets patched -- see the comment on where this gets bound, above.
+    static void playStateChangeHandler(bool playing, void* ctx) {
+        RecorderModule* _this = (RecorderModule*)ctx;
+        if (playing || !_this->recording) { return; }
+        flog::warn("Recorder '{0}': source stopped while recording -- finalizing the file now instead of leaving it open", _this->name);
+        _this->stop();
+    }
+
     void updateAudioMeter(dsp::stereo_t& lvl) {
         // Note: Yes, using the natural log is on purpose, it just gives a more beautiful result.
         double frameTime = 1.0 / ImGui::GetIO().Framerate;
@@ -801,6 +840,7 @@ private:
 
     EventHandler<std::string> onStreamRegisteredHandler;
     EventHandler<std::string> onStreamUnregisterHandler;
+    EventHandler<bool> playStateChangeHandlerEv;
 
 };
 

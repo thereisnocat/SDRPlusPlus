@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <utils/event.h>
@@ -51,6 +52,23 @@ public:
     void setTuningMode(TuningMode mode);
     void setPanadapterIF(double freq);
 
+    // Retuning the source mid-recording changes what's actually being sampled partway
+    // through a baseband file whose header already committed to a single centre frequency
+    // -- a real recording-corrupting action, not a cosmetic one, for anything wideband
+    // enough that "centre frequency" means the RF front end's own tuning rather than just
+    // where a VFO sits within an already-fixed passband. tune() (and therefore
+    // setTuningOffset()/setTuningMode(), which both call it) becomes a no-op while locked,
+    // rather than leaving every caller -- GUI, rigctl, the network server -- to remember to
+    // check this themselves. See RECORDING_REFACTOR_PLAN.md section 6.1.
+    //
+    // Reference-counted, not a flag: the Recorder module allows unlimited simultaneous
+    // instances, so one recording stopping must not unlock tuning out from under a second
+    // one that's still running. lockTuning(true)/lockTuning(false) is still call/release in
+    // pairs from each caller's point of view -- only the internal representation cares that
+    // more than one caller might hold it at once.
+    void lockTuning(bool locked) { tuningLockCount = std::max(0, tuningLockCount + (locked ? 1 : -1)); }
+    bool isTuningLocked() const { return tuningLockCount > 0; }
+
     std::vector<std::string> getSourceNames();
 
     Event<std::string> onSourceRegistered;
@@ -74,4 +92,5 @@ private:
     double ifFreq = 0.0;
     TuningMode tuneMode = TuningMode::NORMAL;
     dsp::stream<dsp::complex_t> nullSource;
+    int tuningLockCount = 0;
 };

@@ -364,7 +364,12 @@ namespace sourcemenu {
             style::endDisabled();
         }
 
-        if (running) { style::beginDisabled(); }
+        // Also disabled while a recording holds the decimation lock (RECORDING_REFACTOR_PLAN.md
+        // section 6.1) -- distinct from `running`, since stopping the *source* (which this
+        // "running" check alone permits) does not stop an independently active recording,
+        // which is exactly how this got changed out from under a live recording before.
+        const bool decimDisabled = running || sigpath::iqFrontEnd.isDecimationLocked();
+        if (decimDisabled) { style::beginDisabled(); }
         ImGui::LeftLabel("Decimation");
         ImGui::FillWidth();
         if (ImGui::Combo("##source_decim", &decimId, decimations.txt)) {
@@ -373,6 +378,6 @@ namespace sourcemenu {
             core::configManager.conf["decimation"] = decimations.key(decimId);
             core::configManager.release(true);
         }
-        if (running) { style::endDisabled(); }
+        if (decimDisabled) { style::endDisabled(); }
     }
 }

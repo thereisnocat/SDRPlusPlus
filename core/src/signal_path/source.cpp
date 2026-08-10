@@ -134,6 +134,10 @@ void SourceManager::tune(double freq) {
     if (selectedHandler == NULL) {
         return;
     }
+    if (isTuningLocked()) {
+        flog::warn("SourceManager: tune() ignored, locked for an active recording");
+        return;
+    }
     // TODO: No need to always retune the hardware in Panadapter mode
     selectedHandler->tuneHandler(abs(((tuneMode == TuningMode::NORMAL) ? (freq + tuneOffset) : ifFreq)), selectedHandler->ctx);
     onRetune.emit(freq + tuneOffset);

@@ -103,6 +103,11 @@ void IQFrontEnd::setBuffering(bool enabled) {
 }
 
 void IQFrontEnd::setDecimation(int ratio) {
+    if (isDecimationLocked()) {
+        flog::warn("IQFrontEnd: setDecimation() ignored, locked for an active recording");
+        return;
+    }
+
     // Temp stop the decimator
     decim.tempStop();
 

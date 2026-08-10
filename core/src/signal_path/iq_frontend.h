@@ -9,6 +9,7 @@
 #include "../dsp/sink/handler_sink.h"
 #include "../dsp/math/conjugate.h"
 #include <fftw3.h>
+#include <algorithm>
 
 class IQFrontEnd {
 public:
@@ -30,6 +31,17 @@ public:
     void setDecimation(int ratio);
     void setInvertIQ(bool enabled);
     void setDCBlocking(bool enabled);
+
+    // Changing decimation mid-recording writes samples at a new rate into a file whose
+    // header already declared the old one -- the same class of rate-mismatch corruption
+    // this whole recording refactor exists to fix, just from a different cause.
+    // setDecimation() becomes a no-op while locked. See RECORDING_REFACTOR_PLAN.md
+    // section 6.1.
+    // Reference-counted for the same reason SourceManager::lockTuning() is: the Recorder
+    // module allows unlimited simultaneous instances, so one recording stopping must not
+    // unlock decimation out from under a second one still running.
+    void lockDecimation(bool locked) { decimationLockCount = std::max(0, decimationLockCount + (locked ? 1 : -1)); }
+    bool isDecimationLocked() const { return decimationLockCount > 0; }
 
     void bindIQStream(dsp::stream<dsp::complex_t>* stream);
     void unbindIQStream(dsp::stream<dsp::complex_t>* stream);
@@ -86,6 +98,7 @@ protected:
     // Parameters
     double _sampleRate;
     double _decimRatio;
+    int decimationLockCount = 0;
     int _fftSize;
     double _fftRate;
     FFTWindow _fftWindow;
