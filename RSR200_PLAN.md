@@ -653,6 +653,17 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    is a manual per-file workaround, not a fix. A real fix means either implementing RF64
    properly (the scaffolding is already half there) or having the recorder warn/split files
    as the 4 GB boundary approaches.
+
+   **Second confirmed instance, same day:** a separate 30.4 GB float32 recording
+   (`baseband_1021631Hz_20-49-54_09-08-2026.wav`) showed the same corruption from a
+   different angle — its `data` size field wasn't `0` but `291816128` (~278 MB), matching
+   `real_content_bytes mod 2^32` exactly (`30356587200 mod 2^32 = 291816128`), i.e. the
+   32-bit counter had wrapped around **seven times** during the recording. Worse than the
+   all-zero case in one way: a strict reader wouldn't see "no data," it would read a
+   plausible-looking ~9 seconds of real audio and stop there, discarding the other ~30 GB
+   silently rather than failing obviously. Confirms the overflow theory precisely rather
+   than just being consistent with it, and recovered the same way (RIFF/`data` size fields
+   → `0xFFFFFFFF`).
 8. **Baseband recording bandwidth follows software decimation, not the full front-end
    span — probably explains why this same recording looked like it covered only the empty
    gap between 19m and 16m.** Confirmed in code: `misc_modules/recorder/src/main.cpp:181`
