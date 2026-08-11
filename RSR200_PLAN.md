@@ -594,9 +594,36 @@ Worth keeping a list, both to avoid re-deriving them and to send back to the man
 Notes from Ralph's first extended live session against the real radio over USB, once
 streaming worked. Recorded as a punch list, not designed or fixed yet.
 
-1. **ADC clock can't be set precisely.** The UI advertises 0.1 MHz resolution, but the
-   control's per-step jump is visibly larger than 0.1 MHz — the slider/drag granularity
-   doesn't match the value granularity it claims.
+1. **ADC clock can't be set precisely — fixed 2026-08-10.** The UI advertises 0.1 MHz
+   resolution, but the control's per-step jump is visibly larger than 0.1 MHz — the
+   slider/drag granularity doesn't match the value granularity it claims.
+
+   Root cause was in the shared `SliderFloatWithSteps` widget
+   (`core/src/gui/widgets/stepped_slider.cpp`), not anything RSR200-specific — every module
+   using it (HackRF's LNA/VGA gain, AirspyHF's attenuator, USRP/PlutoSDR/RFspace/Perseus/Soapy
+   gains, and this ADC clock control) shared the same bug, just less visibly on controls with
+   only a handful of coarse steps. It faked a float slider by driving a real
+   `ImGui::SliderInt` over a `[0, (max-min)/step]` index range and passing the *already
+   MHz-formatted display string* in as that int slider's `format` argument, purely so the
+   drag handle would show "125.0" instead of a raw step number. That works fine for dragging,
+   but breaks Ctrl+Click-to-type, ImGui's normal way to enter an exact value: the popup text
+   box parses whatever you type back using the *slider's real underlying type* (`int`, the
+   step index) — the display-string `format` is only ever used to pre-fill the box, never
+   consulted when parsing what you typed into it. So typing an exact value silently landed on
+   `v_min + (the number you typed) * v_step` instead of the number itself: on this control
+   (70..200 MHz range, 0.1 MHz step), typing "150.0" landed on `70 + 150*0.1 = 85.0`, not
+   150.0 — with no error, no clamping to signal anything was wrong, just a confidently wrong
+   number. That's what "can't be set precisely" actually was: dragging alone can't reliably
+   land on one exact value out of 1300 possible positions crammed into one slider's pixel
+   width (an inherent, expected limitation), and the escape hatch for exact entry was silently
+   broken, so there was no reliable way to hit an exact frequency at all.
+
+   Fixed by driving a real `ImGui::SliderFloat` on the value itself instead of faking one over
+   an int index, then snapping the result to the nearest step after either a drag or a typed
+   entry. Ctrl+Click now parses back using the actual float value shown, so typing "150.0"
+   sets 150.0 MHz, not 85.0. Fixes the same latent bug in every other module listed above as a
+   side effect, verified by rebuilding all of them (`rsr200_source`, `hackrf_source`,
+   `airspyhf_source`, `rfspace_source`, `sdrpp_core`) clean.
 2. **ADC clock × receiver decimation × software decimation gives a huge but opaque space of
    bandwidth/sample-rate choices.** The three controls compose to determine the effective
    rate, but nothing in the interface shows that relationship. Worth an alternate control
