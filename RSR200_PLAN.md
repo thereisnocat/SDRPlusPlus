@@ -634,9 +634,13 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    rates the low decimation settings imply. Whatever alternate interface comes out of item 2
    should surface 24-bit mode's effect on usable bandwidth alongside the rate controls, not
    as a separate, disconnected checkbox.
-4. **Wants a small always-visible spectrum window zoomed to the current frequency.** The
-   existing zoom control does this to some extent but at limited resolution. Not yet clear
-   where this belongs in the layout — noted for later, no design started.
+4. **Wants a small always-visible spectrum window zoomed to the current frequency — designed
+   and implemented 2026-08-10, not RSR200-specific.** Grew into a bigger feature than just
+   this item once designed: a real dedicated spectrum feed (not reusing the main waterfall's
+   view, which was exactly the "limited resolution" this item already flagged) with a shaded,
+   draggable, independently-asymmetric passband, living in the Radio module above the mode
+   selector. Full design and implementation notes in `RADIO_SPECTRUM_FILTER_PLAN.md` — applies
+   to every source, not just RSR200.
 5. **Firmware version still displays wrong — not BCD-decoded.** `main.cpp`'s status line
    (`snprintf(buf, sizeof(buf), "Serial %u, firmware %u", ...)`, around line 350) prints
    `verFirmware` as a plain decimal `uint32_t`, but `rsr200_protocol.h`'s version reply
@@ -823,3 +827,35 @@ time instead of taking a supplied URL at face value.
 
 Local Windows builds (the earlier Windows session's own dev machine) were never affected by
 any of this — they already had the SDK installed locally; this was CI-only.
+
+## 15. Demod IF sample rates can produce pathological resampler filters against RSR200 — found 2026-08-10, not fixed
+
+Found while debugging an unrelated Radio-module CPU/memory blowup (full writeup in
+`RADIO_SPECTRUM_FILTER_PLAN.md`'s "Regression found and fixed in live testing" section) — this
+specific issue is real but distinct, RSR200-relevant, and left for later rather than fixed
+alongside that one.
+
+Every `demod::X` class hardcodes its own fixed IF sample rate with no awareness of what rate
+the actual source produces (`demod::AM::getIFSampleRate()` returns a flat `15000.0`, same
+pattern for NFM/DSB/USB/etc.). `dsp::multirate::RationalResampler` reduces
+`outSamplerate/inSamplerate` to lowest terms and sizes its polyphase FIR off the result — fine
+when that ratio is "nice," but RSR200's actual sample rate (driven by ADC clock ÷ decimation,
+neither of which is chosen with resampler-friendliness in mind — e.g. observed live at
+~1.95MHz) doesn't share a large GCD with a flat `15000`. Confirmed live: selecting AM against
+a real RSR200 logs `[Resamp] predec: 64, interp: 15000, decim: 15259, ..., taps: 1159667` —
+1.16 million filter taps, three times during startup/mode-provisioning. Each occurrence is a
+real, multi-second CPU spike building that filter (confirmed via `sample`-ing the running
+process), though it only happened at startup in the session where this was found, not
+continuously — unlike the Radio spectrum preview's own version of this same failure mode,
+which *was* continuous and is what actually prompted this investigation.
+
+Not fixed here: the fix that worked for the spectrum preview (snap the requested rate to a
+power-of-two decimation of the source's actual rate, so `RationalResampler`'s own
+predecimation stage absorbs the whole ratio and the polyphase-filter path never runs at all)
+doesn't obviously transfer to demod IF rates, which are fixed per-mode constants baked into
+each `demod::X::getIFSampleRate()` and presumably chosen for other reasons (audio quality,
+filter design assumptions downstream in each demodulator) rather than picked freely the way
+the preview's width was. Whether it's safe to snap those too, or whether RSR200's own
+`adcClockMHz`/decimation controls should instead be steered (or at least warned) away from
+rates that don't divide nicely against common demod IF rates, needs its own look rather than
+a quick copy of the preview's fix.

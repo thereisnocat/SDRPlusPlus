@@ -16,6 +16,14 @@ public:
         double getOffset();
         void setCenterOffset(double offset);
         void setBandwidth(double bandwidth, bool updateWaterfall = true);
+        // Independent low/high passband edges (Hz, offsets from the tuned center), trimmed
+        // within the current bandwidth window -- see dsp::channel::RxVFO::setPassband(). No
+        // ImGui::WaterfallVFO counterpart: the main waterfall's VFO box stays exactly what it
+        // is today (a symmetric outer window); asymmetric trim is edited by the Radio module's
+        // own spectrum preview widget, not on the main waterfall.
+        void setPassband(double lo, double hi);
+        double getPassbandLo();
+        double getPassbandHi();
         void setSampleRate(double sampleRate, double bandwidth);
         void setReference(int ref);
         void setSnapInterval(double interval);

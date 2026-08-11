@@ -48,6 +48,18 @@ void VFOManager::VFO::setBandwidth(double bandwidth, bool updateWaterfall) {
     dspVFO->setBandwidth(bandwidth);
 }
 
+void VFOManager::VFO::setPassband(double lo, double hi) {
+    dspVFO->setPassband(lo, hi);
+}
+
+double VFOManager::VFO::getPassbandLo() {
+    return dspVFO->getPassbandLo();
+}
+
+double VFOManager::VFO::getPassbandHi() {
+    return dspVFO->getPassbandHi();
+}
+
 void VFOManager::VFO::setSampleRate(double sampleRate, double bandwidth) {
     dspVFO->setOutSamplerate(sampleRate, bandwidth);
     wtfVFO->setBandwidth(bandwidth);

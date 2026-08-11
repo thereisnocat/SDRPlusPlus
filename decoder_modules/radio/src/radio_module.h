@@ -15,8 +15,10 @@
 #include <core.h>
 #include <stdint.h>
 #include <utils/optionlist.h>
+#include <gui/widgets/mini_spectrum.h>
 #include "radio_interface.h"
 #include "demod.h"
+#include "spectrum_preview.h"
 
 ConfigManager config;
 
@@ -81,6 +83,11 @@ public:
         onUserChangedBandwidthHandler.handler = vfoUserChangedBandwidthHandler;
         onUserChangedBandwidthHandler.ctx = this;
         vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
+
+        // Initialize the spectrum preview -- corrected to the real default bandwidth/offset by
+        // selectDemodByID() below, this initial width is just a placeholder that's never
+        // actually shown
+        preview.init(name, vfo->getOffset(), 40000.0);
 
         // Initialize IF DSP chain
         ifChainOutputChanged.ctx = this;
@@ -151,6 +158,7 @@ public:
         if (!vfo) {
             vfo = sigpath::vfoManager.createVFO(name, ImGui::WaterfallVFO::REF_CENTER, 0, 200000, 200000, 50000, 200000, false);
             vfo->wtfVFO->onUserChangedBandwidth.bindHandler(&onUserChangedBandwidthHandler);
+            preview.init(name, vfo->getOffset(), 40000.0);
         }
         ifChain.setInput(vfo->output, [=](dsp::stream<dsp::complex_t>* out){ ifChainOutputChangeHandler(out, this); });
         ifChain.start();
@@ -163,6 +171,7 @@ public:
         ifChain.stop();
         if (selectedDemod) { selectedDemod->stop(); }
         afChain.stop();
+        preview.deinit();
         if (vfo) { sigpath::vfoManager.deleteVFO(vfo); }
         vfo = NULL;
     }
@@ -199,6 +208,45 @@ private:
 
         float menuWidth = ImGui::GetContentRegionAvail().x;
         ImGui::BeginGroup();
+
+        // Filter preview: spectrum around the carrier with a shaded, draggable passband. Offset
+        // kept in sync with the real VFO's tuned frequency every frame here rather than through
+        // an event -- setOffset() is cheap (just retunes a frequency translator) and this is
+        // the only place in the module that runs every frame regardless of what changed. Width
+        // is NOT touched here on purpose -- see previewWidthHz's own comment; it's set once at
+        // mode selection and deliberately left alone for the rest of that mode's use.
+        //
+        // Uses wtfVFO->centerOffset, not vfo->getOffset() (== wtfVFO->generalOffset): those two
+        // differ for USB/LSB, which tune from the lower/upper edge rather than the center
+        // (getVFOReference() == REF_LOWER/REF_UPPER) -- generalOffset is the edge the frequency
+        // readout shows, centerOffset is generalOffset re-based to the middle of the passband,
+        // and centerOffset is what the real demod VFO's own offset is actually set from
+        // (VFOManager::VFO::setOffset() calls dspVFO->setOffset(wtfVFO->centerOffset), never
+        // generalOffset). Centering the preview on generalOffset instead, as an earlier version
+        // of this did, drew the shaded passband straddling the carrier for USB/LSB -- looking
+        // like it covered both sides -- while the real filter, correctly centered on
+        // centerOffset, was actually and correctly entirely to one side the whole time. Only
+        // the picture was wrong; using the same reference point the real VFO already uses
+        // fixes the picture to match.
+        if (_this->vfo) {
+            _this->preview.setOffset(_this->vfo->wtfVFO->centerOffset);
+        }
+        int specSize = 0;
+        float* specData = _this->preview.acquireFFT(specSize);
+        // carrierOffsetHz: the plot is centered on centerOffset (see above), but the actual
+        // carrier is centerOffset - generalOffset away from that for USB/LSB -- 0 for
+        // REF_CENTER modes, where the two are the same point.
+        double carrierOffsetHz = _this->vfo ? (_this->vfo->wtfVFO->generalOffset - _this->vfo->wtfVFO->centerOffset) : 0.0;
+        // Edges can be dragged out to the mode's true ceiling (maxBandwidth), not just the
+        // current Bandwidth field's value -- that field is a synced *readout* of the passband
+        // now (see applyPassbandEdges()), not a cage around it. See RxVFO::clampPassband()'s
+        // comment for why the DSP layer itself was changed to match.
+        bool passbandChanged = _this->specWidget.draw(CONCAT("##_radio_spectrum_preview_", _this->name), ImVec2(menuWidth, 80.0f * style::uiScale),
+                                                        specData, specSize, _this->preview.getWidth(),
+                                                        &_this->passbandLo, &_this->passbandHi,
+                                                        -_this->maxBandwidth / 2.0, _this->maxBandwidth / 2.0, carrierOffsetHz);
+        _this->preview.releaseFFT();
+        if (passbandChanged) { _this->applyPassbandEdges(); }
 
         ImGui::Columns(4, CONCAT("RadioModeColumns##_", _this->name), false);
         if (ImGui::RadioButton(CONCAT("NFM##_", _this->name), _this->selectedDemodID == 0) && _this->selectedDemodID != 0) {
@@ -243,7 +291,7 @@ private:
             ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
             if (ImGui::InputFloat(("##_radio_bw_" + _this->name).c_str(), &_this->bandwidth, 1, 100, "%.0f")) {
                 _this->bandwidth = std::clamp<float>(_this->bandwidth, _this->minBandwidth, _this->maxBandwidth);
-                _this->setBandwidth(_this->bandwidth);
+                _this->setBandwidthSymmetric(_this->bandwidth);
             }
         }
 
@@ -475,6 +523,31 @@ private:
             bandwidth = config.conf[name][selectedDemod->getName()]["bandwidth"];
             bandwidth = std::clamp<double>(bandwidth, minBandwidth, maxBandwidth);
         }
+        // Default every mode switch to the full symmetric window (today's exact behaviour if
+        // this mode's passband was never trimmed), then load whatever was actually saved for
+        // this specific mode, clamped in case the saved value predates a since-changed
+        // bandwidth. Applied further down by applyPassbandEdges(), after setBandwidth(bandwidth)
+        // -- the VFO's clamp needs the new bandwidth window in place first.
+        passbandLo = -bandwidth / 2.0;
+        passbandHi = bandwidth / 2.0;
+        if (config.conf[name][selectedDemod->getName()].contains("passbandLo")) {
+            passbandLo = std::clamp<double>(config.conf[name][selectedDemod->getName()]["passbandLo"], -bandwidth / 2.0, 0.0);
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("passbandHi")) {
+            passbandHi = std::clamp<double>(config.conf[name][selectedDemod->getName()]["passbandHi"], 0.0, bandwidth / 2.0);
+        }
+        // Re-derive bandwidth from whatever the passband actually ended up being, rather than
+        // trusting the separately-persisted "bandwidth" key on its own -- found live testing
+        // this same day that the two can disagree: every build prior to this fix persisted
+        // `bandwidth` from the live-dragged passband (see applyPassbandEdges()'s own history),
+        // so a config that was ever saved by one of those earlier builds can have a
+        // `bandwidth` stuck at a stale value with no real relationship to the (separately,
+        // correctly loaded) passbandLo/Hi above -- observed directly in this fix's own test
+        // config: AM's "bandwidth" stuck at 15000 (its IF-rate ceiling) while passbandLo/Hi
+        // still correctly held a real ~8kHz trim. Harmless no-op for a freshly-defaulted
+        // passband (passbandHi - passbandLo is exactly bandwidth by construction in that
+        // case); only changes anything for a config with this exact leftover mismatch.
+        bandwidth = std::clamp<double>(passbandHi - passbandLo, minBandwidth, maxBandwidth);
         if (config.conf[name][selectedDemod->getName()].contains("snapInterval")) {
             snapInterval = config.conf[name][selectedDemod->getName()]["snapInterval"];
         }
@@ -528,12 +601,86 @@ private:
         if (vfo) {
             vfo->setBandwidthLimits(minBandwidth, maxBandwidth, selectedDemod->getBandwidthLocked());
             vfo->setReference(selectedDemod->getVFOReference());
+            // VFOManager::VFO::setReference() only updates wtfVFO (the waterfall's own
+            // bookkeeping -- lowerOffset/centerOffset/upperOffset all get correctly
+            // recomputed for the new reference type internally) and stops there; unlike
+            // setOffset()/setCenterOffset(), it never calls dspVFO->setOffset(...), so the
+            // *real* demodulation VFO's actual tuned offset is left exactly where the
+            // *previous* mode's reference type last put it. Switching between a REF_CENTER
+            // mode (AM, NFM, ...) and a REF_LOWER/REF_UPPER one (USB, LSB) changes what
+            // centerOffset actually *means* relative to the tuned/carrier frequency -- by up
+            // to half the bandwidth -- so without this, the real audio stays demodulated at
+            // the stale pre-switch offset until something else happens to call setOffset()
+            // again, not just the spectrum preview (this codebase's first code to actually
+            // read and display centerOffset directly) showing a stale picture. Re-applying
+            // centerOffset to itself is a safe, idempotent way to force that missing sync:
+            // setCenterOffset() always treats its argument as the true center regardless of
+            // reference type, so this doesn't change what wtfVFO already correctly computed --
+            // it only adds the dspVFO->setOffset() call setReference() itself never makes.
+            // Found live 2026-08-10, chasing a spectrum-preview-only symptom ("switching from
+            // USB to AM triggers the balloon") that turned out to be this instead -- a
+            // pre-existing gap in VFOManager, not anything introduced by the preview feature.
+            vfo->setCenterOffset(vfo->wtfVFO->centerOffset);
             vfo->setSnapInterval(snapInterval);
             vfo->setSampleRate(ifSamplerate, bandwidth);
         }
 
         // Configure bandwidth
         setBandwidth(bandwidth);
+
+        // Configure passband edges (see the "Load config" section above).
+        applyPassbandEdges();
+        if (vfo) {
+            preview.setOffset(vfo->wtfVFO->centerOffset);
+            // The only place previewWidthHz gets set -- computed once per mode selection and
+            // then left alone for the rest of this mode's use, on Ralph's own direct
+            // instruction after three earlier attempts at "recompute it live, just more
+            // carefully" all still visibly changed the zoom while trimming ("it goes from a
+            // representation of a section of the spectrum covering maybe three channels to
+            // zoomed in on one ... it looks wrong, it feels wrong, it acts wrong"). Simplest
+            // fix available and the one actually asked for: stop trying to keep it fresh at
+            // all. Trade-off: RadioSpectrumPreview::setWidth()'s own re-snap-against-the-live-
+            // source-rate protection (see its comment) now only runs at mode-select time
+            // rather than every frame -- fine for a source whose rate settles once at startup
+            // and stays put, which is what's actually been observed; a source that changes
+            // rate mid-session without a mode switch could in principle need this revisited.
+            //
+            // Based on max(getDefaultBandwidth(), passbandHi - passbandLo), not either alone:
+            //
+            // Not `bandwidth` -- found live testing this same day that `bandwidth` can be
+            // stale independent of the passband actually in effect: every build prior to that
+            // fix persisted `bandwidth` from the live-dragged passband (see
+            // applyPassbandEdges()'s own history above), so a session that hit any of those
+            // earlier builds can have a leftover `bandwidth` in config.json with no real
+            // relationship to the (separately, correctly persisted) passbandLo/Hi -- observed
+            // directly in testing: AM's `bandwidth` stuck at 15000, its IF-rate ceiling, while
+            // passbandLo/Hi still correctly held a real ~8kHz trim.
+            //
+            // Not passbandHi - passbandLo alone either, despite that being the fix for the
+            // above -- found live testing immediately after: trimming a mode's passband
+            // narrow (exactly what this feature is *for* -- dodging an adjacent signal) and
+            // then leaving and returning to that mode locked the preview into that same narrow
+            // zoom on every subsequent visit, since the persisted passband itself is narrow by
+            // then. The whole point of the preview is to show context around the passband,
+            // which a deliberately-narrowed passband doesn't stop being true for -- so the
+            // *mode's own typical/default width* is the right floor for how much context is
+            // worth showing, independent of how tightly the passband has actually been trimmed
+            // this session. Still grows past that default if the passband is ever wider than
+            // it (an edge case, but a sane one to keep exact).
+            previewWidthHz = previewWidthFor(std::max(selectedDemod->getDefaultBandwidth(), passbandHi - passbandLo));
+            preview.setWidth(previewWidthHz);
+        }
+        // Forces the preview's dB auto-scale to re-range from scratch rather than smoothing in
+        // from wherever the *previous* mode left it -- specWidget is one persistent widget
+        // instance, not recreated per mode, so without this a mode switch to a signal with a
+        // different level than the last mode's carried that old range into the new mode's
+        // first several frames. Found live: numerically nothing about the frequency span had
+        // changed (confirmed directly -- width computation logged identical before/after a
+        // USB -> LSB -> USB round trip) but the *picture* still looked like the "balloon"
+        // regression this whole investigation has been chasing, because this, not the
+        // frequency axis, was what had actually changed. See MiniSpectrum::resetRange()'s own
+        // comment.
+        specWidget.resetRange();
 
         // Configure noise blanker
         nb.setRate(500.0 / ifSamplerate);
@@ -575,16 +722,80 @@ private:
     }
 
 
+    // Sets the overall bandwidth without touching the passband trim -- RxVFO::setBandwidth()
+    // deliberately doesn't re-clamp it either (see that function's comment). Used by
+    // selectDemod(), which manages passbandLo/Hi explicitly itself right after calling this
+    // (loading a persisted trim per mode, not just defaulting to symmetric); everywhere else
+    // that lets the user set a bandwidth as a single scalar should go through
+    // setBandwidthSymmetric() instead, below.
     void setBandwidth(double bw) {
         bw = std::clamp<double>(bw, minBandwidth, maxBandwidth);
         bandwidth = bw;
         if (!selectedDemod) { return; }
         vfo->setBandwidth(bandwidth);
         selectedDemod->setBandwidth(bandwidth);
+        // Deliberately does NOT touch previewWidthHz/preview.setWidth() -- that's set once at
+        // mode selection only now and left alone for the rest of the mode's use, including
+        // across bandwidth edits made through here. See previewWidthHz's own comment.
 
         config.acquire();
         config.conf[name][selectedDemod->getName()]["bandwidth"] = bandwidth;
         config.release(true);
+    }
+
+    // The numeric Bandwidth field and the main waterfall's own bandwidth-drag handles both
+    // give a single scalar width, which can't represent an existing asymmetric trim -- treat
+    // that as the user intentionally asking for a fresh symmetric window at that width, same
+    // as it's always behaved, rather than re-clamping whatever trim was already there into the
+    // new width (which is what happened before RxVFO::clampPassband() stopped treating
+    // "bandwidth" as a second ceiling on the passband -- see its comment for the full story of
+    // why that felt like the filter randomly collapsing whenever this field was touched).
+    void setBandwidthSymmetric(double bw) {
+        setBandwidth(bw);
+        passbandLo = -bandwidth / 2.0;
+        passbandHi = bandwidth / 2.0;
+        applyPassbandEdges();
+    }
+
+    // Pushes passbandLo/passbandHi (already updated in place by MiniSpectrum::draw(), or
+    // freshly loaded/defaulted elsewhere) down to the real VFO and persists them. Deliberately
+    // does *not* touch `bandwidth`/vfo->setBandwidth() or previewWidthHz/preview.setWidth() --
+    // an earlier version of this synced both from the live drag on every frame, which turned
+    // out to be a serious bug, not just a cosmetic one: for USB/LSB, VFOManager::VFO's
+    // WaterfallVFO computes centerOffset *from* bandwidth (`generalOffset +- bandwidth/2`,
+    // anchored to the fixed edge those modes tune from -- see the round-2 fix's own comment on
+    // centerOffset vs generalOffset), so every drag frame was silently retuning the actual
+    // demodulated frequency along with it -- the cause of the heterodyne, the carrier tick
+    // visibly moving while dragging, and the preview zoom churn Ralph reported live, all from
+    // this one mechanism (REF_CENTER modes like AM don't move centerOffset when bandwidth
+    // changes, so there it only manifested as unwanted preview/waterfall-box churn, not a
+    // retune). The numeric Bandwidth field and the main waterfall's VFO box now stay exactly
+    // where they were last set explicitly (typing a number, dragging the main waterfall's own
+    // handles, or a mode switch) and simply don't track fine trims made here -- a real
+    // reduction in scope from round 2's "kept in sync" behaviour, but the alternative was
+    // dragging the passband quietly detuning the radio while USB/LSB SSB audio played.
+    // "Locking the outside bounds of the filter", the actual complaint that started round 2,
+    // is unaffected: minEdge/maxEdge past to MiniSpectrum::draw() are still the mode's true
+    // ceiling (maxBandwidth), not bandwidth, so dragging is still never blocked by it.
+    void applyPassbandEdges() {
+        if (!vfo || !selectedDemod) { return; }
+        vfo->setPassband(passbandLo, passbandHi);
+        passbandLo = vfo->getPassbandLo();
+        passbandHi = vfo->getPassbandHi();
+
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["passbandLo"] = passbandLo;
+        config.conf[name][selectedDemod->getName()]["passbandHi"] = passbandHi;
+        config.release(true);
+    }
+
+    // How wide a slice around the tuned frequency the spectrum preview shows -- deliberately
+    // wider than the current demod bandwidth (the whole point is to see the adjacent channel
+    // the asymmetric filter exists to dodge), clamped so a bandwidth-locked wideband mode like
+    // WFM doesn't ask for an unreasonable amount of spectrum. See
+    // RADIO_SPECTRUM_FILTER_PLAN.md.
+    static double previewWidthFor(double bandwidth) {
+        return std::clamp<double>(bandwidth * 4.0, 3000.0, 500000.0);
     }
 
     void setAudioSampleRate(double sr) {
@@ -776,7 +987,7 @@ private:
 
     static void vfoUserChangedBandwidthHandler(double newBw, void* ctx) {
         RadioModule* _this = (RadioModule*)ctx;
-        _this->setBandwidth(newBw);
+        _this->setBandwidthSymmetric(newBw);
     }
 
     static void sampleRateChangeHandler(float sampleRate, void* ctx) {
@@ -861,6 +1072,32 @@ private:
     EventHandler<dsp::stream<dsp::stereo_t>*> afChainOutputChanged;
 
     VFOManager::VFO* vfo = NULL;
+
+    // Filter preview: a small always-visible spectrum around the carrier, with a shaded,
+    // draggable, independently-asymmetric passband -- see RADIO_SPECTRUM_FILTER_PLAN.md.
+    // passbandLo/passbandHi are Hz offsets from center (lo <= 0 <= hi), the local copies
+    // MiniSpectrum::draw() reads/writes each frame; applyPassbandEdges() pushes whatever it
+    // left them at down to the real VFO and persists them.
+    RadioSpectrumPreview preview;
+    ImGui::MiniSpectrum specWidget;
+    double passbandLo = 0.0;
+    double passbandHi = 0.0;
+    // The preview's zoom width, in Hz. Computed exactly once, in selectDemod() at mode
+    // selection, and then left alone for the rest of that mode's use -- not on bandwidth
+    // edits, not on passband drags, not on a per-frame re-derive. Two earlier, progressively
+    // more careful attempts at keeping this "live" (re-deriving from `bandwidth` every frame;
+    // then only re-deriving on explicit bandwidth changes) both still visibly changed the
+    // preview's zoom while trimming the passband, which is what actually mattered: a section
+    // of spectrum covering several channels turning into a single already-filtered signal
+    // zoomed in close, looking artificial ("a balloon sitting on a flat surface") and losing
+    // the adjacent-channel context the whole feature exists to show. Frozen entirely on
+    // Ralph's own direct instruction after live-testing all three attempts, 2026-08-10.
+    // Trade-off: RadioSpectrumPreview::setWidth()'s own protection against a bad
+    // source-sample-rate ratio (see its comment) now only gets (re-)applied at mode-select
+    // time rather than continuously, so a source that changes rate mid-session without a mode
+    // switch is unprotected until the next one -- not something observed in practice, since
+    // the one source tested against settles its rate once at startup and holds it.
+    double previewWidthHz = 40000.0;
 
     // IF chain
     dsp::chain<dsp::complex_t> ifChain;
