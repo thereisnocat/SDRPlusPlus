@@ -634,3 +634,145 @@ stress sequence (LSB -> USB -> SAM -> DSB) and confirmed it stayed clean through
 final build. Rebuilt clean (both `build` and `build_release`) and redeployed to all three
 locations (`SDR++.app`, `SDR++ RB.app`, `root_dev/modules/radio.dylib`), relaunched, confirmed
 running without crashing.
+
+## Live-testing feedback round 12 (2026-08-11) -- dragging past the Bandwidth field had no audible effect
+
+Reported: "Dragging the filters beyond the value in the Bandwidth field does not change the
+audio response; filters are limited to the number in the Bandwidth field. Dragging beyond that
+value should increase that value."
+
+Root cause: two independent filters sit in series for any demodulator -- RxVFO's own passband
+trim (what dragging the preview's edges actually controls), and the demodulator's own separate
+internal filter/AGC, sized from `bandwidth` (see e.g. `demod::AM::setBandwidth()` calling
+`demod.setBandwidth(bandwidth)` on the actual `dsp::demod::AM` block). `RadioModule::
+applyPassbandEdges()` (what a drag calls) only ever touched the first one -- deliberately, per
+round 2's own fix, since syncing `bandwidth` from every drag frame used to detune USB/LSB audio.
+So narrowing the drag audibly worked (RxVFO's own trim is the tighter of the two filters, so it
+was always the one actually limiting things), but widening past `bandwidth` did nothing audible:
+the demodulator's own, narrower, independent filter downstream was still the real bottleneck,
+and nothing ever told it to widen too.
+
+Traced round 2's actual mechanism precisely this time rather than avoiding it again:
+`VFOManager::VFO::setBandwidth()` calls `wtfVFO->setBandwidth(bandwidth)`, and
+`WaterfallVFO::setBandwidth()` recomputes `centerOffset` for REF_LOWER/REF_UPPER VFOs (USB/LSB)
+to keep the fixed tuning edge in place while the other edge moves -- correctly, in `wtfVFO`'s
+own bookkeeping -- but `VFOManager::VFO::setBandwidth()` never propagated that new centerOffset
+down to the real demod VFO's tuned offset. Exactly the same missing-resync shape as round 10's
+`setReference()` gap, just in a different sibling method. Fixed it there, at the actual source,
+instead of routing around it again: `VFOManager::VFO::setBandwidth()` (and `setSampleRate()`,
+found to have the identical latent gap while in there) now calls
+`dspVFO->setOffset(wtfVFO->centerOffset)` after touching `wtfVFO`'s bandwidth. A no-op for
+REF_CENTER modes (AM, SAM, ...), matching `setOffset()`'s own idempotent-for-REF_CENTER shape.
+
+With that fixed at the source, `RadioModule::applyPassbandEdges()` can now safely grow
+`bandwidth` again -- but, deliberately, *only* grow it, never shrink: `if (passbandHi -
+passbandLo > bandwidth) { setBandwidth(passbandHi - passbandLo); }` right before pushing the
+edges down to the VFO. Narrowing still needs no help from `bandwidth` at all (RxVFO's own trim
+already handles it); only widening past the existing ceiling needs `bandwidth` -- and the
+demodulator's own filter it drives -- to follow.
+
+Verified with actual UI automation, not just log output: launched fresh, reset to a clean
+symmetric passband via the numeric Bandwidth field (rigctl's own `M <mode> <bw>` command turned
+out to route through plain `setBandwidth()`, not `setBandwidthSymmetric()`, so it doesn't reset
+an existing asymmetric trim -- had to use the actual UI field to get a clean baseline), then used
+`cliclick`'s drag primitives on the widget's actual edge-handle pixel coordinates (located by
+scanning screenshot pixels for the edge/carrier marker colors, since eyeballing screen positions
+across two different retina-vs-point coordinate spaces proved unreliable by hand). Confirmed
+three things: (1) dragging the hi edge out past the current Bandwidth field value grows the
+field to match (3200 -> 5937 in AM); (2) dragging back in afterward leaves the field alone
+(5937, unchanged) while the passband itself still visibly narrows; (3) doing the same grow-drag
+in USB (a REF_LOWER mode, exactly where the old detuning bug lived) left the tuned-frequency
+readout completely unchanged throughout (1.310.000 before and after), confirming the
+setBandwidth() resync fix doesn't reintroduce round 2's original bug.
+
+One process note: several early automation attempts silently landed on the Claude Code app's own
+window instead of SDR++, because a Bash tool call issued between an explicit window-refocus and
+the subsequent cliclick let Claude Code's own window steal focus back. Fix was procedural, not
+code: always refocus SDR++ and perform the click/drag in the same Bash call, with no other tool
+calls in between.
+
+Rebuilt clean (both `build` and `build_release`), redeployed to all three locations, relaunched,
+confirmed running without crashing.
+
+## Live-testing feedback round 13 (2026-08-11) -- growing the outer edge dragged the inner edge too
+
+Reported: "In USB and LSB, dragging the outer bound will also move the inner bound away from
+the carrier, resulting in attenuation of lower audio frequencies. The inner bound should stay
+where it is and not be affected."
+
+Root cause, a direct side effect of round 12's own fix: passbandLo/passbandHi (both in
+RadioModule and inside RxVFO) are Hz offsets *from centerOffset* -- the same coordinate frame
+MiniSpectrum::draw() plots in. Growing `bandwidth` from applyPassbandEdges() moves centerOffset
+itself for USB/LSB (correctly -- see round 12's VFOManager::VFO::setBandwidth() fix, which keeps
+the fixed tuning edge in place while the far edge moves). But nothing was re-basing the *other*
+passband edge when that happened -- so both edges silently drifted along with centerOffset in
+absolute-frequency terms, not just the one actually being dragged. The inner edge (the one
+sitting right next to the carrier, passing the low audio frequencies closest to it) drifting
+away from the carrier is exactly what attenuated those frequencies.
+
+Fix, in `applyPassbandEdges()`: capture `centerOffset` immediately before and after the
+`setBandwidth()` call that growing triggers, and subtract that shift from *both* passbandLo and
+passbandHi before pushing them to the VFO. A no-op for REF_CENTER modes, where `setBandwidth()`
+never moves centerOffset to begin with.
+
+Verified with live instrumented testing (temporary per-frame fprintf diagnostic, since pixel-
+scanning screenshots proved too easy to misjudge -- an earlier read of a screenshot in this same
+round was corrected by Ralph directly: a screenshot I'd called "fine" was actually still showing
+the bug). Confirmed algebraically and then empirically: after growing the outer edge from a
+clean symmetric baseline, `centerOffset_new + passbandLo_new` came out exactly equal to
+`centerOffset_old + passbandLo_old` (the pinned edge's absolute frequency, bit-for-bit
+preserved) every time, while the dragged edge landed exactly where the user dragged it.
+`generalOffset` (the actual tuned/carrier frequency) stayed completely stable throughout every
+successful trial.
+
+Process note: automated UI-drag testing in this environment repeatedly fought two artifacts
+unrelated to the code under test -- (1) `cliclick`'s text-typing primitive (`t:...`) reliably
+triggered spurious tuning changes on this app (traced to nothing in the reported code paths;
+avoided by using mouse-only interactions, e.g. clicking a field's own +/- stepper buttons,
+instead of typing to reset test state), and (2) a Claude Code permission dialog intermittently
+stole window focus mid-sequence, causing a synthetic drag to land on the wrong window entirely
+with no error -- only caught by screenshotting and finding Claude's own UI frontmost instead of
+SDR++. Neither reflects anything about the actual fix; noted here so a future round doesn't
+waste time re-diagnosing the same two false leads.
+
+Rebuilt clean, redeployed to all three locations, relaunched, confirmed running without
+crashing.
+
+## Live-testing feedback round 14 (2026-08-11) -- carrier shown centered in USB/LSB instead of at an edge
+
+Reported: "The display of USB and LSB signals shows the carrier in the center of the filter
+rather than at one of the edges." Followed by "it works otherwise" -- i.e. everything from
+rounds 12-13 (growing past Bandwidth, inner edge staying put) was confirmed still correct; this
+was a new, narrower complaint about the carrier tick's position specifically.
+
+Not a code bug this time -- verified by checking `root_dev/radio_config.json` directly:
+
+    USB: bandwidth=3000  passbandLo=-3000.0  passbandHi=0.0
+    LSB: bandwidth=2108  passbandLo=0.0       passbandHi=2108.1
+
+Both are shifted a full half-bandwidth away from where they belong (should be +/-1500 for USB,
++/-1054 for LSB) -- exactly the shape round 12's own bug (fixed in round 13) would have left
+behind, persisted from *my own* automated drag-testing earlier in round 12, before the round-13
+fix existed to prevent it. Since a mode switch only ever *loads* whatever's persisted for that
+mode rather than re-validating it, this stale, asymmetric-relative-to-the-carrier state just sat
+in the test sandbox's config indefinitely, showing up as "carrier in the center" the next time
+either mode was selected -- matches exactly: carrierOffsetHz for USB was -1500 (bandwidth/2),
+sitting precisely halfway between passbandLo(-3000) and passbandHi(0).
+
+Confirmed the code itself is correct: reset both modes' passbandLo/passbandHi to fresh symmetric
+values (+/-bandwidth/2) directly in the config (app was stopped first to avoid the running
+process's in-memory config clobbering the on-disk edit), relaunched, and screenshotted all three
+reference cases zoomed in tight on the widget:
+
+- USB: carrier tick lands exactly on the *left* edge of the shaded region, passband extending
+  entirely above it (rightward) -- correct.
+- LSB: carrier tick lands exactly on the *right* edge, passband extending entirely below it
+  (leftward) -- correct, and the mirror image of USB as expected.
+- AM (REF_CENTER, unaffected control case): carrier stayed exactly centered in the shaded
+  region, confirming nothing about the REF_CENTER path regressed.
+
+No source change this round -- config-only. Worth remembering for next time: the persisted
+`radio_config.json` under whatever `-r` directory a session has been iterating against can carry
+forward corruption from *earlier, now-fixed* bugs, and won't self-heal just because the code that
+caused it was fixed later -- worth a quick sanity check of persisted passbandLo/Hi values after
+landing a fix like round 13's, rather than assuming a clean process relaunch alone proves it.

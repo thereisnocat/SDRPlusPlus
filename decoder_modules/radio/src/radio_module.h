@@ -758,27 +758,58 @@ private:
     }
 
     // Pushes passbandLo/passbandHi (already updated in place by MiniSpectrum::draw(), or
-    // freshly loaded/defaulted elsewhere) down to the real VFO and persists them. Deliberately
-    // does *not* touch `bandwidth`/vfo->setBandwidth() or previewWidthHz/preview.setWidth() --
-    // an earlier version of this synced both from the live drag on every frame, which turned
-    // out to be a serious bug, not just a cosmetic one: for USB/LSB, VFOManager::VFO's
-    // WaterfallVFO computes centerOffset *from* bandwidth (`generalOffset +- bandwidth/2`,
-    // anchored to the fixed edge those modes tune from -- see the round-2 fix's own comment on
-    // centerOffset vs generalOffset), so every drag frame was silently retuning the actual
-    // demodulated frequency along with it -- the cause of the heterodyne, the carrier tick
-    // visibly moving while dragging, and the preview zoom churn Ralph reported live, all from
-    // this one mechanism (REF_CENTER modes like AM don't move centerOffset when bandwidth
-    // changes, so there it only manifested as unwanted preview/waterfall-box churn, not a
-    // retune). The numeric Bandwidth field and the main waterfall's VFO box now stay exactly
-    // where they were last set explicitly (typing a number, dragging the main waterfall's own
-    // handles, or a mode switch) and simply don't track fine trims made here -- a real
-    // reduction in scope from round 2's "kept in sync" behaviour, but the alternative was
-    // dragging the passband quietly detuning the radio while USB/LSB SSB audio played.
-    // "Locking the outside bounds of the filter", the actual complaint that started round 2,
-    // is unaffected: minEdge/maxEdge past to MiniSpectrum::draw() are still the mode's true
-    // ceiling (maxBandwidth), not bandwidth, so dragging is still never blocked by it.
+    // freshly loaded/defaulted elsewhere) down to the real VFO and persists them.
+    //
+    // Also grows `bandwidth` -- and only grows it, never shrinks -- when the passband has been
+    // dragged wider than it. Narrowing the passband already changes the audible filter entirely
+    // on its own (RxVFO's own bandpass trim, independent of `bandwidth`), but *widening* past
+    // `bandwidth` used to have no audible effect at all: the demodulator itself keeps its own
+    // separate internal filter/AGC sized from `bandwidth` (see demod::AM::setBandwidth() and
+    // its siblings), completely independent of RxVFO's passband trim, and that second, narrower
+    // filter was the one actually limiting the audio -- dragging the preview's edges out past it
+    // widened the *display* and the VFO-level filter, but the demod's own filter downstream
+    // never got told to widen too, so nothing audible changed. Reported live 2026-08-11:
+    // "Dragging the filters beyond the value in the Bandwidth field does not change the audio
+    // response... Dragging beyond that value should increase that value."
+    //
+    // An earlier version of this file avoided calling setBandwidth() from here at all --
+    // *every* live drag frame used to sync bandwidth this way, and for USB/LSB that reliably
+    // detuned the actual audio, because VFOManager::VFO's WaterfallVFO recomputes centerOffset
+    // from bandwidth for those modes (anchored to the fixed edge they tune from), and nothing
+    // was propagating that new centerOffset down to the real demod VFO's tuned offset. That
+    // propagation gap is now fixed at its actual source, VFOManager::VFO::setBandwidth() itself
+    // (see its own comment -- the same missing-resync pattern round 10 already found and fixed
+    // in setReference()), so calling it from here is safe again. Still only doing it for actual
+    // growth, though, not on every frame regardless of direction: shrinking doesn't need it (the
+    // passband trim alone already does the job), and there's no reason to touch the numeric
+    // field/persisted config on a trim that's just making the filter narrower than its own
+    // ceiling, not asking for a new ceiling.
     void applyPassbandEdges() {
         if (!vfo || !selectedDemod) { return; }
+        double neededBandwidth = passbandHi - passbandLo;
+        if (neededBandwidth > bandwidth) {
+            // For USB/LSB, growing `bandwidth` here moves wtfVFO's centerOffset (see
+            // VFOManager::VFO::setBandwidth()'s own comment -- it keeps the fixed tuning edge in
+            // place while the *other* edge moves, which is exactly right for the real demod
+            // audio). But passbandLo/passbandHi, both here and inside RxVFO, are expressed as Hz
+            // offsets *from centerOffset* -- the same coordinate frame MiniSpectrum::draw() plots
+            // in -- so when centerOffset itself shifts, both edges silently shift right along
+            // with it in absolute-frequency terms, not just the one the user actually dragged.
+            // Reported live 2026-08-11: dragging USB/LSB's outer edge out was also dragging the
+            // *inner* edge -- the one sitting right next to the carrier -- away from it,
+            // attenuating the low audio frequencies nearest the carrier that it's supposed to be
+            // passing untouched. Re-basing both edges by exactly however far centerOffset moved,
+            // right here before they're pushed down to the VFO, keeps every edge pinned to the
+            // same absolute frequency it was at before this call -- including the one just
+            // dragged, since MiniSpectrum::draw() computed its new value in the *old*
+            // centerOffset's coordinate frame too. A no-op for REF_CENTER modes (AM, SAM, ...),
+            // where setBandwidth() never moves centerOffset in the first place.
+            double oldCenterOffset = vfo->wtfVFO->centerOffset;
+            setBandwidth(neededBandwidth);
+            double centerOffsetShift = vfo->wtfVFO->centerOffset - oldCenterOffset;
+            passbandLo -= centerOffsetShift;
+            passbandHi -= centerOffsetShift;
+        }
         vfo->setPassband(passbandLo, passbandHi);
         passbandLo = vfo->getPassbandLo();
         passbandHi = vfo->getPassbandHi();

@@ -44,7 +44,22 @@ void VFOManager::VFO::setCenterOffset(double offset) {
 void VFOManager::VFO::setBandwidth(double bandwidth, bool updateWaterfall) {
     if (_bandwidth == bandwidth) { return; }
     _bandwidth = bandwidth;
-    if (updateWaterfall) { wtfVFO->setBandwidth(bandwidth); }
+    if (updateWaterfall) {
+        wtfVFO->setBandwidth(bandwidth);
+        // Same gap as the one found in setReference() (see its own comment) -- for a
+        // REF_LOWER/REF_UPPER VFO (USB/LSB), WaterfallVFO::setBandwidth() correctly recomputes
+        // centerOffset to keep the tuned edge (lowerOffset/upperOffset) fixed while the other
+        // edge moves, but stops at its own bookkeeping; nothing here was carrying that new
+        // centerOffset down to the real demod VFO's actual tuned offset, so growing/shrinking
+        // bandwidth this way left the *audio* tuned to the pre-change frequency until something
+        // else happened to call setOffset()/setCenterOffset() again. Found live 2026-08-11
+        // chasing "dragging the spectrum-preview filter wider than the Bandwidth field doesn't
+        // widen the audio" -- growing the passband past the current bandwidth needs to grow
+        // `bandwidth` itself to match (see RadioModule::applyPassbandEdges()), which routes
+        // through here, which is what actually exposed this. For REF_CENTER VFOs (AM, SAM, ...)
+        // this is a no-op change, matching setOffset()'s own idempotent-for-REF_CENTER shape.
+        dspVFO->setOffset(wtfVFO->centerOffset);
+    }
     dspVFO->setBandwidth(bandwidth);
 }
 
@@ -63,6 +78,14 @@ double VFOManager::VFO::getPassbandHi() {
 void VFOManager::VFO::setSampleRate(double sampleRate, double bandwidth) {
     dspVFO->setOutSamplerate(sampleRate, bandwidth);
     wtfVFO->setBandwidth(bandwidth);
+    // Same missing-resync gap as setBandwidth() above (see its own comment) -- wtfVFO->
+    // setBandwidth() can move centerOffset for REF_LOWER/REF_UPPER VFOs, and nothing here
+    // propagated that to the real demod VFO's actual tuned offset. Not known to have been
+    // hit live through this particular call (selectDemod() always calls applyPassbandEdges()
+    // right after, which happens to re-tune things correctly as a side effect), but it's the
+    // identical latent bug, so fixing it here too rather than leaving a known duplicate in
+    // place.
+    dspVFO->setOffset(wtfVFO->centerOffset);
 }
 
 void VFOManager::VFO::setReference(int ref) {
