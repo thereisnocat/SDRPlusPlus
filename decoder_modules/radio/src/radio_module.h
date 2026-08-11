@@ -667,7 +667,10 @@ private:
             // worth showing, independent of how tightly the passband has actually been trimmed
             // this session. Still grows past that default if the passband is ever wider than
             // it (an edge case, but a sane one to keep exact).
-            previewWidthHz = previewWidthFor(std::max(selectedDemod->getDefaultBandwidth(), passbandHi - passbandLo));
+            // Parenthesised (std::max) -- windows.h's own max() macro turns an unparenthesised
+            // std::max(...) into MSVC error C2589. Same trap as bare M_PI; see the fix for
+            // iq_frontend.h's lockDecimation() for the full explanation.
+            previewWidthHz = previewWidthFor((std::max)(selectedDemod->getDefaultBandwidth(), passbandHi - passbandLo));
             preview.setWidth(previewWidthHz);
         }
         // Forces the preview's dB auto-scale to re-range from scratch rather than smoothing in

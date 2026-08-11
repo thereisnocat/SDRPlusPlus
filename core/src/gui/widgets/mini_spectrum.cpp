@@ -56,12 +56,16 @@ namespace ImGui {
         if (fftData != NULL && fftSize > 1) {
             float instMin = fftData[0], instMax = fftData[0];
             for (int i = 1; i < fftSize; i++) {
-                instMin = std::min(instMin, fftData[i]);
-                instMax = std::max(instMax, fftData[i]);
+                // Parenthesised (std::min)/(std::max) -- windows.h's own min()/max() macros
+                // turn an unparenthesised std::min/std::max(...) into MSVC error C2589. Same
+                // trap as bare M_PI; see the fix for iq_frontend.h's lockDecimation() for the
+                // full explanation.
+                instMin = (std::min)(instMin, fftData[i]);
+                instMax = (std::max)(instMax, fftData[i]);
             }
             // A little headroom above the peak and below the floor so the trace doesn't ride
             // the very top/bottom edge of the plot.
-            float margin = std::max((instMax - instMin) * 0.1f, 1.0f);
+            float margin = (std::max)((instMax - instMin) * 0.1f, 1.0f);
             instMin -= margin;
             instMax += margin;
             if (!rangeInit) {
@@ -84,14 +88,14 @@ namespace ImGui {
             }
             else {
                 framesSinceInit++;
-                float alpha = std::max(0.2f, 1.0f / (float)(framesSinceInit + 1));
+                float alpha = (std::max)(0.2f, 1.0f / (float)(framesSinceInit + 1));
                 rangeMin += (instMin - rangeMin) * alpha;
                 rangeMax += (instMax - rangeMax) * alpha;
             }
 
-            float range = std::max(rangeMax - rangeMin, 1.0f);
+            float range = (std::max)(rangeMax - rangeMin, 1.0f);
             float scale = size.y / range;
-            int steps = std::max(1, (int)size.x);
+            int steps = (std::max)(1, (int)size.x);
             float prevY = 0.0f;
             for (int i = 0; i <= steps; i++) {
                 float x = bb.Min.x + (float)i;

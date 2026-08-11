@@ -151,13 +151,17 @@ private:
     // "4x the current bandwidth" width for "closest power-of-two-of-the-input-rate to 4x the
     // current bandwidth" -- close enough for what's a rough visual guide, not a precise value
     // anything downstream depends on.
+    // Parenthesised (std::max)/(std::min) throughout this function and updateReshapeRate()
+    // below -- windows.h's own max()/min() macros turn an unparenthesised std::max/std::min(...)
+    // into MSVC error C2589. Same trap as bare M_PI; see the fix for iq_frontend.h's
+    // lockDecimation() for the full explanation.
     double snapWidth(double desiredWidth) {
         double effectiveSr = sigpath::iqFrontEnd.getEffectiveSamplerate();
-        if (effectiveSr <= 0.0) { return std::max(desiredWidth, 1000.0); }
+        if (effectiveSr <= 0.0) { return (std::max)(desiredWidth, 1000.0); }
         int shift = 0;
         int maxShift = (int)std::round(std::log2((double)dsp::multirate::PowerDecimator<dsp::complex_t>::getMaxRatio()));
         while (shift < maxShift && (effectiveSr / (double)(1LL << (shift + 1))) >= desiredWidth) { shift++; }
-        return std::max(effectiveSr / (double)(1LL << shift), 1000.0);
+        return (std::max)(effectiveSr / (double)(1LL << shift), 1000.0);
     }
 
     void updateReshapeRate() {
@@ -167,8 +171,8 @@ private:
         // FFT than its own update interval provides (see clampPassband()'s equivalent concern
         // over in rx_vfo.h -- same "a control fed from something the user can shrink a lot
         // needs its own floor" pattern).
-        int interval = std::max(1, (int)std::round(_width / FFT_RATE_HZ));
-        nzSize = std::min(interval, FFT_SIZE);
+        int interval = (std::max)(1, (int)std::round(_width / FFT_RATE_HZ));
+        nzSize = (std::min)(interval, FFT_SIZE);
         reshape.setKeep(nzSize);
         reshape.setSkip(interval - nzSize);
     }

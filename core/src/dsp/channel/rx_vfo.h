@@ -165,8 +165,11 @@ namespace dsp::channel {
         // at all, independent of whether it's actually in use.
         void generateTaps() {
             taps::free(ftaps);
-            double width = std::max(_passbandHi - _passbandLo, MIN_PASSBAND_WIDTH_HZ);
-            double transWidth = std::max(width * 0.1, MIN_PASSBAND_WIDTH_HZ / 2.0);
+            // Parenthesised (std::max) -- windows.h's own max() macro turns an unparenthesised
+            // std::max(...) into MSVC error C2589. Same trap as bare M_PI; see the fix for
+            // iq_frontend.h's lockDecimation() for the full explanation.
+            double width = (std::max)(_passbandHi - _passbandLo, MIN_PASSBAND_WIDTH_HZ);
+            double transWidth = (std::max)(width * 0.1, MIN_PASSBAND_WIDTH_HZ / 2.0);
             ftaps = taps::bandPass<complex_t>(_passbandLo, _passbandHi, transWidth, _outSamplerate);
         }
 
