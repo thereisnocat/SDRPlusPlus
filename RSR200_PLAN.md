@@ -641,15 +641,23 @@ streaming worked. Recorded as a punch list, not designed or fixed yet.
    draggable, independently-asymmetric passband, living in the Radio module above the mode
    selector. Full design and implementation notes in `RADIO_SPECTRUM_FILTER_PLAN.md` — applies
    to every source, not just RSR200.
-5. **Firmware version still displays wrong — not BCD-decoded.** `main.cpp`'s status line
-   (`snprintf(buf, sizeof(buf), "Serial %u, firmware %u", ...)`, around line 350) prints
-   `verFirmware` as a plain decimal `uint32_t`, but `rsr200_protocol.h`'s version reply
-   parsing (`readU32` at the two call sites feeding `firmware`) reads it as straight binary
-   rather than packed BCD. DP calls out firmware "225" by that exact three-digit form
-   (`rsr200_protocol.h`'s own header comment cites "firmware 225"), which is the shape of a
-   BCD-encoded value, not a raw integer — so the fix is almost certainly in how the field is
-   decoded, not just how it's formatted for display. Not yet fixed; noted here so the next
-   pass at it starts from the right file and line instead of re-finding them.
+5. **Firmware version still displays wrong — not BCD-decoded. Fixed 2026-08-11.** Confirmed
+   directly against the real unit: it reports the raw firmware field as the binary value
+   0x0225 (549 decimal), and Ralph independently confirmed the true firmware is 225 -- BCD
+   digits "0225", not the binary integer. Fixed at the source rather than at display time:
+   `rsr200_protocol.h` gained a generic `bcdToDecimal()` helper, applied at both places the
+   32-bit firmware field gets parsed (`parseEmbeddedCommand()` for the USB/embedded reply,
+   `parseLanVersionPacket()` for the LAN one) -- `main.cpp`'s display code needed no change,
+   since it was always just printing whatever `Reply::firmware` already contained. Serial
+   number is untouched; the DP describes only the firmware field with the "4 digit
+   hexadecimal value" phrasing that signals packed BCD, and the observed serial number (40)
+   shows no sign of the same misreading. `test/test_protocol.cpp`'s existing version-report
+   checks had encoded firmware "225" as the raw binary byte `0xE1` -- exactly the assumption
+   this fix corrects -- so they were updated to a genuinely BCD-packed `0x0225`, plus a new
+   dedicated block directly exercising `bcdToDecimal()` itself. Full suite (`core/test/
+   run_tests.sh`) passes, 0 failures across all 13 suites. Confirmed live 2026-08-11 once the
+   device was reconnected: display now reads "Serial 40, firmware 225" against the real
+   device, matching Ralph's independently-confirmed true firmware version exactly.
 6. **Resampler predecimation overflow, hit live during clock/decimation testing.** Caught in
    the log during the same live session, right after item 1/2's imprecise-clock and
    opaque-rate-relationship issues would have been in play: a burst of rapid Start/Stop and
@@ -859,3 +867,207 @@ the preview's width was. Whether it's safe to snap those too, or whether RSR200'
 `adcClockMHz`/decimation controls should instead be steered (or at least warned) away from
 rates that don't divide nicely against common demod IF rates, needs its own look rather than
 a quick copy of the preview's fix.
+
+## Live-testing feedback (2026-08-11) -- VHF preamp doesn't activate
+
+Reported: "Selecting Use VHF input (else HF1) and VHF preamp does not activate the VHF
+preamp. I've tested this with HDSDR and the Reuter RSR200 EXTio module and it works there,
+so I know the preamp is properly connected to the radio."
+
+Confirmed live against the real device (connected via USB, shows up generically as an
+"FTDI SuperSpeed-FIFO Bridge") with a temporary diagnostic that logged the actual bytes
+`applyConfig()` constructs and sends for `VAR_SWITCH`: the correct value was always being
+built -- `0x0082` for VHF input + preamp both on (bit 1 + bit 7), matching the protocol
+exactly. So the bug was never about *what* gets sent, only about *when*.
+
+Root cause: `Device::configuredOnce`, which gates whether the ADC clock and data-
+transmission commands get resent on `applyConfig()`, is set `true` on the first successful
+configuration and was **never reset** on `stop()`. `applyConfig()`'s own comment already
+documents why that matters: "Changing the ADC clock or the transmission settings triggers a
+synchronisation event" -- and `stop()`'s own comment says "Stop Stream closes the USB
+endpoint entirely... the next Start has to reopen and reconfigure from scratch either way."
+But because `configuredOnce` stayed `true` across a stop/start within the same process, a
+same-session restart (exactly how a user has to test these particular checkboxes, since
+they're disabled while running) would see `clockChanged`/`formatChanged` both false --
+nothing else changed -- and skip resending the clock and transmission-format commands
+entirely, sending *only* the switch register on its own. The radio apparently needs the
+preceding synchronisation event those two commands trigger for the switch register's
+relay-affecting bits (VHF routing, preamp) to actually take hold; sent alone, the same
+correct value doesn't reach the relays.
+
+Reproduced and verified the mechanism directly with a second diagnostic logging
+`configuredOnce`/`formatChanged`/`clockChanged` on every `applyConfig()` call:
+
+    First start (fresh process):  configuredOnce=0 -> clock=1 transmission=1 (correct)
+    Same-session restart (before fix): configuredOnce=1, nothing else changed
+                                        -> clock=0 transmission=0 (bug: switch sent alone)
+    Same-session restart (after fix):  configuredOnce=0 -> clock=1 transmission=1 (fixed)
+
+Fixed by resetting `configuredOnce` (and `pending`/`streaming`/`expectSequence`, the same
+class of stale per-session state) inside `Device::setTransport(nullptr)` -- the existing
+signal `stop()` already sends when it tears the transport down, so no change to `main.cpp`
+was needed. Every fresh `start()` now gets the full reconfiguration sequence again, matching
+what `stop()`'s own comment already said should happen.
+
+Not independently confirmed by ear/eye that the preamp is now audibly/visually stronger --
+the antenna in use during this session showed very weak FM broadcast reception generally
+(flat noise floor, no clear stations, regardless of preamp state), which made a clean before/
+after signal-level comparison unreliable. The structural fix is well-evidenced on its own
+(exact reproduction of the reported symptom's trigger condition, a comment already in the
+code stating what should happen, and confirmed correct command sequencing before/after), but
+worth Ralph's own ears/HDSDR-style comparison to close the loop.
+
+Rebuilt clean, redeployed to all three locations, relaunched, confirmed running without
+crashing.
+
+## Live-testing feedback, continued (2026-08-11) -- preamp still not activating; primary source re-verified
+
+Reported: "The preamp is still not activating. It gives a visual indication on its screen
+when it's working. I verified that it HDSDR. It does not happen here." -- i.e. the radio's
+own front-panel indicator, not just SDR++'s own display, is the ground truth, and it
+confirms the fix above did not resolve the actual problem.
+
+Went back to the primary source rather than this plan doc's own transcription of it --
+`RSR200_DP_ENG_V52.pdf`, found locally in `~/Downloads/Reuter RSR200 documents/`. Confirmed:
+
+- **Bit assignment is exactly right.** DP 3.3's "Set variable 16 bit value" table, variable
+  5 ("Switch"): "Bit 7: Preamplifier VHF, 0 = off, 1 = on" -- matches
+  `SW_VHF_PREAMP = 1 << 7` in `rsr200_protocol.h` precisely. Rules out a transcription error
+  in the bit position.
+- **Firmware version confirmed 225, not 549** -- Ralph identified `verFirmware` as printed
+  (549) is a decimal misreading of a BCD-encoded 0x0225; the real firmware is 225, exactly
+  the version this DP (v0.52) was written against. Rules out a firmware-version protocol
+  mismatch (already flagged as a known, unrelated display bug in the punch list, item 5).
+- **Found the actual missing piece, DP 4.1**: "After sending a command block, you must wait
+  for confirmation of the last command... before new commands can be sent." `applyConfig()`
+  has never done this -- it fires up to five separate 0xF5/0xF2/0xB4 commands back-to-back
+  with nothing reading the transport to observe any embedded confirmation in between, let
+  alone waiting for one.
+
+Tried fixing that gap two ways:
+
+1. **Re-send VAR_SWITCH again after Start Stream**, on the theory that the switch register
+   might only be honored once streaming is actually underway. Tested live, checked the
+   radio's own front-panel indicator directly -- no change, preamp still doesn't light.
+   Reverted (see radio_module -- sorry, `main.cpp`'s `start()` -- diff; removed cleanly).
+
+2. **A fixed `sleep_for()` pacing delay between each command** in `applyConfig()`, since a
+   true wait-for-the-real-confirmation loop was judged too risky to add here: the USB read
+   it would need to pump (`Transport::nextFrame()`) is configured with no pipe timeout
+   (`FT_SetPipeTimeout(..., 0)`) and runs synchronously on whatever thread calls `start()`,
+   before the worker thread that normally drains frames even exists -- if streaming ever
+   stalled during that wait, the call would hang forever instead of failing cleanly. A fixed
+   sleep looked like the safe compromise. **It was not safe**: reproducibly broke Start
+   Stream outright on the real device ("Last error: Start Stream failed"). Best working
+   theory: DP 4.1 says USB streaming auto-starts right after power-up into a small
+   (4096-byte double-buffered) transmit FIFO -- sleeping without ever reading
+   `Transport::nextFrame()` just lets that already-unread IN pipe back up further before the
+   next OUT write, rather than actually helping. Reverted immediately once confirmed live;
+   `rsr200_device.h`'s `applyConfig()` is back to firing all commands with no gap, exactly as
+   before this round, plus a comment recording why a bare sleep here doesn't work so a future
+   pass doesn't retry the same broken idea.
+
+**Status: not yet resolved.** What's now been ruled out, with reasonable confidence: wrong
+bit position, wrong command format, wrong firmware-version assumptions, the `configuredOnce`
+reset bug (real, fixed, confirmed via diagnostic -- but not sufficient on its own), sending
+the command at the wrong point relative to Start Stream. What's still open: DP 4.1's
+documented wait-for-confirmation requirement is real and unimplemented, but implementing it
+safely needs the confirmation to be observed by *reading* the stream during the wait, not
+just pausing -- which means either (a) draining frames during the pause instead of sleeping
+blindly, or (b) a larger change moving `applyConfig()`'s command sequence into the worker
+thread's own already-running `pump()`/`service()` loop as a small state machine, so waiting
+for a real ack no longer risks blocking the caller. Neither attempted yet after the sleep
+regression; worth trying (a) first, next round, as the smaller change.
+
+Also worth requesting from Ralph directly next round, since code archaeology and safe live
+experimentation have both been exhausted without resolving this: a raw USB packet capture
+from the Windows/HDSDR session (e.g. Wireshark + USBPcap) showing the actual byte sequence
+and timing HDSDR's ExtIO module uses when the preamp successfully engages, to compare
+directly against SDR++'s sequence rather than continuing to infer timing requirements from
+the DP's prose alone.
+
+Reverted cleanly, rebuilt, redeployed to all three locations, relaunched, confirmed running
+without the Start-Stream regression.
+
+## VHF preamp -- root cause found and fixed, confirmed live (2026-08-11)
+
+Resolved via a USB packet capture Ralph took of HDSDR's ExtIO module actually engaging the
+real preamp (`HDSDR-RSR200-VHF-Preamp.pcapng`, ~557 MB, 17134 packets). Parsed directly with
+scapy (`pip3 install --user scapy`; no Wireshark/tshark available, so raw USBPcap URBs were
+walked by hand -- the first 2 bytes of each captured packet are the USBPcap header length,
+27 in every case here, so payload = `raw[27:]`, and the RSR200's own command structure starts
+right there unchanged: 4-byte command number, then the documented byte layout). Filtered for
+the `0xF5` (Set Variable) instruction byte across the whole capture -- only 8 such commands
+in the entire session:
+
+    t+0.000s  var=3 (antenna ctl HF1/VHF)  value=0x0000   -- startup init
+    t+0.004s  var=4 (antenna ctl HF2)      value=0x0000   -- startup init
+    t+0.009s  var=1 (attenuator ADC1)      value=0x0000   -- startup init
+    t+0.013s  var=2 (attenuator ADC2)      value=0x0000   -- startup init
+    t+0.017s  var=5 (switch)               value=0x0001   -- startup init (bit 0 only)
+    t+0.035s  var=5 (switch)               value=0x0001   -- duplicate/retry
+    t+15.384s var=5 (switch)               value=0x0003   -- bits 0+1: VHF input selected
+    t+21.660s var=5 (switch)               value=0x001B   -- bits 0+1+3+4: preamp engaged
+
+The one command that actually engages the preamp adds bits 3 and 4 to the switch register --
+**not bit 7**, which is what `SW_VHF_PREAMP` (and this project's own reading of DP 3.3's
+table, "Bit 7: Preamplifier VHF") had been sending for the entire investigation. Bits 3+4 are
+documented as "Remote power supply HF1/VHF": bit 3 on/off, bit 4 plain +12V vs RS-232
+"Control" mode -- nominally meant for powering an *external* active antenna accessory
+(RLA4/RFA2/RAP, DP 4.4), not an internal preamp. The straightforward reading: on this
+hardware, the VHF preamp module is wired and powered through the same rail an external
+remote-powered accessory would use, rather than through a separately switched internal
+circuit -- so bit 7 may simply be inert on this unit/firmware regardless of what DP 3.3's
+table says it should do. (Also notable, though unrelated to the bug: HDSDR always sets bit 0,
+ADC2 CLK inverted, even in its very first startup command before VHF/preamp are touched at
+all -- an idle default of theirs, not something tied to this control. Left alone; nothing
+observed depends on it.)
+
+Fixed in `main.cpp`'s `buildConfig()`: `vhfPreamp` now sets `SW_REMOTE_PWR_CH1 |
+SW_REMOTE_CTRL_CH1` (bits 3+4) instead of `SW_VHF_PREAMP` (bit 7), matching the captured
+sequence exactly (`SW_ADC1_TO_VHF | SW_REMOTE_PWR_CH1 | SW_REMOTE_CTRL_CH1` = 0x1B, byte-for-
+byte identical to HDSDR's own command). Verified live against the real hardware -- Ralph
+confirmed directly on the radio's own front-panel display, not just SDR++'s spectrum: **the
+preamp indicator is now active and shows the correct text.**
+
+`configuredOnce` fix from earlier in this investigation stays in place -- both were real bugs
+independently required for correct behaviour (the earlier one so the full command sequence
+gets resent on every restart, this one so the resent commands actually mean the right thing).
+
+Rebuilt clean, redeployed to all three locations, relaunched, confirmed running and the fix
+active. This closes out the preamp investigation.
+
+### Related, found by Ralph during this same confirmation pass: VHF spectrum reads inverted -- fixed
+
+Tuning to a known station by RDS while on VHF input showed the displayed frequency and the
+actual received station disagreeing, and dragging the waterfall's own frequency-range control
+moved the spectrum in the opposite direction from HF operation -- both symptoms of a
+mirrored/inverted spectrum. Ralph diagnosed and confirmed a workaround himself: checking
+"Invert IQ" in the source panel corrects it.
+
+Root cause was already half-fixed in the code and just never wired up: `tuneFor()` (DP's own
+Nyquist-zone arithmetic) computes `Tuning::spectrumInverted` correctly on every retune --
+true for any even-numbered zone -- but nothing downstream ever read that field. Confirmed this
+is *not* simply "VHF inverted, HF1 not": at a 125 MHz ADC clock, 30 MHz (HF1-ish) lands in
+zone 1 (odd, not inverted) while 80 MHz (within VHF's 66-150 MHz range) lands in zone 2 (even,
+inverted) -- but VHF's own range spans multiple zones of alternating parity depending on the
+exact frequency and clock, so a single manual checkbox can't stay correct across a retune the
+way a per-block check tied to the actual tuning can.
+
+Fixed in `Device::deliver()`: when `tuning.spectrumInverted` is true, every delivered
+sample's Q component is negated (conjugating the signal, the standard correction for a
+mirrored spectrum, and the same net effect "Invert IQ" was achieving manually) -- applied
+fresh on every block, so it tracks retuning automatically rather than needing the checkbox
+touched again. This makes "Invert IQ" redundant for this cause specifically; it's left alone
+as a manual override for other reasons someone might still want it (e.g. genuinely
+reversed antenna wiring), and it stays *off* in the persisted config from this session, so
+there's no double-negation to worry about.
+
+Added six new checks in `test/test_device.cpp` ("Spectrum inversion follows the current
+tuning, not a fixed setting") exercising exactly this: one `Device` instance, tuned first to
+30 MHz (zone 1) then 80 MHz (zone 2) then back to 30 MHz, with a known synthetic I/Q sample
+poked into each block, checking Q comes through unchanged/negated/unchanged across the three
+retunes. Full suite (`core/test/run_tests.sh`) passes, 0 failures across all 13 suites, before
+ever touching the real hardware. Rebuilt, redeployed to all three locations, relaunched,
+confirmed running with a full, correctly-aligned FM broadcast band visible across 90-104 MHz
+on VHF input.

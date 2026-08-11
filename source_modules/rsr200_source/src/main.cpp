@@ -91,7 +91,31 @@ private:
         c.opMode = dualChannel ? OP_INDEPENDENT : OP_PARALLEL_ADD;
         c.swapChannels = swapChannels;
         c.tunedHz = tunedHz;
-        c.switchRegister = (useVhf ? SW_ADC1_TO_VHF : 0) | (vhfPreamp ? SW_VHF_PREAMP : 0) |
+        // vhfPreamp sets the *remote power* bits (3+4), not SW_VHF_PREAMP (bit 7) --
+        // confirmed 2026-08-11 from a USB packet capture of HDSDR's ExtIO module actually
+        // engaging the radio's own front-panel preamp indicator. DP 3.3's own table labels
+        // bit 7 "Preamplifier VHF, 0=off, 1=on", and that's what this code sent for weeks of
+        // live testing -- always the textbook-correct bytes per the written spec, confirmed
+        // by direct diagnostic logging, and it never once lit the indicator. The capture
+        // shows HDSDR never touches bit 7 at all: the one and only command it sends when the
+        // preamp is engaged is SET_VARIABLE(switch, 0x001B) -- bits 0, 1, 3, 4 -- added on
+        // top of whatever was already set (0x0003, bits 0+1, from selecting VHF input
+        // moments earlier). Bits 3+4 are documented as "Remote power supply HF1/VHF": bit 3
+        // on/off, bit 4 plain +12V vs RS-232 "Control" mode -- normally meant for powering an
+        // external active antenna (RLA4/RFA2/RAP), per DP 4.4. The straightforward reading:
+        // on this hardware, the VHF preamp module is wired and powered exactly like an
+        // external remote-powered accessory would be, through the same rail, rather than
+        // through a separately switched internal circuit -- so bit 7 may be genuinely inert
+        // on this unit/firmware regardless of what the table says it should do. Matches the
+        // captured sequence exactly: SW_ADC1_TO_VHF | SW_REMOTE_PWR_CH1 | SW_REMOTE_CTRL_CH1.
+        //
+        // Bit 0 (SW_ADC2_CLK_INVERTED) is also always set in the capture's every command,
+        // including before VHF/preamp are touched at all -- HDSDR's own idle default, not
+        // something tied to this control. Left alone here: it's a dual-channel ADC2 clock
+        // phase setting, unrelated to what this checkbox does, and changing our own default
+        // for it isn't supported by anything actually seen going wrong so far.
+        c.switchRegister = (useVhf ? SW_ADC1_TO_VHF : 0) |
+                            (vhfPreamp ? (SW_REMOTE_PWR_CH1 | SW_REMOTE_CTRL_CH1) : 0) |
                             (dualChannel ? SW_ADC2_TO_HF2 : 0);
         c.attenuator1 = atten1;
         c.attenuator2 = atten2;

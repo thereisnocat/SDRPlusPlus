@@ -325,6 +325,67 @@ int main() {
     }
 
     // -----------------------------------------------------------------
+    printf("\nSpectrum inversion follows the current tuning, not a fixed setting\n");
+    {
+        // A wanted frequency's Nyquist zone -- and therefore whether it comes off the ADC
+        // mirrored -- depends on the exact frequency and the ADC clock, not on which of the
+        // radio's inputs it happens to be reached through (found live 2026-08-11: VHF and
+        // HF1 aren't uniformly one or the other). 125 MHz clock, half = 62.5 MHz: 30 MHz
+        // falls in zone 1 (odd, not inverted) and 80 MHz in zone 2 (even, inverted), so one
+        // Device exercises both without needing separate setups.
+        FakeTransport t;
+        Device d;
+        d.setTransport(&t);
+        Config c;
+        c.format = { 1, 16 };
+        c.adcClockHz = 125e6;
+        d.applyConfig(c, 0);
+        const BlockLayout l = d.layout();
+
+        SampleBlock got;
+        d.onSamples = [&](const SampleBlock& b) { got = b; };
+
+        auto pokeSample = [&](std::vector<uint8_t>& block, int16_t iVal, int16_t qVal) {
+            block[0] = (uint8_t)(iVal & 0xFF);
+            block[1] = (uint8_t)((iVal >> 8) & 0xFF);
+            block[2] = (uint8_t)(qVal & 0xFF);
+            block[3] = (uint8_t)((qVal >> 8) & 0xFF);
+        };
+
+        d.tune(30e6, 0);
+        check(d.currentTuning().zone == 1 && !d.currentTuning().spectrumInverted,
+              "30 MHz at a 125 MHz clock is zone 1, not inverted");
+        std::vector<uint8_t> notInverted = makeLanBlock(l, 1, 1, nullptr);
+        pokeSample(notInverted, 1000, 2000);
+        t.frames.push_back(notInverted);
+        d.pump();
+        check(std::abs(got.chA[1] - (2000.0f / 32768.0f)) < 1e-6f,
+              "not inverted: Q comes through unchanged");
+
+        d.tune(80e6, 0);
+        check(d.currentTuning().zone == 2 && d.currentTuning().spectrumInverted,
+              "80 MHz at the same clock is zone 2, inverted");
+        std::vector<uint8_t> inverted = makeLanBlock(l, 2, 1, nullptr);
+        pokeSample(inverted, 1000, 2000);
+        t.frames.push_back(inverted);
+        d.pump();
+        check(std::abs(got.chA[0] - (1000.0f / 32768.0f)) < 1e-6f,
+              "inverted: I is untouched");
+        check(std::abs(got.chA[1] - (-2000.0f / 32768.0f)) < 1e-6f,
+              "inverted: Q is negated to conjugate the spectrum");
+
+        // Retuning back out of the even zone stops correcting again -- this isn't a sticky
+        // per-session setting, it tracks the tuning live.
+        d.tune(30e6, 0);
+        std::vector<uint8_t> backToOdd = makeLanBlock(l, 3, 1, nullptr);
+        pokeSample(backToOdd, 1000, 2000);
+        t.frames.push_back(backToOdd);
+        d.pump();
+        check(std::abs(got.chA[1] - (2000.0f / 32768.0f)) < 1e-6f,
+              "retuning back to an odd zone stops inverting again");
+    }
+
+    // -----------------------------------------------------------------
     printf("\nUSB framing uses the same device\n");
     {
         FakeTransport t;

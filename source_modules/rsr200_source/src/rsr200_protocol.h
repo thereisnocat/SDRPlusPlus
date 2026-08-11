@@ -327,6 +327,28 @@ namespace rsr200 {
         p[3] = (uint8_t)((v >> 24) & 0xFF);
     }
 
+    // DP 3.2/3.3 describe the firmware version field as "4 digit hexadecimal value firmware
+    // version" -- that's packed BCD (each nibble is one decimal digit), not a plain integer.
+    // The DP's own examples only ever write firmware versions as bare 3-digit numbers ("225",
+    // "549" nowhere appears) -- exactly the shape you'd expect from decimal digits packed one
+    // per nibble, not from a binary count. Verified live: this unit reports the raw 32-bit
+    // field as 0x0225, which read straight (readU32's normal binary interpretation) prints as
+    // decimal 549 -- but decoded as BCD (nibbles 5, 2, 2, 0 from the LSB, i.e. digits "0225"),
+    // it's 225, which is both a plausible firmware number on its own and, not coincidentally,
+    // exactly the version this project's protocol documentation (RSR200_DP_ENG_V52.pdf) was
+    // itself written against. Generic over any number of packed digits, so it doesn't assume
+    // firmware versions stay 3 digits forever.
+    inline uint32_t bcdToDecimal(uint32_t bcd) {
+        uint32_t result = 0;
+        uint32_t multiplier = 1;
+        while (bcd != 0) {
+            result += (bcd & 0xF) * multiplier;
+            multiplier *= 10;
+            bcd >>= 4;
+        }
+        return result;
+    }
+
     // A block is credible when the sync words are present and the counter matches its own
     // ones' complement. Both checks together make a false positive very unlikely, which is
     // what lets a receiver find block boundaries in an arbitrary byte stream.
@@ -558,7 +580,7 @@ namespace rsr200 {
         if (c[0] == instr::READ_VERSION) {
             r.kind = REPLY_VERSION;
             r.serial = (uint32_t)c[1] | ((uint32_t)c[2] << 8) | ((uint32_t)c[3] << 16);
-            r.firmware = readU32(c + 4);
+            r.firmware = bcdToDecimal(readU32(c + 4));
             return r;
         }
         r.confirmedCommand = readU32(c + 4);
@@ -582,7 +604,7 @@ namespace rsr200 {
         out = Reply();
         out.kind = REPLY_VERSION;
         out.serial = (uint32_t)p[5] | ((uint32_t)p[6] << 8) | ((uint32_t)p[7] << 16);
-        out.firmware = readU32(p + 8);
+        out.firmware = bcdToDecimal(readU32(p + 8));
         return true;
     }
 

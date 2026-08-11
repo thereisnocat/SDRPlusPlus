@@ -94,7 +94,39 @@ namespace rsr200 {
         static constexpr uint64_t ACK_TIMEOUT_MS = 500;
         static constexpr int MAX_ATTEMPTS = 3;
 
-        void setTransport(Transport* t) { transport = t; }
+        void setTransport(Transport* t) {
+            transport = t;
+            if (!t) {
+                // DP 3.3: Stop Stream closes the USB endpoint entirely, so whatever the
+                // radio's own switch/clock/format state was carries no guarantee into the
+                // *next* Start -- "the next Start has to reopen and reconfigure from scratch
+                // either way" (see applyConfig()'s own comment). But configuredOnce, once set
+                // true by the process's first-ever successful applyConfig(), was never being
+                // cleared here -- so a same-process restart (stop, flip a setting, start
+                // again) would see clockChanged/formatChanged both false (nothing the user
+                // touched actually differs from last time) and skip re-sending the ADC clock
+                // and data-transmission commands entirely, even though the endpoint closing
+                // means the radio needs them again just as much as it did the very first time.
+                //
+                // Found live 2026-08-11 chasing "Use VHF input + VHF preamp doesn't activate
+                // the preamp": confirmed via direct diagnostic logging that applyConfig() was
+                // constructing and sending the exact correct VAR_SWITCH bytes (variable 5,
+                // value 0x0082 for VHF + preamp both set) -- so the bug wasn't in *what* gets
+                // sent, only in *when*: a fresh-process first start sends clock + data-
+                // transmission + switch together and the preamp engages, but a same-session
+                // restart (the natural way to test a checkbox that's disabled while running)
+                // sends only the switch register on its own, with neither of the two commands
+                // the radio apparently needs first to actually apply it to the relays.
+                //
+                // pending/streaming/expectSequence reset alongside it for the same reason --
+                // all of it is state from a USB session the endpoint closing just ended, not
+                // something the next one should start from.
+                configuredOnce = false;
+                pending.hasCommand = false;
+                streaming = false;
+                expectSequence = false;
+            }
+        }
         Transport* getTransport() const { return transport; }
 
         const Config& config() const { return cfg; }
@@ -115,6 +147,21 @@ namespace rsr200 {
         //  - Changing the ADC clock or the transmission settings triggers a synchronisation
         //    event, which is what puts the two channels back in phase (DP 4.6). So the
         //    clock is set before the LOs, never after.
+        //
+        // Tried and reverted 2026-08-11: a fixed sleep_for() between each of the commands
+        // below, on the theory (DP 3.1/4.1: "wait for confirmation... before new commands
+        // can be sent") that firing all five back-to-back gives the radio's firmware no real
+        // processing time. Broke Start Stream outright on real hardware -- confirmed live,
+        // reproducibly. Most likely cause: the RSR200 auto-starts USB streaming right after
+        // power-up (DP 4.1) into a small (4096-byte double-buffered) transmit FIFO, and
+        // nothing reads Transport::nextFrame() during applyConfig() at all, sleeping or not
+        // -- so a sleep-based pause just gives the already-unread IN pipe more time to back
+        // up before the next OUT write, rather than actually helping. A real fix would need
+        // to drain frames (or otherwise service the IN pipe) during any deliberate pause
+        // here, not just wait -- do that in a future pass rather than reintroducing a bare
+        // sleep. See RSR200_PLAN.md's live-testing entry for the full account (bit-for-bit
+        // correct VAR_SWITCH content confirmed via diagnostic, confirmed against the radio's
+        // own front-panel indicator that the preamp still doesn't engage either way).
         // ---------------------------------------------------------------------
 
         bool applyConfig(const Config& next, uint64_t nowMs) {
@@ -310,6 +357,29 @@ namespace rsr200 {
 
             unpack(iq, frames, cfg.format, gain, bufA.data(),
                    cfg.format.channels == 2 ? bufB.data() : nullptr);
+
+            // tuneFor() already works out, per DP's own Nyquist-zone arithmetic, exactly
+            // when the current tuning lands in an even zone and therefore comes off the ADC
+            // mirrored -- tuning.spectrumInverted was computed right there every time tune()
+            // runs, and nothing downstream ever looked at it. Found live 2026-08-11: Ralph
+            // noticed VHF reception reading at the wrong frequency (RDS-confirmed) and the
+            // waterfall panning backwards relative to HF, diagnosed it as a mirrored
+            // spectrum, and confirmed manually enabling SDR++'s own "Invert IQ" option fixed
+            // it -- correct as an explanation, but wrong as a place to leave the fix: which
+            // zone a tuned frequency falls in depends on the exact frequency and the ADC
+            // clock rate, not just "HF vs VHF" (at a 125 MHz clock, for instance, VHF's own
+            // 66-150 MHz range straddles two different zones with opposite parity), so a
+            // single manual checkbox can't stay correct across a whole retune the way this
+            // per-block check does. Negating the Q sample of every complex pair conjugates
+            // the signal, which is the standard correction for a mirrored spectrum -- same
+            // effect as the "Invert IQ" option this makes redundant, just applied
+            // automatically and only when the current tuning actually needs it.
+            if (tuning.spectrumInverted) {
+                for (size_t i = 1; i < need; i += 2) { bufA[i] = -bufA[i]; }
+                if (cfg.format.channels == 2) {
+                    for (size_t i = 1; i < need; i += 2) { bufB[i] = -bufB[i]; }
+                }
+            }
 
             lastBlock.chA = bufA.data();
             lastBlock.chB = (cfg.format.channels == 2) ? bufB.data() : nullptr;

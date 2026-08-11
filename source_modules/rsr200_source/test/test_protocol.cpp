@@ -263,6 +263,15 @@ int main() {
     }
 
     // -----------------------------------------------------------------
+    printf("\nBCD decoding\n");
+    {
+        check(bcdToDecimal(0x0225) == 225, "0x0225 BCD-decodes to 225, not 549");
+        check(bcdToDecimal(0) == 0, "zero decodes to zero");
+        check(bcdToDecimal(0x9999) == 9999, "all-nines round-trips");
+        check(bcdToDecimal(0x0007) == 7, "single low digit, no leading-zero artefacts");
+    }
+
+    // -----------------------------------------------------------------
     printf("\nReply parsing\n");
     {
         // Plain confirmation: four zero bytes then the command number being confirmed.
@@ -281,15 +290,19 @@ int main() {
         r = parseEmbeddedCommand(self);
         check(r.selfGenerated, "command number 0 marks a self-generated report");
 
-        uint8_t ver[8] = { instr::READ_VERSION, 0x34, 0x12, 0x00, 0xE1, 0x00, 0x00, 0x00 };
+        // DP 3.2/3.3 describe the firmware field as a "4 digit hexadecimal value" -- packed
+        // BCD, one decimal digit per nibble -- not a plain binary count. 0x0225 on the wire
+        // (bytes 0x25, 0x02, 0x00, 0x00 little-endian) is firmware "225" once BCD-decoded;
+        // it is not the binary value 0x0225 = 549 decimal. See bcdToDecimal()'s own comment.
+        uint8_t ver[8] = { instr::READ_VERSION, 0x34, 0x12, 0x00, 0x25, 0x02, 0x00, 0x00 };
         r = parseEmbeddedCommand(ver);
-        check(r.kind == REPLY_VERSION && r.serial == 0x1234 && r.firmware == 225, "USB version report parses");
+        check(r.kind == REPLY_VERSION && r.serial == 0x1234 && r.firmware == 225, "USB version report parses (BCD-decoded)");
 
         // The 12-byte standalone LAN version packet, which is the only reply sent outside
         // the stream.
-        uint8_t lanver[12] = { 12, 0, 0, 0, instr::READ_VERSION, 0x34, 0x12, 0x00, 0xE1, 0x00, 0x00, 0x00 };
+        uint8_t lanver[12] = { 12, 0, 0, 0, instr::READ_VERSION, 0x34, 0x12, 0x00, 0x25, 0x02, 0x00, 0x00 };
         check(parseLanVersionPacket(lanver, sizeof(lanver), r) && r.serial == 0x1234 && r.firmware == 225,
-              "LAN version packet parses");
+              "LAN version packet parses (BCD-decoded)");
         lanver[0] = 8;
         check(!parseLanVersionPacket(lanver, sizeof(lanver), r), "a wrong length is rejected");
     }
