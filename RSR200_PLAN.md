@@ -509,7 +509,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **0** | **Done** — D3XX confirmed universal and user-space, SFP module ordered (§1). Remaining: install D3XX to `/usr/local` (needs sudo). | No |
 | **1** | **Done** — `src/rsr200_protocol.h`: block geometry, USB packet geometry, status header, 16/24-bit unpacking, block resynchronisation, all nine PC→radio commands, reply parsing, port/DSP mode bytes, hardware diversity weight packing, Nyquist zone mapping. `test/test_protocol.cpp` checks every documented figure and the manual's worked examples; wired into `core/test/run_tests.sh`. | No |
 | **1b** | **Done** — `src/rsr200_device.h`: the transport-agnostic device layer. Configuration ordering, command numbering, acknowledgement and fresh-number retry, embedded reply extraction, sequence-gap detection, sample delivery. Covered by `test/test_device.cpp` against a fake transport. Phase 2 is now mostly plugging in a socket. | No |
-| **2** | **Transport built and tested, not yet proven against the radio** — `src/rsr200_lan_transport.h`: TCP connect, block resync from an arbitrary byte stream (garbage prefix, split blocks, glued blocks all covered), command send. Implements `Transport` (`sendCommand`/`nextFrame`) so the device layer needs no changes to use it. `test/test_lan_transport.cpp` proves this against a synthetic loopback server, the same "known-correct source before hardware" approach used throughout this project; not yet run against a real radio — it was on the Windows machine it is known to work on over USB when this was written (§1). First live IQ and the version-query open question (§10) are still open. | No for what's built; yes for what's left |
+| **2** | **Transport now wired into the actual module, 2026-08-12 — not yet run against the radio.** `src/rsr200_lan_transport.h`'s `LanTcpTransport` (TCP connect, block resync from an arbitrary byte stream, command send; `test/test_lan_transport.cpp` proves it against a synthetic loopback server) had existed since before this date but was never reachable from `main.cpp` — no UI, no way to select it. Now wired in properly: a "Transport" combo (USB / LAN TCP) in `menuHandler()`, a "Radio IP address" text field shown only for LAN, `start()`/`stop()` branch on the selection and hold whichever concrete transport is active behind a single `Transport* activeTransport`, and both of `main.cpp`'s ad-hoc direct-transport calls (the version-query probe, the Stop Stream command) now go through `activeTransport->isLan()`/`streamPort()` instead of hardcoding USB framing. `Device` itself needed zero changes — it was already fully transport-agnostic internally. Getting to this point involved a real networking side-quest (see the section below): the radio's LAN interface turned out not to be joined to the network at all until power-cycled, and it landed on a DHCP-assigned address, not the documented static default — worth a DHCP reservation for the radio's MAC before relying on this long-term. **First live IQ over LAN achieved 2026-08-12** — real streaming blocks received, correct documented size, sync words and inverted-counter check passing on every block — but the connection sequence itself doesn't yet match the radio's documented requirements; see "First live LAN connection" below for what's real and what's still needed before this is actually usable. | No for what's built; yes for what's left |
 | **3** | Full single-channel control: ADC clock, decimation, attenuators, input switching, 24-bit, Nyquist zone display and spectrum inversion. | Yes |
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
@@ -1071,3 +1071,120 @@ retunes. Full suite (`core/test/run_tests.sh`) passes, 0 failures across all 13 
 ever touching the real hardware. Rebuilt, redeployed to all three locations, relaunched,
 confirmed running with a full, correctly-aligned FM broadcast band visible across 90-104 MHz
 on VHF input.
+
+## LAN interface: finding the radio on the network, and wiring in the transport (2026-08-12)
+
+Started from Ralph reaching out to the manufacturer about the SFP module and the LAN LED;
+their answer was that a blinking green LED just means "network connection working." That
+turned out to be a much lower-level claim than it sounds like -- see below.
+
+**The chase.** An `nmap -Pn -p 55557,55558 192.168.1.10` result reported both ports, and was
+read as "the radio is online." Several rounds of independent verification all disagreed with
+that:
+
+- A stale *reject* route cached on Ralph's laptop for `192.168.1.10` (flagged `UHRLWI` in
+  `netstat -rn` -- the `R` is reject) made every connection attempt fail before ever touching
+  the network. Cleared with `sudo route delete -host` + `sudo arp -d`; genuinely clean
+  attempts afterward still got no ARP reply at all.
+- The router's own connected-devices list showed nothing at `.10`.
+- A clean, cache-cleared retest from the desktop Mac (the one that ran the original scan)
+  came back identical -- no ARP reply, both ports timing out.
+- The original scan itself, reread carefully, never actually showed what it was taken to
+  show: both ports were `filtered`, not `open` -- nmap's term for "got no response, can't
+  tell open from closed," most consistent with nothing being there to respond at all -- and
+  `-Pn` skips host-discovery entirely, so "Host is up" in that output was never a real
+  check, just nmap taking the flag's word for it. The likely actual explanation: that scan
+  was run *before* Ralph moved his desktop Mac off `.10` to free the address for the radio,
+  so it was almost certainly seeing the desktop's own ports, not the radio's.
+
+**Root cause: the LED lied, in the specific way LEDs on physical-layer transceivers always
+can.** "Blinking green" almost certainly just meant the SFP transceiver had a physical link
+with the switch -- a lower layer than "joined the network," which needs a completed DHCP
+negotiation (or a working static-IP fallback) to mean anything. A link light coming up
+requires none of that. Confirmed by power-cycling the radio and doing a full subnet
+discovery scan (`sudo nmap -sn 192.168.1.0/24`) rather than continuing to guess at one
+address: the radio appeared at `192.168.1.176` -- a DHCP-assigned address, not the documented
+static default `192.168.1.10` -- with `55557/tcp open` (matching the documented TCP command
+port exactly) and `55558/tcp closed` (also correct -- that port is UDP per DP §3.3/RSR200_
+PLAN.md §3.3, and a TCP probe against a UDP-only port getting a clean RST rather than a
+timeout is exactly what a live, responsive host should do). The MAC's OUI (`00:0A:35`)
+resolves to Xilinx, consistent with this being genuinely FPGA-based hardware rather than a
+coincidence.
+
+**Practical follow-up, not yet done:** the radio's address is DHCP-assigned and therefore not
+stable across lease renewal or the next power cycle. A DHCP reservation for its MAC in the
+router (or configuring a static IP on the radio itself) would keep this from moving again.
+
+**Transport wiring landed the same day** — see phase 2's table entry above for what changed
+in `main.cpp`. Not yet tested: actually connecting SDR++ to the radio over LAN and confirming
+live IQ, the actual next milestone.
+
+## First live LAN connection, and the real gap it found (2026-08-12)
+
+Once the radio was reachable (previous section), a standalone smoke test was written --
+`test/test_lan_live.cpp`, the LAN-side equivalent of `test_usb_live.cpp` but going through
+the `Device` layer instead of raw frame counting, since that's the actual code path
+`main.cpp` uses. **It connected and streamed real data on the first real attempt**: TCP
+connect succeeded, `applyConfig()`/`startStream()` were accepted, and 80+ blocks of the
+documented exact size (522704 bytes, 130560 samples) arrived over several seconds, with
+plausible near-zero sample values (10 MHz, no strong local signal there).
+
+Two things looked wrong and needed real diagnosis rather than another guess:
+
+- **Sequence gaps on almost every block.**
+- **The version-query reply, and one config command's acknowledgement, never arrived** --
+  "no acknowledgement for command 176" (176 = 0xB0, `cmdSetLoBoth`'s instruction byte).
+
+A raw byte dump (bypassing `Device`, reading `LanTcpTransport::nextFrame()` directly and
+hex-dumping the trailer of each block) ruled out a framing bug conclusively: the sync words
+matched exactly, and `invCounter` was the exact bitwise complement of `counter` on every
+single block -- both would essentially never happen by coincidence if resync were finding
+the wrong byte offsets. So the blocks themselves are being found and parsed correctly; the
+*counter values* just don't behave like a plain "+1 per block" sequence (they jittered and
+occasionally went backward -- e.g. 9080, 9077, 17500, 17506, 17514, 17503).
+
+**Reading the actual manufacturer PDF (`RSR200_DP_ENG_V52.pdf`, not just this plan doc's own
+transcription of it) found the real cause, in section 4.2's documented connection procedure
+for LAN/TCP:**
+
+> "Command processing should be carried out according to the back and forth principle...
+> (Command → Confirmation → Next command...)."
+
+Before "Start stream" is ever sent, the radio is in **packet mode** (DP §3): every command
+(Read version numbers, Set data transmission, Set ADC clock, Set generators, Set variable,
+...) gets an individual reply -- an 8-byte "Confirmation" or "Special confirmation" packet
+(DP §3.2), or for the version query specifically a 12-byte "Version numbers LAN" packet --
+sent as its own standalone TCP write, *not* embedded in a streaming block. Only once
+streaming has actually started does reply data move into the embedded-commands area at the
+end of each block instead.
+
+`Device::applyConfig()` sends up to six commands (ADC clock, data transmission, switch,
+attenuator ×2, LO/tune) back-to-back via a fire-and-forget `send()`, and nothing ever reads
+anything back until `pump()` starts being called -- which only happens *after* `startStream()`
+has already been sent. So every one of those individual confirmation packets sits unread in
+the TCP socket's receive buffer the whole time, in a format (`LanTcpTransport::nextFrame()`)
+has no code path for at all -- it only knows how to resync against fixed-size streaming
+blocks. By the time real block parsing starts, whatever accumulated gets silently absorbed
+into resync's search rather than actually processed, and the version reply and several
+commands' acknowledgements are simply lost. The remaining question -- exactly why the
+*counter value itself* comes out jittery rather than just "correctly framed but starting
+from an unexpected number" -- isn't fully explained yet and needs more investigation once
+proper packet-mode handling exists to test against a clean baseline.
+
+**This is a real, scoped gap, not a quick fix, and is exactly what's next:**
+
+1. `LanTcpTransport` needs a genuine packet-mode read path -- parsing standalone 8/12-byte
+   confirmation/version-reply packets, separate from the streaming-block resync logic it
+   already has.
+2. `Device`'s LAN configuration sequence needs to actually wait for and consume each
+   command's individual confirmation before sending the next one, matching DP §4.2's
+   documented "Command → Confirmation → Next command" procedure -- currently it fires all of
+   them with no acknowledgement wait at all, LAN or USB. (USB doesn't need this to work
+   because embedded replies show up for free in blocks USB is already streaming
+   continuously; LAN's packet-mode-before-streaming behavior has no equivalent free ride.)
+
+Not committed yet. Files touched so far this session for this work: `main.cpp`'s LAN wiring
+(committed target for next commit), `rsr200_lan_transport.h` (added errno/`WSAGetLastError()`
+detail to `connect()`'s error message -- was previously a bare "connect() failed" with no way
+to tell "nothing listening" from "firewalled" from "network unreachable" apart, found while
+debugging this), and the new `test/test_lan_live.cpp`.

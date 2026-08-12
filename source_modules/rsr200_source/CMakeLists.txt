@@ -4,7 +4,8 @@ project(rsr200_source)
 # transport_usb.cpp compiles on Windows, Linux and macOS -- Windows against FTDI's WinUSB
 # D3XX SDK (FTD3XX.h), the other two against FTDI's POSIX D3XX SDK (ftd3xx.h), which is a
 # different library with a different async-I/O call for the same job (see transport_usb.cpp).
-# No other transport exists yet -- transport_lan.cpp is RSR200_PLAN.md phase 2, not started.
+# The LAN transport (RSR200_PLAN.md phase 2) is header-only (src/rsr200_lan_transport.h,
+# raw BSD/Winsock sockets, no vendor SDK) so it needs no separate source file here.
 set(SRC "src/main.cpp" "src/transport_usb.cpp")
 
 include(${SDRPP_MODULE_CMAKE})

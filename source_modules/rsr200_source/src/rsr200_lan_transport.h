@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <atomic>
 #include <mutex>
 
@@ -17,6 +18,7 @@ typedef SOCKET SockFd;
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cerrno>
 typedef int SockFd;
 #define RSR200_INVALID_SOCK (-1)
 #endif
@@ -82,8 +84,17 @@ namespace rsr200 {
             }
 
             if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+                // strerror(errno)/WSAGetLastError() -- a bare "connect() failed" gives no way
+                // to tell "nothing listening" from "firewalled" from "network unreachable"
+                // apart, which matters a lot when bringing this up against real hardware for
+                // the first time. See RSR200_PLAN.md's LAN section.
+#ifdef _WIN32
+                const std::string reason = "WSA error " + std::to_string(WSAGetLastError());
+#else
+                const std::string reason = strerror(errno);
+#endif
                 close();
-                return setError("connect() to " + host + " failed");
+                return setError("connect() to " + host + " failed: " + reason);
             }
 
             connected = true;

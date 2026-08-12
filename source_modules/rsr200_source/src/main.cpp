@@ -8,6 +8,7 @@
 #include "rsr200_protocol.h"
 #include "rsr200_device.h"
 #include "transport_usb.h"
+#include "rsr200_lan_transport.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -17,7 +18,7 @@
 
 SDRPP_MOD_INFO{
     /* Name:            */ "rsr200_source",
-    /* Description:     */ "Reuter RSR200B source module (USB)",
+    /* Description:     */ "Reuter RSR200B source module (USB/LAN)",
     /* Author:          */ "Ralph Brandi",
     /* Version:         */ 0, 1, 0,
     /* Max instances    */ 1
@@ -27,15 +28,19 @@ ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
-// SDR++ module shell around rsr200::Device (RSR200_PLAN.md phases 0/1/1b) and
-// rsr200::UsbTransport (phase 6). Only USB is wired up here -- transport_lan.cpp (phase 2)
-// doesn't exist yet, so this module is Windows-only until it does; see CMakeLists.txt.
+// SDR++ module shell around rsr200::Device (RSR200_PLAN.md phases 0/1/1b),
+// rsr200::UsbTransport (phase 6) and rsr200::LanTcpTransport (phase 2, wired into this
+// module 2026-08-12 -- the transport itself already existed and passed its own tests
+// against a synthetic loopback server, just wasn't reachable from the UI yet).
 //
 // Everything protocol- and framing-specific lives in rsr200_protocol.h/rsr200_device.h/
-// transport_usb.*, all covered by their own tests or (for the USB transport) a live-hardware
-// smoke test (test/test_usb_live.cpp). This file is just the GUI/config/threading shell:
+// transport_usb.*/rsr200_lan_transport.h, all covered by their own tests or (for the two
+// transports) a live-hardware smoke test. This file is just the GUI/config/threading shell:
 // menu controls set an rsr200::Config, applyConfig() sequences the commands the documents
 // require, and a worker thread turns rsr200::Device::pump() into SDR++ stream writes.
+// Device itself is fully transport-agnostic (Transport::isLan()/streamPort()/setLayout()),
+// so switching transports here only means choosing which one to open/connect and holding a
+// Transport* to it -- see activeTransport below.
 
 using namespace rsr200;
 
@@ -139,14 +144,25 @@ private:
         if (_this->running) { return; }
 
         _this->lastError.clear();
-        std::string err;
-        if (!_this->usb.open(0, err)) {
-            _this->lastError = "open failed: " + err;
-            flog::error("RSR200SourceModule '{0}': {1}", _this->name, _this->lastError);
-            return;
+        if (_this->transportSel == 0) {
+            std::string err;
+            if (!_this->usb.open(0, err)) {
+                _this->lastError = "open failed: " + err;
+                flog::error("RSR200SourceModule '{0}': {1}", _this->name, _this->lastError);
+                return;
+            }
+            _this->activeTransport = &_this->usb;
+        }
+        else {
+            if (!_this->lan.connect(_this->lanHost)) {
+                _this->lastError = "LAN connect failed: " + _this->lan.lastError();
+                flog::error("RSR200SourceModule '{0}': {1}", _this->name, _this->lastError);
+                return;
+            }
+            _this->activeTransport = &_this->lan;
         }
 
-        _this->device.setTransport(&_this->usb);
+        _this->device.setTransport(_this->activeTransport);
         _this->device.onError = [_this](const std::string& msg) {
             std::lock_guard<std::mutex> lck(_this->statusMtx);
             _this->lastError = msg;
@@ -165,7 +181,7 @@ private:
         const Config cfg = _this->buildConfig();
         if (!_this->device.applyConfig(cfg, now)) {
             _this->lastError = "initial configuration failed";
-            _this->usb.close();
+            _this->closeActiveTransport();
             return;
         }
 
@@ -180,7 +196,7 @@ private:
         if (cfg.format.channels == 2) {
             if (!_this->device.setHardwareDiversity(1.0, 0.0, now)) {
                 _this->lastError = "failed to set channel 2 to unity gain";
-                _this->usb.close();
+                _this->closeActiveTransport();
                 return;
             }
         }
@@ -188,13 +204,15 @@ private:
         // A cheap, read-only probe -- not modelled on Device (which has no "send an
         // unsolicited command" method), so sent directly through the transport. The reply
         // arrives embedded in the stream like any other (DP 3.3), and Device::onReply above
-        // already watches for REPLY_VERSION regardless of who sent the command.
-        auto verCmd = cmdReadVersion(9999, /*lan=*/false);
-        _this->usb.sendCommand(verCmd.data(), verCmd.size());
+        // already watches for REPLY_VERSION regardless of who sent the command. isLan()
+        // picks the right (USB fixed-length vs LAN shortened) command encoding regardless
+        // of which transport is actually active.
+        auto verCmd = cmdReadVersion(9999, _this->activeTransport->isLan());
+        _this->activeTransport->sendCommand(verCmd.data(), verCmd.size());
 
         if (!_this->device.startStream(now)) {
             _this->lastError = "Start Stream failed";
-            _this->usb.close();
+            _this->closeActiveTransport();
             return;
         }
 
@@ -211,12 +229,16 @@ private:
         _this->running = false;
 
         // Interrupt the worker's blocked read before touching anything it might still be
-        // using (see transport_usb.h's abortReads() -- releasing the buffer/OVERLAPPED pool
-        // out from under a thread still waiting on it is a race), then join, then a full
-        // close(). DP 3.3: Stop Stream closes the USB endpoint entirely regardless, so the
-        // next Start has to reopen and reconfigure from scratch either way.
+        // using, then join, then a full close(). For USB, that's abortReads() (see
+        // transport_usb.h -- releasing the buffer/OVERLAPPED pool out from under a thread
+        // still waiting on it is a race); for LAN, LanTcpTransport::stop() closes the
+        // socket, which is the only portable way to unstick a thread blocked in a BSD
+        // recv() call. DP 3.3: Stop Stream closes the USB endpoint entirely regardless, so
+        // the next Start has to reopen and reconfigure from scratch either way; the LAN
+        // side reconnects fresh next Start for the same reason, by symmetry.
         _this->run = false;
-        _this->usb.abortReads();
+        if (_this->activeTransport == &_this->lan) { _this->lan.stop(); }
+        else { _this->usb.abortReads(); }
         _this->out.stopWriter();
         _this->outA.stopWriter();
         _this->outB.stopWriter();
@@ -225,12 +247,26 @@ private:
         _this->outA.clearWriteStop();
         _this->outB.clearWriteStop();
 
-        auto stopCmd = cmdStopStream(9998, /*lan=*/false, PORT_USB);
-        _this->usb.sendCommand(stopCmd.data(), stopCmd.size());
-        _this->usb.close();
-        _this->device.setTransport(nullptr);
+        // activeTransport may already be disconnected (LAN: stop() above closed the socket)
+        // -- sendCommand() on a dead transport just returns false, which is fine here, the
+        // radio's own Stop Stream handling is best-effort on a link that's already gone.
+        if (_this->activeTransport) {
+            auto stopCmd = cmdStopStream(9998, _this->activeTransport->isLan(), _this->activeTransport->streamPort());
+            _this->activeTransport->sendCommand(stopCmd.data(), stopCmd.size());
+        }
+        _this->closeActiveTransport();
 
         flog::info("RSR200SourceModule '{0}': Stop!", _this->name);
+    }
+
+    // Closes whichever transport is active (if any), tells Device to let go of it, and
+    // clears activeTransport -- the one place all of start()'s failure paths and stop()
+    // itself funnel through, so neither has to know which concrete transport is in use.
+    void closeActiveTransport() {
+        if (activeTransport == &lan) { lan.close(); }
+        else if (activeTransport == &usb) { usb.close(); }
+        activeTransport = nullptr;
+        device.setTransport(nullptr);
     }
 
     static void tune(double freq, void* ctx) {
@@ -281,6 +317,19 @@ private:
         bool dirty = false;
 
         if (_this->running) { SmGui::BeginDisabled(); }
+
+        SmGui::LeftLabel("Transport");
+        SmGui::FillWidth();
+        if (SmGui::Combo(CONCAT("##_rsr200_transport_", _this->name), &_this->transportSel, "USB\0LAN (TCP)\0")) {
+            dirty = true;
+        }
+        if (_this->transportSel != 0) {
+            SmGui::LeftLabel("Radio IP address");
+            SmGui::FillWidth();
+            if (SmGui::InputText(CONCAT("##_rsr200_lanhost_", _this->name), _this->lanHost, sizeof(_this->lanHost))) {
+                dirty = true;
+            }
+        }
 
         SmGui::LeftLabel("ADC clock (MHz)");
         SmGui::FillWidth();
@@ -425,6 +474,12 @@ private:
         if (c.contains("vhfPreamp")) { vhfPreamp = c["vhfPreamp"]; }
         if (c.contains("atten1")) { atten1 = c["atten1"]; }
         if (c.contains("atten2")) { atten2 = c["atten2"]; }
+        if (c.contains("transportSel")) { transportSel = c["transportSel"]; }
+        if (c.contains("lanHost")) {
+            std::string h = c["lanHost"];
+            strncpy(lanHost, h.c_str(), sizeof(lanHost) - 1);
+            lanHost[sizeof(lanHost) - 1] = '\0';
+        }
         config.release();
     }
 
@@ -441,6 +496,8 @@ private:
         c["vhfPreamp"] = vhfPreamp;
         c["atten1"] = atten1;
         c["atten2"] = atten2;
+        c["transportSel"] = transportSel;
+        c["lanHost"] = std::string(lanHost);
         config.release(true);
     }
 
@@ -469,8 +526,26 @@ private:
     int atten2 = 0;
     double tunedHz = 10e6;
 
-    // Transport + protocol layer.
+    // Transport selection. 0 = USB, 1 = LAN (TCP) -- matches transportItems' order in
+    // menuHandler(). LAN UDP (RSR200_PLAN.md phase 5) isn't implemented yet, so it isn't
+    // offered here. lanHost is the radio's LAN IP -- the RSR200 documents a static default
+    // of 192.168.1.10 but also runs a DHCP client for ~5s after power-up, so a real radio on
+    // a real network may land on a DHCP-assigned address instead; there's no discovery
+    // mechanism (no mDNS/broadcast in the documented protocol), so this has to be typed in.
+    // Plain char buffer, not std::string, matching every other source module's InputText
+    // field (network_source, rtl_tcp_source, spyserver_source, ...).
+    int transportSel = 0;
+    char lanHost[64] = "192.168.1.10";
+
+    // Transport + protocol layer. Device (rsr200_device.h) is fully transport-agnostic --
+    // it only ever talks to whichever Transport* was handed to setTransport(), and asks
+    // that object (isLan()/streamPort()) rather than assuming USB. usb/lan are the two
+    // concrete transports; activeTransport points at whichever start() opened, so the rest
+    // of this file (the version-query probe, the Stop Stream command) can go through it
+    // without caring which one it is either.
     UsbTransport usb;
+    LanTcpTransport lan;
+    Transport* activeTransport = nullptr;
     Device device;
 
     // Worker thread and the status it publishes, guarded by statusMtx since the GUI thread
