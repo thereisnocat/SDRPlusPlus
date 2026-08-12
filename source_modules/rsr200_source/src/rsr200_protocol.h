@@ -262,10 +262,20 @@ namespace rsr200 {
         return (bits == 16) ? 32768.0f : 8388608.0f;
     }
 
+    // Branchless sign extension: shift the 3 bytes into the *top* of a 32-bit word (instead
+    // of the bottom), then an arithmetic right shift by 8 sign-extends for free, in the same
+    // instruction that repositions the value -- no `if` needed. (Signed right-shift of a
+    // negative value is arithmetic on every compiler this project targets -- GCC, Clang,
+    // MSVC all document it, and it's well-defined outright as of C++20 -- so this is safe in
+    // practice despite technically being implementation-defined under the C++17 this project
+    // currently builds with.) Was previously read-into-the-bottom-3-bytes plus a branch;
+    // functionally identical, just without the per-sample branch. See
+    // RECORDING_PERFORMANCE_PLAN.md phase 15 -- unpack() is a tight scalar loop running at
+    // the full incoming sample rate (up to ~20.5 MSp/s on an RSR200 in 24-bit mode), so
+    // per-sample cost here is not free the way it would be at audio rates.
     inline int32_t read24(const uint8_t* p) {
-        int32_t v = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-        if (v & 0x800000) { v |= ~0xFFFFFF; }
-        return v;
+        int32_t v = (int32_t)(((uint32_t)p[0] << 8) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 24));
+        return v >> 8;
     }
 
     inline int16_t read16(const uint8_t* p) {
@@ -273,19 +283,29 @@ namespace rsr200 {
     }
 
     // Returns the number of samples written per channel.
+    //
+    // Four separate tight loops instead of one loop with fmt.bits/fmt.channels checked on
+    // every iteration -- those are invariant for the whole call, not per-sample, so checking
+    // them once up front and running the specific loop that case needs removes a
+    // per-sample branch that never actually varies within a single call. See phase 15: this
+    // runs at the full incoming sample rate, so a branch here is a branch ~20.5 million times
+    // a second in the demanding case (24-bit), not a rounding error.
     inline int unpack(const uint8_t* iq, int frames, const StreamFormat& fmt,
                       float gain, float* outA, float* outB) {
         const float scale = gain / fullScaleFor(fmt.bits);
         const int step = (fmt.bits / 8) * 2;    // one complex sample of one channel
 
         if (fmt.channels == 1) {
-            for (int i = 0; i < frames; i++) {
-                const uint8_t* p = iq + (size_t)i * step;
-                if (fmt.bits == 16) {
+            if (fmt.bits == 16) {
+                for (int i = 0; i < frames; i++) {
+                    const uint8_t* p = iq + (size_t)i * step;
                     outA[2 * i] = (float)read16(p) * scale;
                     outA[2 * i + 1] = (float)read16(p + 2) * scale;
                 }
-                else {
+            }
+            else {
+                for (int i = 0; i < frames; i++) {
+                    const uint8_t* p = iq + (size_t)i * step;
                     outA[2 * i] = (float)read24(p) * scale;
                     outA[2 * i + 1] = (float)read24(p + 3) * scale;
                 }
@@ -294,15 +314,18 @@ namespace rsr200 {
         }
 
         // Dual channel is interleaved per sample: I1 Q1 I2 Q2.
-        for (int i = 0; i < frames; i++) {
-            const uint8_t* p = iq + (size_t)i * step * 2;
-            if (fmt.bits == 16) {
+        if (fmt.bits == 16) {
+            for (int i = 0; i < frames; i++) {
+                const uint8_t* p = iq + (size_t)i * step * 2;
                 outA[2 * i] = (float)read16(p) * scale;
                 outA[2 * i + 1] = (float)read16(p + 2) * scale;
                 outB[2 * i] = (float)read16(p + 4) * scale;
                 outB[2 * i + 1] = (float)read16(p + 6) * scale;
             }
-            else {
+        }
+        else {
+            for (int i = 0; i < frames; i++) {
+                const uint8_t* p = iq + (size_t)i * step * 2;
                 outA[2 * i] = (float)read24(p) * scale;
                 outA[2 * i + 1] = (float)read24(p + 3) * scale;
                 outB[2 * i] = (float)read24(p + 6) * scale;

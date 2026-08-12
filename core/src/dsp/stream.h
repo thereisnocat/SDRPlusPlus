@@ -67,6 +67,41 @@ namespace dsp {
             return true;
         }
 
+        // Non-blocking counterpart to swap(): if the reader hasn't drained the previous
+        // buffer yet, returns 0 immediately instead of waiting -- the caller just skips this
+        // frame for this consumer rather than stalling. Meant for a low-priority consumer a
+        // producer can't afford to ever wait on (see dsp::routing::Splitter's lowPriority
+        // path, RECORDING_PERFORMANCE_PLAN.md section 2.1/phase 8): swap() couples how fast
+        // *every* writer-side loop iterates to how fast the slowest reader drains, which is
+        // exactly the coupling a low-priority consumer must not impose. Writing into writeBuf
+        // beforehand is always safe regardless of the outcome here -- the reader only ever
+        // touches readBuf, never writeBuf, so a skipped swap just means that write gets
+        // overwritten by the next one, not that anything unsafe was touched.
+        // Returns: 1 = swapped, 0 = reader still busy (skipped, not an error), -1 = stopped.
+        virtual inline int trySwap(int size) {
+            {
+                std::unique_lock<std::mutex> lck(swapMtx);
+                if (writerStop) { return -1; }
+                if (!canSwap) { return 0; }
+
+                // Swap buffers
+                dataSize = size;
+                T* temp = writeBuf;
+                writeBuf = readBuf;
+                readBuf = temp;
+                canSwap = false;
+            }
+
+            // Notify reader that some data is ready
+            {
+                std::lock_guard<std::mutex> lck(rdyMtx);
+                dataReady = true;
+            }
+            rdyCV.notify_all();
+
+            return 1;
+        }
+
         virtual inline int read() {
             // Wait for data to be ready or to be stopped
             std::unique_lock<std::mutex> lck(rdyMtx);

@@ -38,7 +38,11 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     preproc.addBlock(&dcBlock, dcBlocking);
     preproc.addBlock(&conjugate, false); // TODO: Replace by parameter
 
+    // split reads preproc's output directly, same as always -- see iq_frontend.h's
+    // bindRawIQStream() comment for why rawSplit isn't wired in here unconditionally.
     split.init(preproc.out);
+    rawSplit.init(preproc.out);
+    currentPreprocOut = preproc.out;
 
     // TODO: Do something to avoid basically repeating this code twice
     int skip;
@@ -64,7 +68,10 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     // Clear the rest of the FFT input buffer
     dsp::buffer::clear(fftInBuf, _fftSize - _nzFFTSize, _nzFFTSize);
 
-    split.bindStream(&fftIn);
+    // Low-priority: a slow spectrum/waterfall FFT must never make VFOs or the recorder
+    // wait behind it for their own copy of a frame -- see splitter.h's bindStream() doc
+    // and RECORDING_PERFORMANCE_PLAN.md section 2.1.
+    split.bindStream(&fftIn, true);
 
     _init = true;
 }
@@ -120,18 +127,18 @@ void IQFrontEnd::setDecimation(int ratio) {
     decim.tempStart();
 
     // Enable or disable in the chain
-    preproc.setBlockEnabled(&decim, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&decim, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
 
     // Update the DSP sample rate (TODO: Find a way to get rid of this)
     core::setInputSampleRate(_sampleRate);
 }
 
 void IQFrontEnd::setDCBlocking(bool enabled) {
-    preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
 }
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
-    preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
+    preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
 }
 
 void IQFrontEnd::bindIQStream(dsp::stream<dsp::complex_t>* stream) {
@@ -140,6 +147,50 @@ void IQFrontEnd::bindIQStream(dsp::stream<dsp::complex_t>* stream) {
 
 void IQFrontEnd::unbindIQStream(dsp::stream<dsp::complex_t>* stream) {
     split.unbindStream(stream);
+}
+
+void IQFrontEnd::bindRawIQStream(dsp::stream<dsp::complex_t>* stream) {
+    if (rawStreams.empty()) {
+        // First raw consumer: insert rawSplit between preproc and split now, not before --
+        // see iq_frontend.h's comment on this method for why it isn't wired in
+        // unconditionally.
+        //
+        // Order matters here in a way it's easy to get backwards: split must stop reading
+        // preproc.out (via setInput(), below) *before* rawSplit ever starts reading it --
+        // dsp::stream<T> has strictly single-reader semantics (one shared dataReady/canSwap
+        // pair, not tracked per-reader), so any window where both are simultaneously live
+        // readers of the same stream races on that internal state, and can leave one of them
+        // stuck waiting on a signal the other already consumed. Retargeting split to
+        // mainStream first means its thread just blocks harmlessly on an empty mainStream
+        // for the brief moment until rawSplit starts feeding it -- no crash, no race. The
+        // reverse order here (rawSplit started before split let go of preproc.out) was
+        // exactly phase 13's bug -- see RECORDING_PERFORMANCE_PLAN.md phase 14: it's what
+        // caused "stopping recording stops all audio" (unbindRawIQStream() had the same
+        // ordering mistake, the other direction).
+        split.setInput(&mainStream);
+        rawSplit.bindStream(&mainStream);
+        rawSplit.start();
+    }
+    rawSplit.bindStream(stream);
+    rawStreams.insert(stream);
+}
+
+void IQFrontEnd::unbindRawIQStream(dsp::stream<dsp::complex_t>* stream) {
+    rawSplit.unbindStream(stream);
+    rawStreams.erase(stream);
+    if (rawStreams.empty()) {
+        // Last raw consumer gone: tear the indirection back down so split goes right back to
+        // reading preproc's real output directly, at zero extra copy cost -- exactly the
+        // no-recording case, unaffected by this feature ever having existed.
+        //
+        // Mirrors bindRawIQStream()'s ordering fix: rawSplit.stop() joins its worker thread
+        // synchronously (dsp::block::doStop()), so by the time it returns rawSplit is
+        // *guaranteed* no longer reading preproc.out -- only then is it safe for split to
+        // start reading it again via setInput() below.
+        rawSplit.stop();
+        rawSplit.unbindStream(&mainStream);
+        split.setInput(currentPreprocOut);
+    }
 }
 
 dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, double bandwidth, double offset) {
@@ -213,6 +264,12 @@ void IQFrontEnd::start() {
     // Start pre-proc chain (automatically start all bound blocks)
     preproc.start();
 
+    // Only if a raw consumer was already bound going into this start() (e.g. the front end
+    // was restarted -- a source switch -- while a recording was active): restore rawSplit's
+    // insertion. The ordinary case is rawStreams empty here, in which case rawSplit stays
+    // idle and split reads preproc's output directly, same as always.
+    if (!rawStreams.empty()) { rawSplit.start(); }
+
     // Start IQ splitter
     split.start();
 
@@ -232,6 +289,10 @@ void IQFrontEnd::stop() {
 
     // Stop pre-proc chain (automatically start all bound blocks)
     preproc.stop();
+
+    // Only stop rawSplit if it's actually running (a raw consumer currently bound) -- see
+    // start()'s matching comment.
+    if (!rawStreams.empty()) { rawSplit.stop(); }
 
     // Stop IQ splitter
     split.stop();

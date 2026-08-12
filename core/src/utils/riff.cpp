@@ -22,8 +22,26 @@ namespace riff {
     bool Writer::open(std::string path, const char form[4]) {
         std::lock_guard<std::recursive_mutex> lck(mtx);
 
+        // A fresh, unopened stream every time -- same clean-slate effect the previous
+        // single-step `file = std::ofstream(path, ...)` had, just split into two steps so
+        // pubsetbuf() below gets a chance to run first. It has no effect once a stream has
+        // ever been associated with a file, which the single-step constructor already does
+        // immediately.
+        file = std::ofstream();
+
+        // Enlarge the stream's internal write buffer well beyond the platform default
+        // (typically a few KB). At sustained wideband recording rates the default buffer
+        // size means thousands of small write() syscalls per second; a much larger one lets
+        // far more data accumulate per syscall and gives the OS's own write-behind caching
+        // more to work with, rather than constantly resyncing to disk. See
+        // RECORDING_PERFORMANCE_PLAN.md phase 6. writeBuf is a member (not a local) because
+        // the backing storage has to outlive the stream's use of it; only resized once, not
+        // on every open() of the same long-lived Writer.
+        if (writeBuf.empty()) { writeBuf.resize(WRITE_BUFFER_BYTES); }
+        file.rdbuf()->pubsetbuf(writeBuf.data(), (std::streamsize)writeBuf.size());
+
         // Open file
-        file = std::ofstream(path, std::ios::out | std::ios::binary);
+        file.open(path, std::ios::out | std::ios::binary);
         if (!file.is_open()) { return false; }
 
         // Begin RIFF chunk

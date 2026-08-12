@@ -44,7 +44,8 @@ $REPO/source_modules/rsr200_source/test/test_protocol.cpp
 $REPO/source_modules/rsr200_source/test/test_device.cpp
 $REPO/source_modules/rsr200_source/test/test_lan_transport.cpp
 $REPO/core/test/test_linrad_raw.cpp
-$REPO/core/test/test_crowded_band.cpp"
+$REPO/core/test/test_crowded_band.cpp
+$REPO/misc_modules/recorder/test/test_recording_queue.cpp"
 
 fail=0
 

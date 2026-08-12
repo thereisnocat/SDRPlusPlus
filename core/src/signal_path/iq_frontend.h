@@ -10,6 +10,7 @@
 #include "../dsp/math/conjugate.h"
 #include <fftw3.h>
 #include <algorithm>
+#include <set>
 
 class IQFrontEnd {
 public:
@@ -49,6 +50,25 @@ public:
     void bindIQStream(dsp::stream<dsp::complex_t>* stream);
     void unbindIQStream(dsp::stream<dsp::complex_t>* stream);
 
+    // For a consumer that needs the full undecimated-by-this-stage rate but must never
+    // compete with the FFT/VFO copies for time on split's own thread -- the recorder's
+    // baseband tap is the motivating case. See RECORDING_PERFORMANCE_PLAN.md phase 12: at a
+    // high enough sample rate, split's own per-iteration memcpy cost across all its bound
+    // consumers -- proportional to (bound consumer count) x (sample rate), regardless of how
+    // fast any one of them drains -- became a real throughput ceiling on its single thread
+    // once the recorder's tap was one of the consumers sharing it, throttling delivery to
+    // every consumer including live audio's VFO.
+    //
+    // rawSplit -- a second Splitter, its own dedicated thread -- is inserted between preproc
+    // and split ONLY while at least one raw consumer is bound, and removed the instant the
+    // last one unbinds (see the .cpp): split reads preproc's output directly at ordinary
+    // times, exactly as before this feature existed, and only pays the cost of an extra
+    // full-rate copy stage while something is actually using it. Phase 12's first version of
+    // this wired rawSplit in unconditionally, which regressed the *no-recording* case by
+    // permanently doubling copy volume even when nothing needed it -- see phase 13.
+    void bindRawIQStream(dsp::stream<dsp::complex_t>* stream);
+    void unbindRawIQStream(dsp::stream<dsp::complex_t>* stream);
+
     dsp::channel::RxVFO* addVFO(std::string name, double sampleRate, double bandwidth, double offset);
     void removeVFO(std::string name);
 
@@ -86,8 +106,17 @@ protected:
     dsp::correction::DCBlocker<dsp::complex_t> dcBlock;
     dsp::chain<dsp::complex_t> preproc;
 
-    // Splitting
+    // Splitting. split normally reads preproc's output directly, same as always. rawSplit and
+    // mainStream only come into play while bindRawIQStream() has at least one consumer bound
+    // -- see that method's declaration comment above and its definition in the .cpp.
     dsp::routing::Splitter<dsp::complex_t> split;
+    dsp::routing::Splitter<dsp::complex_t> rawSplit;
+    dsp::stream<dsp::complex_t> mainStream;
+    std::set<dsp::stream<dsp::complex_t>*> rawStreams;
+    // Tracks preproc's real current output stream so unbindRawIQStream() can point split back
+    // at it directly once the last raw consumer is gone, without needing a public getter on
+    // Sink<T>/block for a protected member (_in) that nothing else needs exposed.
+    dsp::stream<dsp::complex_t>* currentPreprocOut = NULL;
 
     // FFT
     dsp::stream<dsp::complex_t> fftIn;

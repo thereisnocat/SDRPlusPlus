@@ -1,0 +1,288 @@
+# Recording subsystem: performance/throughput plan
+
+**Status: 2026-08-12 — CLOSED for now. Phases 1-3 and 6-16 done (11 folds in phase 5's UI
+work, done early as diagnostic instrumentation); phases 4 and 7 not started, not currently
+planned.** `RSR200 @ 20.513 MSp/s + 24-bit + recording` investigation (phases 8-16) is closed
+by mutual agreement, not abandoned mid-guess: real bugs found and fixed along the way (a
+live-audio-vs-FFT stopgap, a stop-time hang, an unplayable-recording bug, and a genuine
+`unpack()` CPU optimization confirmed by real profiling data), but the remaining symptom at
+that specific combination is a diffuse, cumulative real-time throughput margin problem — not
+one isolated fixable component, and not simply a hardware capacity ceiling either (this is an
+M3 Max with 16 cores and 64GB RAM; there's headroom left in raw terms). 16-bit is clean and
+accepted as the practical operating point for this sample rate. May be revisited later with
+more targeted profiling if it matters again. See the bottom of this document for the exact
+prompt that started it.
+
+Distinct from `RECORDING_REFACTOR_PLAN.md`, which covers format/interoperability (RF64,
+WavViewDX/SDR Console compatibility, metadata correctness) and explicitly scoped *out*
+throughput questions — see that document's section 4: "don't introduce rate errors... that's
+a timing/format-correctness concern, not a bandwidth one." This plan is the bandwidth one.
+
+## 1. The problem, as reported
+
+Recording a full-width span (e.g. the whole FM broadcast band, ~20 MHz) produces dropouts —
+audible breakup, presumably corresponding to lost/gapped samples — even to an SSD. A
+comparison point was given directly: an Elad FDM-S3 (24 MHz digitizing bandwidth, comparable
+to the RSR200) records the same kind of span to a *spinning* hard drive, with its own native
+FDM-SW2 software or with SDR Console, without dropouts. SDR++ dropping frames on faster
+storage than the thing it's being unfavorably compared against is itself a strong signal that
+the bottleneck is architectural, not raw disk throughput — a modern SSD is not the limiting
+resource for a task a 2010s-era spinning disk already handles.
+
+## 2. What the audit found, most severe first
+
+### 2.1 A slow recorder can stall live listening too, not just itself
+
+`IQFrontEnd` has exactly one `dsp::routing::Splitter<dsp::complex_t> split`
+(`core/src/signal_path/iq_frontend.h:90`) that every consumer of the baseband IQ stream binds
+into through the same `bindIQStream()`/`unbindIQStream()` pair
+(`core/src/signal_path/iq_frontend.cpp:137-142`) — the waterfall/FFT (`split.bindStream(&fftIn)`,
+line 67), every VFO (`bindIQStream(vfoIn)`, line 159 — i.e. all live demodulation and audio),
+and the recorder's own tap, with no distinction between them at this layer.
+
+`Splitter::run()` (`core/src/dsp/routing/splitter.h`):
+
+```cpp
+for (const auto& stream : streams) {
+    memcpy(stream->writeBuf, base_type::_in->readBuf, count * sizeof(T));
+    if (!stream->swap(count)) { ... }   // blocks until that stream's reader has drained it
+}
+```
+
+This iterates its bound consumers **sequentially, blocking on each one's `swap()`** before
+moving to the next. If any one consumer is slow to drain, the loop cannot even reach the
+*next* consumer until the slow one catches up. A slow recording tap can therefore stall the
+live waterfall and live audio too — not a recording-only problem, a whole-front-end one.
+
+### 2.2 The recorder is the slow consumer: synchronous disk I/O directly on the DSP thread
+
+Every block in this framework gets its own dedicated thread that loops `run()` forever
+(`dsp::block::workerLoop()`, `core/src/dsp/block.h`). For the recorder, that thread does the
+actual blocking disk write itself, with nothing between "just received samples from the
+shared stream" and "blocked on a `write()` syscall":
+
+- **Single-channel baseband**: `complexHandler` (`misc_modules/recorder/src/main.cpp:734`) is
+  invoked synchronously from `dsp::sink::Handler`'s own thread and calls `writer.write()`
+  directly.
+- **Dual-channel (phasing) recording**: `dualWorker()` (`misc_modules/recorder/src/main.cpp:372`)
+  — its own dedicated thread, same pattern: read, interleave into `dualBuf`, `writer.write()`,
+  no queue anywhere in between.
+
+There is no producer/consumer boundary anywhere in this path. The thread responsible for
+keeping the live pipeline moving is the same thread that blocks on disk I/O.
+
+### 2.3 Almost no slack anywhere in the pipeline to absorb a stall
+
+`dsp::stream<T>` (`core/src/dsp/stream.h`) is a double-buffer (ping-pong), not a ring queue:
+the writer fills one buffer, calls `swap()`, and blocks until the reader has drained the
+*other* buffer and called `flush()`. `STREAM_BUFFER_SIZE` (1,000,000 samples) is each buffer's
+*allocated capacity*, not the effective cushion — `swap()` fires once per upstream read
+iteration with whatever amount that iteration produced, typically on the order of ~1000
+samples for a USB source's natural packet size. At wideband sample rates that's tens of
+microseconds of real slack per hop, repeated across every block from source to sink. A single
+disk stall of even a few milliseconds — an ordinary HDD seek, a filesystem journal commit, an
+indexer (Spotlight, Windows Search) touching the file mid-write — blows through that many
+times over, and the stall propagates hop-by-hop all the way back to the source's own read
+loop, which for USB hardware typically has its own buffer sized for low-latency streaming, not
+multi-second stalls.
+
+### 2.4 Secondary: an untuned, tiny write buffer
+
+`riff::Writer::open()` (`core/src/utils/riff.cpp:26`) opens a plain `std::ofstream` with no
+`pubsetbuf()`/enlarged buffer and no pre-allocation of the file's eventual size. Default
+stream buffering is typically a few KB, so sustained wideband recording means thousands of
+small `write()` syscalls per second rather than infrequent large ones. Real overhead, and
+worth fixing regardless — but on its own this wouldn't explain outright dropouts the way
+2.1-2.3 do. A multiplier on the real problem, not the root cause.
+
+### 2.5 Ruled out
+
+Sample-format conversion (`wav::Writer::write()`, `core/src/utils/wav.cpp:192`) uses VOLK
+(SIMD) for Int16/Int32; Float32 is a direct pass-through. Not a CPU bottleneck. Only the
+rarely-used Uint8 path is a naive scalar loop, and Uint8 isn't the wideband use case anyone
+reaches for.
+
+No existing queue, async writer, buffer tuning, or explicit `fsync`/flush call exists anywhere
+in `misc_modules/recorder/src/` or `core/src/utils/{wav,riff}.cpp` — confirmed by direct
+search, not assumed absent.
+
+## 3. What "fixed" means
+
+**Goal.** Recording any span the front-end can actually deliver, at any bandwidth the hardware
+and chosen sample type support, should not itself be the cause of dropped samples — the
+recording (and, per 2.1, anything else sharing the same IQ front-end) should be limited only
+by whether the *storage* can sustain the average data rate, not by whether it can sustain the
+data rate with zero tolerance for any single transient stall.
+
+**Non-goals**, to keep this plan the same size as the actual problem:
+
+- Not revisiting `RECORDING_REFACTOR_PLAN.md`'s territory (format, interop, metadata) — that
+  work is done and out of scope here.
+- Not a general redesign of `dsp::routing::Splitter` for every module in the codebase that
+  uses one. Decoupling the recorder specifically (phase 1) removes it as the slow consumer
+  that triggers 2.1's hazard; a *different* future slow consumer could in principle still
+  trigger the same class of problem through the same shared Splitter. Deliberately deferred
+  (decided, section 5), not forgotten — worth revisiting once the recorder-specific fix is in
+  and its actual real-world impact is known, rather than speculatively widening this plan
+  before that evidence exists.
+- Not attempting to make recording survive a storage device that's genuinely, sustainedly too
+  slow for the configured bandwidth (e.g. a USB 2.0 thumb drive asked to hold 24 MSp/s
+  dual-channel Float32 forever). Buffering absorbs *transient* stalls; it can't manufacture
+  bandwidth the disk doesn't have.
+
+## 4. Design direction for the real fix
+
+The recorder's DSP-facing side (`complexHandler`/`dualWorker`) should do the minimum possible
+work — copy incoming samples into a bounded queue and return immediately — and a separate,
+dedicated writer thread should drain that queue and perform the actual (still synchronous,
+still blocking, still using the existing `wav::Writer::write()` unmodified) disk write, off
+the DSP critical path entirely. This is the standard shape for exactly this problem (a
+real-time producer that must never block, paired with a slower consumer that's allowed to
+lag), and it fixes both halves of the problem at once: the recording itself gets real slack to
+absorb transient disk stalls, and — because the recorder's *own* stream-draining is now fast
+regardless of disk speed — section 2.1's shared-Splitter hazard stops being triggerable by the
+recorder specifically.
+
+Concrete points, two decided (section 5) and the rest still implementation-time details:
+
+- **Queue sizing: capped by a fixed RAM budget, not a fixed time target.** Decided (section
+  5) — a time-based target ("buffer N seconds") was the original framing, but at high enough
+  configured bandwidth that silently costs an unreasonable amount of RAM (see the 2.3 GB/3s
+  example that was flagged, below). Capping by RAM instead means the buffered *duration* is
+  whatever falls out of `RAM budget ÷ bytes/sec at the current rate/channel count` —
+  automatically shrinking at higher bandwidths rather than holding a fixed time target
+  regardless of memory cost. Default budget: **512 MB** per recorder instance, queued as raw
+  `dsp::complex_t`/interleaved `float` (i.e. *before* the eventual on-disk sample-type
+  conversion, which still happens on the writer thread exactly as `wav::Writer::write()`
+  already does it) — large enough to absorb multi-second stalls at moderate rates, small
+  enough not to be alarming on a modest system, adjustable later if it proves wrong in either
+  direction. The existing dual-channel UI already surfaces `about %.0f MB/min`
+  (`misc_modules/recorder/src/main.cpp:497`); a parallel readout showing the buffered
+  *duration* the current 512 MB actually translates to at the configured rate (e.g.
+  "buffered: 3.2s of stall protection") tells a user what they're actually protected against,
+  rather than a number that silently means something different at every bandwidth.
+- **Backpressure policy when the queue itself fills: drop-with-warning.** Decided (section
+  5) — when the queue is full (disk genuinely falling behind, not just a transient stall),
+  the producer discards the current incoming block rather than blocking (blocking here would
+  just reintroduce section 2.1's hazard one layer later) or growing unbounded (an OOM risk on
+  a long enough sustained shortfall). An honest, visible gap beats a silent stall that
+  produces the exact same audible dropout this whole plan exists to fix, just for everyone
+  sharing the front-end instead of only the recording. Surfaced the same way this codebase
+  already surfaces exactly this concept elsewhere — RSR200's `lastBlock.sequenceGap`/
+  "Sequence gaps seen" status counter (`source_modules/rsr200_source/src/main.cpp`) — a
+  visible "Recording gaps: N" counter in the recorder's own menu, not just a log line, so a
+  struggling disk is obvious during the session, not discovered afterward by a gap in the
+  file. Rate-limit the log warning itself (once per gap, not once per dropped block) so a
+  sustained shortfall doesn't also spam the log.
+- **Shutdown ordering.** `stop()` must fully drain the queue through the writer thread before
+  calling `writer.close()`, or the tail of a recording is silently lost, and before the
+  `auxi` `stopTime` patch (`misc_modules/recorder/src/main.cpp:345-348`), which needs to
+  reflect when the *last sample* was actually written, not when the stream was told to stop
+  accepting new ones.
+  Two-part flag needed (matching this project's existing `dualRun`/thread-join pattern):
+  stop *accepting new* samples immediately, but keep the writer thread alive until the queue
+  it was already holding is empty, then join.
+- **Live duration display.** `writer.getSamplesWritten()` currently increments synchronously
+  inside `write()` — used for the "Recording HH:MM:SS" readout (`main.cpp:558`). Once writes
+  happen asynchronously, this reflects samples actually flushed to disk, not samples captured
+  — expected to lag the true elapsed time by up to the queue's buffered depth under normal
+  operation, and visibly more if the disk is genuinely falling behind. Worth surfacing that
+  lag directly (e.g. a separate "buffered: N samples/seconds" indicator) rather than letting
+  the existing readout quietly mean something subtly different than it used to.
+- **Applies to both recording paths identically** — single-channel baseband
+  (`complexHandler`) and dual-channel (`dualWorker`) both currently call `writer.write()`
+  synchronously and both need the same queue-and-writer-thread treatment. Audio-mode
+  recording (`stereoHandler`/`monoHandler`) has the identical architectural gap but at
+  48 kHz-class rates is far less likely to ever hit it in practice — include it for
+  consistency rather than leaving one recording mode on the old, riskier path, but it's not
+  the motivating case.
+
+## 5. Decisions (2026-08-11)
+
+All three questions this plan originally raised as open, answered directly rather than left
+for implementation time to guess at:
+
+- **Backpressure policy: drop-with-warning.** When the queue itself fills — the disk
+  genuinely falling behind, not just absorbing a transient stall — the producer discards the
+  current incoming block and the recorder surfaces it visibly (section 4's "Recording gaps:
+  N" counter, precedented by RSR200's own "Sequence gaps seen" status line), rather than
+  blocking (which would just reintroduce section 2.1's hazard one layer later) or growing the
+  queue unbounded (an OOM risk on a long enough sustained shortfall). An honest, visible gap
+  beats a silent stall that produces the exact same audible dropout this plan exists to fix.
+- **Queue sizing: capped by RAM, not a fixed time target.** Default 512 MB per recorder
+  instance (section 4's first bullet has the full reasoning) — the buffered *duration* falls
+  out of that budget divided by the configured rate's actual bytes/sec, so it automatically
+  shrinks at higher bandwidths instead of a fixed "N seconds" target silently costing
+  unreasonable RAM at high enough configured rates (the 24 MSp/s Float32 dual-channel case
+  that originally motivated this question is already ~2.3 GB for just 3 seconds at a fixed
+  time target — capping by RAM avoids ever reaching for that number in the first place).
+- **The general Splitter hazard (section 2.1) is deliberately deferred, not addressed by this
+  plan.** Fix the recorder specifically first, then see whether it was actually the whole
+  story before speculatively widening scope to a shared-infrastructure change that affects
+  every module using a Splitter. Revisit only if real-world testing after phase 1 still shows
+  a slow consumer stalling live listening through some *other* path.
+  - **Revisited, 2026-08-12 (phase 8 below): it did.** With phases 1-3 and 6 landed, live
+    testing at 20.513 MSp/s (164.1 MHz ADC clock ÷ 8x decimation) surfaced exactly the
+    predicted symptom from a *different* slow consumer than originally suspected: not the
+    recorder (now off the real-time path entirely), but the spectrum/waterfall FFT itself
+    at that rate — live audio had audible click artifacts while the simultaneously-running
+    recording, insulated by its own RAM-buffered queue with no real-time deadline to miss,
+    played back completely clean. That asymmetry is the tell: whatever's stalling the shared
+    Splitter isn't hurting the recorder anymore, only anything still on the real-time path.
+    See phase 8 for the stopgap applied and why the general fix is still open.
+  - **Deployment trap hit while shipping phase 8, worth recording generally**: `Splitter<T>`
+    is embedded *by value* (not by pointer) inside plugin-defined classes reachable across the
+    core/plugin `.dylib` boundary — `SinkManager::Stream::splitter` (`core/src/signal_path/sink.h`,
+    used by `radio.dylib` via `RadioModule`) and the recorder's own `splitter`
+    (`misc_modules/recorder/src/main.cpp:876`). Adding a member to `Splitter<T>` changes its
+    `sizeof`/layout, so rebuilding only `sdrpp_core` (as phases 1-6 always safely did — none of
+    those changes touched a header-only class embedded by value elsewhere) was **not** enough
+    this time: a stale `radio.dylib` built against the old layout crashed on startup
+    (`EXC_BAD_ACCESS` inside `Splitter<stereo_t>::bindStream`) once paired with a freshly built
+    core. Full `cmake --build build_release -j8` (every target, not just the one header
+    touched) is required whenever a header-only template class gets a new member, and both
+    `SDR++.app`'s and `SDR++ RB.app`'s bundles need rebuilding from that, *and* `root_dev/modules/`
+    (which the `-r` dev flag loads plugin `.dylib`s from independently of whatever's inside the
+    `.app` bundle) needs the same fresh copies — otherwise a stale `root_dev/modules/radio.dylib`
+    reproduces the identical crash even after the real fix already landed, which is exactly what
+    happened during this session's own verification.
+
+## 6. Phased implementation plan
+
+New code lives in `misc_modules/recorder/src/` (a new header alongside `main.cpp`, not
+promoted to `core/src/utils/`) — everything in section 4's design is recorder-specific today,
+with no second consumer anywhere else in the codebase to generalize for yet. Matches this
+plan's own non-goals (section 3): build the narrow thing that's actually needed, not a
+speculative shared framework.
+
+| Phase | Scope | Depends on |
+|---|---|---|
+| **1** ✅ | **Done, 2026-08-11.** `misc_modules/recorder/src/recording_queue.h`: `RecordingQueue`, a bounded RAM-capped sample queue paired with a dedicated writer thread. Owns the 512 MB budget (section 5), the drop-with-warning policy and gap counting, and the stop/drain/join ordering (section 4) — all in one place so phases 2-4 are just wiring, not reimplementing the same logic three times. Deliberately takes a plain `std::function<void(float*, int)>` write callback rather than a `wav::Writer*` directly — nothing about batching/pacing writes onto a background thread needs to know about WAV/RIFF, and staying decoupled is what let phase 1 be tested on its own (`misc_modules/recorder/test/test_recording_queue.cpp`, 14 checks: full drain in order and unmodified, the RAM cap bounds queued bytes exactly, a push past the cap returns immediately rather than blocking and is counted as a gap, `stop()` fully drains a backlog before returning, a fresh `start()` resets the gap counter) without linking against core, wired into `core/test/run_tests.sh`'s `STANDALONE` list. Full suite 14/14. Nothing in the real recorder module (`main.cpp`) touches this yet — that's phases 2-4. | None — foundational. |
+| **2** ✅ | **Done, 2026-08-12.** Wired phase 1's queue into single-channel baseband recording (`complexHandler`, `main.cpp`) — the actual motivating case (wideband IQ, the RSR200-FM-band scenario that started this plan). `complexHandler` now just pushes and returns. `recQueue.start()`/`.stop()` added around the existing `writer.open()`/`writer.close()` in `start()`/`stop()`, positioned so the queue is fully drained (everything already pushed is written) before the `auxi` stopTime patch and `writer.close()` run. Confirmed live by Ralph: recorded and played back normally through the real UI. | Phase 1 |
+| **3** ✅ | **Done, 2026-08-12.** Same treatment for dual-channel/phasing recording (`dualWorker`). `dualWorker` keeps doing its own read/`ChannelSync`/interleave work exactly as before — only the final `writer.write()` call at the end of that loop became a `recQueue.push()`. Reuses the same `recQueue`/`recChannels` phase 2 already added (`recChannels` was already being set to 4 for dual-channel in `start()`), so this phase was wiring only, no new state. The old `recMtx` lock around that write call is gone too — `recQueue` has its own internal synchronization and, unlike the direct `writer.write()` it replaced, never touches `writer` itself. Full suite 14/14; live confirmation not yet done (needs a dual-channel/phasing source to test against). | Phase 1, 2 |
+| **4** | Wire the same queue into audio-mode recording (`stereoHandler`/`monoHandler`). Included for consistency (section 4's last bullet) rather than because it's likely to matter in practice at 48 kHz-class rates — lowest priority of the three wiring phases, safe to do last or skip first-pass if time is short. | Phase 1 |
+| **5** | Surface it in the UI: a "buffered: N.Ns of stall protection" readout next to the existing `about %.0f MB/min` line (derived from the 512 MB budget ÷ the configured rate, so it's meaningful at whatever bandwidth is actually selected), and a live "Recording gaps: N" counter styled like the existing red/yellow recording-state text — visible during the session, not just in the log, matching RSR200's own "Sequence gaps seen" precedent. | Phases 2-4 (needs real data to show — do after at least the baseband path, phase 2, lands) |
+| **6** ✅ | **Done, 2026-08-12.** Enlarged `riff::Writer`'s `std::ofstream` buffer via `pubsetbuf()` — `open()` (`core/src/utils/riff.cpp`) now constructs a fresh, unopened `std::ofstream`, points it at a 1 MB backing buffer (`writeBuf`, a `Writer` member so it outlives the stream and isn't reallocated on every `open()` of the same long-lived `Writer`), *then* calls `file.open(path, ...)` — `pubsetbuf()` only has any effect before a stream is first associated with a file, so the old single-step constructor form had to be split. At sustained wideband rates this cuts the write() syscall count by roughly two orders of magnitude versus the platform default (typically a few KB), leaving far more for the OS's own write-behind caching to batch. Pre-allocating the file's expected size, the other half of this phase's original scope, turned out not to cleanly apply and was dropped: `riff::Writer` is opened with no known final length (recording stops on user action, not at a predetermined size), so there is no size to pre-allocate to without either guessing or plumbing an estimate in from the recorder module for no real benefit — the buffer enlargement above is the well-supported, low-risk part of this phase, and a grow-ahead-by-chunks scheme (e.g. `posix_fallocate` in fixed increments as `data` grows) is a possible future refinement, not implemented here. Full suite 14/14, including `test_wav_roundtrip`'s RF64 backpatch/seek round trip, confirming the seek-based JUNK→ds64 patching in `close()` still works correctly against the buffered stream. Both `SDR++.app` and `SDR++ RB.app` rebuilt via `make_macos_bundle.sh` (this phase touches `sdrpp_core`, not just the recorder module's own `.dylib`) and smoke-tested to launch cleanly under `root_dev` with no crash. Live confirmation of a recorded file playing back correctly not yet done. | None — independent of everything else. |
+| **7** | Verification. Full `core/test/run_tests.sh` suite including phase 1's new unit tests, unchanged and passing. Live acceptance test reproducing the scenario that started this plan directly: record the same kind of wide span (full FM band or comparable) that produced audible dropouts before, and confirm the recording comes out clean — ideally with the phase 5 gap counter at 0 as the concrete, in-app evidence, not just "sounded fine on playback." | All of 1-6 |
+| **8** ✅ | **Done, 2026-08-12. Stopgap for section 2.1, triggered by live testing at 20.513 MSp/s (phases 1-3 and 6's live-test at 164.1 MHz ADC clock ÷ 8x decimation, 24-bit mode, Float32) — audible clicks in live audio while the simultaneous recording stayed clean.** Root cause traced end-to-end: `IQFrontEnd::init()` binds the FFT/waterfall's `fftIn` to the shared `split` Splitter *first*, before any VFO or the recorder (`core/src/signal_path/iq_frontend.cpp:67`, previously unconditional `split.bindStream(&fftIn)`). `Splitter::run()` blocks on each bound consumer's `swap()` in bind order (section 2.1), so a slow `fftIn` delayed every consumer bound after it. `fftIn` feeds `Reshaper`, whose ring buffer (`core/src/dsp/buffer/ring_buffer.h`, fixed `RING_BUF_SZ` = 1,000,000 samples) is only ≈49ms of slack at this rate — once the actual FFT compute (windowing + FFTW + log conversion, `IQFrontEnd::handler()`) falls behind, `Reshaper::run()`'s `ringBuf.write()` blocks, delaying `fftIn`'s flush, stalling the shared Splitter's next `swap()` for everyone, including the VFO feeding live audio. Recording didn't show it because phases 1-3 already moved it off this real-time path entirely (RAM-buffered queue, no per-frame deadline to miss); live audio has no such slack. **Fix**: `dsp::routing::Splitter::bindStream()` (`core/src/dsp/routing/splitter.h`) gained an optional `lowPriority` parameter (default `false`, so every other caller — the recorder's own audio splitter, `phasing.cpp`'s per-channel splitters — is unaffected); low-priority consumers are kept in a second list and swapped only *after* every normal-priority one each frame, so a slow one can never make a real-time consumer wait behind it for that frame's data. `iq_frontend.cpp` now calls `split.bindStream(&fftIn, true)`. This is explicitly a stopgap, not the full fix: `run()` as a whole (and therefore how soon the *next* frame is even read) still waits on the low-priority consumer's `swap()`, so sustained FFT backpressure can still ripple upstream — it just no longer forces real-time consumers to wait behind it *within* an already-arrived frame, which is what was actually producing the audible clicks. The full fix (fully independent per-consumer delivery, immune to backpressure rippling upstream at all) is still open — see section 5's revisited note. Full suite 14/14. First deploy attempt (rebuilding only `sdrpp_core`, matching phases 1-6's pattern) crashed on startup — see section 5's "deployment trap" note for why and the fix. Corrected: full `cmake --build build_release -j8` (every target), both `.app` bundles rebuilt from that, and `root_dev/modules/` refreshed too. Confirmed by Ralph directly ("that didn't crash") and independently by launching under `-r root_dev` after syncing that directory's copies. **Live-tested at 20.513 MSp/s: live audio still broke up badly, recording still stayed clean** — the bind-order-only stopgap was insufficient, exactly the residual risk flagged above (sustained, not just occasional, FFT backlog at this rate means `run()` as a whole was still gated on `fftIn`'s blocking `swap()` every single frame, so reordering alone couldn't help once the backlog stopped being transient). See phase 9. | None — independent, but motivated by real-world testing after phases 1-3/6. |
+| **9** ✅ | **Done, 2026-08-12. The actual fix for section 2.1, prompted directly by phase 8's stopgap proving insufficient under sustained (not just transient) FFT backlog at 20.513 MSp/s.** Added `dsp::stream<T>::trySwap()` (`core/src/dsp/stream.h`) — a non-blocking counterpart to `swap()`: if the reader hasn't drained the previous buffer yet, it returns immediately (`0`, "skipped") instead of waiting, rather than blocking the caller. Writing into `writeBuf` beforehand is always safe regardless of the outcome, since the reader only ever touches `readBuf`. `Splitter::run()`'s low-priority loop now calls `trySwap()` instead of `swap()` — a low-priority consumer that's behind just has *that frame* skipped for it alone; `run()` never waits on it at all, so it can no longer gate how soon the next input frame is even read, closing the gap phase 8 left open. Purely additive (new method, no new members on any class) — no repeat of phase 8's layout-mismatch deploy trap, though the full multi-target rebuild discipline from section 5 was followed again anyway rather than assumed safe. Full suite 14/14. Both `.app` bundles rebuilt and `root_dev/modules/` synced; both smoke-tested to launch cleanly with no crash. **Live-tested at 20.513 MSp/s: no change — same constant clicking, but Ralph's report narrowed it decisively: only happens while recording is active.** That single detail rules out `fftIn`/the FFT path entirely (phases 8/9 fixed exactly what they targeted) and points somewhere phases 8/9 never touched: the recorder's *own* tap into the shared splitter. See phase 10. | Phase 8 |
+| **10** ✅ | **Done, 2026-08-12. Root cause of the "only while recording" symptom phase 9 didn't fix.** The recorder's own `basebandStream`/`dualBuf` tap into the shared `IQFrontEnd` splitter (`bindIQStream()`, `misc_modules/recorder/src/main.cpp`) is bound at *normal* priority, same as any VFO — phases 8/9 only ever touched `fftIn`'s binding, not this one, so it was never protected by either fix. `RecordingQueue::push()` (`misc_modules/recorder/src/recording_queue.h`) allocated a fresh `std::vector<float>` on *every single call* — a heap allocation under the same mutex the writer thread also locks, running synchronously on whichever thread drains that normal-priority splitter-bound stream (`complexHandler`/`dualWorker`). At 20.513 MSp/s that's potentially thousands of allocations/sec; slow enough for long enough, it stalls that thread's ability to keep draining its stream, which — ordinary blocking `swap()`, no `trySwap()` involved here — throttles the whole shared splitter's iteration, gating delivery to every other consumer including live audio. Explains the correlation exactly: unbound (no recording), no consumer, no stall. **Fix**: `push()`/the writer thread now recycle buffers through a free list instead of allocating fresh each call — `push()` pops a reusable buffer if one exists and `assign()`s into it (hits its no-realloc fast path once warmed up, since pushed chunk sizes are steady at a fixed configured rate); the writer thread hands the buffer back to the free list after `writeFn()` consumes it. Public interface, RAM-budget accounting, and drop-with-warning semantics all unchanged. Added a new test (`test_recording_queue.cpp`, global `operator new` override scoped to that standalone binary) asserting zero allocations ≥1KB across 20 steady-state pushes once the free list has warmed up — not just "should be faster" reasoning. Full suite 14/14 (15 checks now). Both `.app` bundles rebuilt (recorder-only header, but full multi-target rebuild done anyway per section 5's lesson) and `root_dev/modules/` synced; both smoke-tested to launch cleanly. **Live-tested at 20.513 MSp/s: no change at all — "still breaks up live when recording... no real change."** Two fixes in a row (phases 9 and 10) with zero measurable effect means the Splitter-blocking theory itself needs actual evidence, not a third guess. See phase 11. | None — independent, prompted by phase 9's live test. |
+| **11** ✅ | **Done, 2026-08-12. Not a fix — instrumentation, in response to phase 10 producing no measurable change.** Surfaced `RecordingQueue`'s already-tracked `getGapCount()`/`getQueuedBytes()`/`getRamBudgetBytes()` in the recorder's own status UI (`misc_modules/recorder/src/main.cpp`, right under the existing "Recording HH:MM:SS" line): a red "Recording gaps: N" line (styled like the existing recording-state text) once any gap has occurred, and a "Buffered: X.X / 512 MB" line always. This is phase 5 from section 6's original table, done now as a diagnostic rather than a nice-to-have — it turns "is the queue actually backing up toward its RAM cap (writer thread/disk genuinely can't keep up) or staying near-empty (something else entirely is the bottleneck)" from a guess into an observable fact, without attaching a debugger or profiler to a session neither of us can drive interactively. Purely additive UI, no logic change; recorder-only rebuild, both `.app` bundles rebuilt via `make_macos_bundle.sh` (not a raw dylib copy into the bundle -- that risks invalidating the bundle's code signature) and smoke-tested to launch cleanly. **Result: gaps stayed 0, buffered stayed ~0 throughout the breakup** — `RecordingQueue` itself is completely healthy; the disk/writer thread is keeping up fine. This ruled out phases 9's and 10's whole theory (a slow/blocking consumer on the shared splitter) and redirected the investigation to a different mechanism entirely. Two further live A/B tests nailed it down: (a) switching SAM→AM made no difference — rules out PLL-specific sensitivity, the click is demod-agnostic, happening upstream of demodulation; (b) dropping decimation from 8x to 16x (20.513→10.256 MSp/s) with recording still on made the clicking disappear *entirely* — clean confirmation of a throughput/volume ceiling, not a logic bug: whatever the cost is, it scales with sample rate, and this hardware clears it below ~20 MSp/s but not above. See phase 12. | None — diagnostic, prompted by phases 9-10 showing no effect. |
+| **12** ✅ | **Done, 2026-08-12. The actual fix, identified via phase 11's diagnostic data plus two live A/B tests (SAM vs AM: no difference; 8x vs 16x decimation: clean at half rate) that pinned the mechanism down precisely.** Root cause: `Splitter::run()` (`core/src/dsp/routing/splitter.h`) does one full-block `memcpy` *per bound consumer*, all sequentially on the Splitter's own single thread. Before this phase, `IQFrontEnd`'s one and only `split` fanned out to `fftIn` (low-priority since phase 8), every live VFO, *and* the recorder's baseband tap (`bindIQStream()`) — all sharing that one thread's copy budget. Phases 9-10 made the recorder's own consumption fast and non-blocking, but neither reduced the raw *volume* of data that thread has to physically copy once a third full-rate consumer is bound: at 20.513 MSp/s Float32 (~164MB/s), adding the recorder's copy to what the thread already does for the live VFO pushed total per-iteration `memcpy` work past this hardware's real-time budget for a single thread — throttling delivery to *every* consumer sharing it, VFO included, regardless of how fast the recorder's own downstream chain was. Explains all three pieces of evidence at once: recording-gated (that thread only does the extra copy when the recorder's tap is bound), demod-agnostic (the ceiling is upstream of any VFO/demodulator), and invisible to `RecordingQueue`'s counters (the bottleneck was never inside the queue). **Fix**: split `IQFrontEnd`'s single splitter into two. `rawSplit` now reads directly from `preproc`'s output and has exactly one always-bound consumer, `mainStream`; the existing `split` reads `mainStream` instead of `preproc.out` directly and keeps doing exactly what it always did (`fftIn` + VFOs). A new `bindRawIQStream()`/`unbindRawIQStream()` pair on `IQFrontEnd` binds directly to `rawSplit` instead — used by the recorder's baseband tap in place of `bindIQStream()`. Since each `Splitter` is its own `dsp::block` with its own dedicated thread, `rawSplit`'s copy (feeding `mainStream` + the recorder) now runs in parallel, on a separate OS thread, with `split`'s copy (feeding `fftIn` + VFOs) — genuine parallelism across CPU cores instead of serializing all three consumers' copies on one thread. Total system-wide `memcpy` work is unchanged; what changed is that it's no longer all serialized on a single thread. The three `preproc.setBlockEnabled()` reconfiguration callbacks (decimation/DC-blocking/IQ-invert toggles) now retarget `rawSplit.setInput()` instead of `split.setInput()`, matching the new topology. `start()`/`stop()` gained `rawSplit.start()`/`stop()` calls, ordered right after `preproc`'s own (before `split`'s, since `split` now depends on `mainStream`, which only `rawSplit` feeds). Dual-channel/phasing recording is untouched — it already taps `sigpath::phasing`'s own separate per-channel splitters, never shared `IQFrontEnd::split`'s thread at all. `iq_exporter` also still uses the plain `bindIQStream()`/`split` for its own full-rate export — same theoretical exposure at extreme rates, but no reported issue there, so left alone rather than scope-creeping into an unreported problem. Full suite 14/14. New `IQFrontEnd` members (`rawSplit`, `mainStream`) mean another layout change reachable across the plugin boundary — full multi-target `cmake --build build_release -j8` done again (not skipped, per phase 8's lesson), both `.app` bundles rebuilt via `make_macos_bundle.sh`, `root_dev/modules/` synced (radio/recorder/phasing/iq_exporter), both smoke-tested to launch cleanly with no crash. **Live-tested: regression.** Ralph: "Previously clean audio at 20.513 MSp/s without recording now has clicks. Adding recording dramatically increases the click rate, but even without recording the audio is unlistenable." This version wired `rawSplit` in *unconditionally* — `split.init(&mainStream)` instead of `split.init(preproc.out)` — meaning `rawSplit`'s copy from `preproc.out` into `mainStream` ran *at all times*, recording or not, on top of `split`'s own copy into `fftIn`/VFOs from `mainStream`. That's not parallelizing existing work, it's adding a brand new full-rate copy stage that never existed before and never turns off — strictly worse than the pre-phase-12 baseline whenever nothing raw is bound, which explains the regression exactly. See phase 13. | Phase 11 (diagnostic data) |
+| **13** ✅ | **Done, 2026-08-12. Fixes phase 12's regression by making the extra copy stage conditional instead of permanent.** `split` now reads `preproc.out` directly again, exactly as it always did before phase 12 — zero behavioral or performance change from the pre-phase-12 baseline whenever no raw consumer is bound, which is the common case. `rawSplit`/`mainStream` are only *inserted* into the chain — `split.setInput(&mainStream)`, `rawSplit` bound to `mainStream` and started — the moment the first `bindRawIQStream()` call arrives, and torn back down (`split.setInput()` pointed back at preproc's real current output, `rawSplit` stopped and unbound from `mainStream`) the instant the last one calls `unbindRawIQStream()`. A new `currentPreprocOut` member tracks preproc's real current output stream (updated alongside `rawSplit.setInput()` in all three `setBlockEnabled()` reconfiguration callbacks, *regardless* of whether raw is currently inserted, so it's never stale by the time a teardown needs it) — exists only because `Sink<T>::_in` is protected with no public getter, and adding one for this one caller wasn't worth widening that class's interface. `IQFrontEnd::start()`/`stop()` only start/stop `rawSplit` if `rawStreams` is already non-empty going in (the front end being restarted, e.g. a source switch, while a recording happens to be active) rather than unconditionally. Net effect: the *cost* of this whole feature -- one extra full-rate copy stage on its own thread -- is now paid only while something is actually bound to it, exactly matching the tradeoff intended in phase 12 but never actually delivered. Full suite 14/14. Both `.app` bundles rebuilt (full multi-target, `IQFrontEnd` layout changed again) and `root_dev/modules/` synced; both smoke-tested to launch cleanly with no crash. **Live-tested, mixed: no-recording case confirmed clean (the regression is fixed) — but recording still clicked the same as ever, "stopping recording stops all audio," and the recorded file wouldn't play back at all.** Two new, more serious bugs on top of an unresolved original one. See phase 14. | Phase 12 |
+| **14** ✅ | **Done, 2026-08-12. Fixes phase 13's own bug: a genuine concurrency race, not a performance issue, likely explaining all three symptoms phase 13's live test turned up at once.** `bindRawIQStream()`/`unbindRawIQStream()` (`core/src/signal_path/iq_frontend.cpp`) had `split` and `rawSplit` both live-reading `preproc.out` simultaneously for a brief window during insertion/teardown — `rawSplit.start()` ran *before* `split.setInput(&mainStream)` retargeted `split` away from `preproc.out` (insertion), and `split.setInput(currentPreprocOut)` ran *before* `rawSplit.stop()` had actually stopped it from reading `preproc.out` (teardown). `dsp::stream<T>` has strictly single-reader semantics — one shared `dataReady`/`canSwap`/`readerStop` state, not tracked per-reader (`core/src/dsp/stream.h`) — so two concurrent readers race on that state: one can consume a swap the other was waiting on, torn/duplicated reads of the same double-buffer are possible while the writer's `swap()` proceeds underneath them, and a reader can end up permanently parked waiting on a signal that's already been consumed. This is a strong, unified explanation for everything phase 13's test found: the stop-time hang (`split`'s thread stuck after a lost signal — directly explains "stopping recording stops all audio"), the unplayable file (`RecorderModule::stop()` calling `unbindRawIQStream()` synchronously, hanging there, means `writer.close()` and its RIFF finalization never ran), and *possibly* the still-unresolved clicking too, if the same race corrupted `preproc.out`'s buffer bookkeeping right at the start of the recording and the corruption persisted rather than the phase 12/13 fix ever getting cleanly tested. **Fix**: reordered both functions so exactly one of {`split`, `rawSplit`} is ever a live reader of `preproc.out` at any instant — `bindRawIQStream()` now retargets `split` to `mainStream` *first* (its thread just blocks harmlessly on an empty `mainStream` for the brief transition) before `rawSplit` ever starts reading `preproc.out`; `unbindRawIQStream()` now calls `rawSplit.stop()` *first* — which joins its worker thread synchronously (`dsp::block::doStop()`), so by the time it returns `rawSplit` is guaranteed done with `preproc.out` — before `split` starts reading it again. Body-only change (no member/layout change), but full multi-target rebuild done anyway per established discipline. Full suite 14/14. Both `.app` bundles rebuilt and `root_dev/modules/` synced; both smoke-tested to launch cleanly. **Live-tested: the hang and unplayable file are both fully fixed** — "stops cleanly and doesn't hang," "recorded file plays back properly, no clicks, audio audible." Real bugs, genuinely resolved. **The original clicking is unchanged** — "massive clicks" while recording, same as ever, now cleanly isolated with no confound. This is the first fully clean test of the phase 12/13 two-thread parallelization idea, and it does *not* fix the clicking — meaningful negative evidence against a CPU-time-on-one-thread theory. See phase 15. | Phase 13 |
+| **15** ✅ | **Done, 2026-08-12. Redirected the investigation entirely, via two more live data points: sample TYPE (Float32 vs Int16 on the recorded file) made no difference, but ADC RESOLUTION (24-bit vs 16-bit, an RSR200 hardware/firmware setting) made a clean, decisive difference — 16-bit stays clean, 24-bit clicks badly. Plus real numbers: Activity Monitor showed 680% CPU at 24-bit *before* recording even starts, 780% once it does, 450% at 16-bit without recording.** The sample-type result doesn't disprove a bandwidth/CPU theory the way it first looked like it might — `wav::Writer::write()`'s Float32/Int16 choice only affects the very last on-disk conversion step; the entire internal pipeline (Splitter, `RecordingQueue`, everything phases 8-14 touched) always carries `dsp::complex_t` float pairs regardless of that setting, so that test never touched the actual internal cost. The ADC-resolution result points somewhere none of phases 8-14 ever looked: `source_modules/rsr200_source/src/rsr200_protocol.h`'s `unpack()` — the scalar, per-sample loop that converts raw USB bytes into `dsp::complex_t`, running at the full incoming rate (up to ~20.5 MSp/s), upstream of `IQFrontEnd`/`Splitter`/`RecordingQueue` entirely. Two real inefficiencies found there: `read24()` used a branch for sign extension where a shift-into-the-top-byte-then-arithmetic-shift-right trick is branchless and gives an identical result (verified by hand against `test_protocol.cpp`'s existing positive/negative fixtures, both matched exactly); `unpack()` checked `fmt.bits`/`fmt.channels` — invariant for the whole call — on *every sample* rather than once up front, so it now branches once and runs one of four dedicated tight loops instead. Both fixes are pure computation, no threading/architecture change, low-risk by construction. Explains the evidence collected so far reasonably well: 24-bit's `read24()` does more work per sample than 16-bit's `read16()` (bigger shifts, non-word-aligned 3-byte reads), an already-CPU-heavy baseline (680%/6.8 cores just to receive and process live, before recording) has little headroom left, and recording's own ~100-percentage-point addition (its own thread, `RecordingQueue`'s copy, disk I/O) is enough to tip an already-marginal `unpack()` past missing its own real-time deadline on this hardware — while the demod-agnostic, recording-gated, `RecordingQueue`-counters-stay-healthy pattern observed throughout phases 9-14 is consistent with a bottleneck this far upstream. **Caveat, stated plainly**: 680%/6.8 cores of *total* process CPU is a lot to attribute entirely to one scalar loop doing roughly 300M ops/sec (well under one core's throughput on modern hardware) -- something else in the pipeline (FFT/waterfall rendering, VOLK-based DSP stages elsewhere) is very likely also contributing meaningfully to that total, so this fix should not be assumed to be the whole story on its own; it's a real, verified improvement to a real hot loop, not a guaranteed full fix. Full suite 14/14 (verified `read24()`'s branchless rewrite against existing sign-extension test fixtures by hand in addition to the automated run). `rsr200_source`-only change (module-scoped header, no core/layout impact) — targeted dylib redeploy to both bundles plus `root_dev/modules/`, both smoke-tested to launch cleanly. **Live-tested with real numbers.** `unpack()`'s fix produced a real, measurable win exactly where expected — 24-bit receive-only CPU dropped from 680% to 550% (16-bit stayed flat at 450%, as it should since that code path was already using the cheap branch) — confirming it was a genuine, non-trivial cost center. But it didn't fix the actual symptom: recording at 24-bit reached 825% CPU and audio still broke up; 16-bit recording (660% CPU) stayed clean, matching every earlier test. Conclusion, agreed with Ralph: 16-bit is clean at this sample rate and an accepted, practical operating point; 24-bit + 20.513 MSp/s + recording is not pursued further for now. **Correction to how this was first framed**: Ralph's machine is an M3 Max (12P+4E, 16 cores total) with 64GB RAM — 825% is only ~8 of 16 cores, so "hardware capacity ceiling" overstated it; there's substantial raw headroom left. The more accurate read is that some *specific* thread (`unpack()`'s own single receive thread is the prime suspect — inherently bound to one core's throughput no matter how many cores the machine has, regardless of aggregate load elsewhere) is occasionally missing its own tight per-sample deadline under memory-bandwidth or cache contention from the other threads recording adds, not that the machine lacks raw compute. That's a real, fixable-in-principle problem. It isn't pursued further here only because 16-bit is an accepted practical answer and the fixes shipped along the way (phases 8-15) are real; chasing the 24-bit case further would need actual profiling data (a `sample`/Instruments capture) rather than another architectural guess, given two wrong guesses already in this investigation (phases 12 and the "clean but ineffective" phase 12/13 parallelization). Worth revisiting with real profiling data if it matters again later. | None — redirected by phase 14's clean result plus new live evidence. |
+| **16** ✅ | **Done, 2026-08-12. The real profiling data phase 15 called for — `sample sdrpp 5 -f ~/Desktop/sdrpp_sample.txt` (macOS's built-in sampling profiler, 1ms interval, 5s capture) at 24-bit with recording active — and the closing note for this investigation.** Findings, read as honestly as the format allows (see caveat below): `unpack()` is confirmed *not* the dominant cost — only ~95 of 1988 samples (~5%) on the RSR200 receive thread. Instead, **73% of that thread's samples (1452/1988) sit inside `std::condition_variable::wait()`, blocked in `RSR200SourceModule::deliver()`'s own `out.swap(b.frames)` call (`source_modules/rsr200_source/src/main.cpp:275`)** — waiting for its downstream reader (`IQFrontEnd::inBuf`, then `preproc`→`rawSplit`/`split`→everything phases 8-14 touched) to catch up. The VFO thread and the audio-rate `Splitter` were checked too and are also mostly idle/blocked, not doing sustained work; nothing in the VOLK/`memmove` leaf functions stood out as a single dominant hot loop. **Caveat, stated as plainly as phase 15's**: `sample` works by briefly suspending threads to capture stacks — real overhead — and Ralph reported the clicking got *worse* while it ran, confirming the measurement itself perturbed the system it was measuring. The 73%-blocked figure should be read as "consistent with the downstream chain being the throughput-limiting factor," not as precise, unperturbed timing. **Conclusion**: no new single fixable hot spot found. The picture is a diffuse, cumulative pipeline-throughput margin problem at 24-bit + 20.513 MSp/s + recording — consistent with, not a reversal of, everything phases 8-15 already found — and the profiler's own overhead being enough to visibly worsen it confirms the system is operating at a razor-thin real-time margin at this specific combination, not that any one component is straightforwardly broken. **Investigation closed here, formally, by mutual agreement**: 16-bit is clean and accepted as the practical operating point at this sample rate; 24-bit + 20.513 MSp/s + recording is not pursued further for now, but may be revisited later with more targeted profiling (per-thread CPU%, or Instruments' Time Profiler with its lower per-sample overhead than `sample`) if it matters again. Every fix that shipped along the way (phases 8-15) is real and stays in place regardless. | Phase 15 |
+
+Phase numbers assigned in build order, not necessarily the order they have to land in — phase
+6 in particular has no dependency on anything else and could go first as a quick, independent
+win while phase 1's queue is still being built.
+
+## Appendix: how this plan started
+
+Prompt (2026-08-11), verbatim intent: audit the recorder module for throughput/dropout
+issues without changing any code first, given a direct comparison — an Elad FDM-S3 (24 MHz
+digitizing bandwidth) records the full FM band to a spinning hard drive without dropouts using
+its own native software or SDR Console, while SDR++ produces dropouts recording a comparable
+span even to an SSD. The audit in section 2 is that exploration's result, unedited in
+substance from what was first reported back.

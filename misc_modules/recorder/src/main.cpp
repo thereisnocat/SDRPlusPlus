@@ -25,6 +25,7 @@
 #include <utils/wav_meta.h>
 #include <dsp/combine/channel_sync.h>
 #include <radio_interface.h>
+#include "recording_queue.h"
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -208,11 +209,12 @@ public:
 
         writer.setFormat(containers[containerId]);
         if (recordingDual) {
-            writer.setChannels(4);
+            recChannels = 4;
         }
         else {
-            writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
+            recChannels = (recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2;
         }
+        writer.setChannels(recChannels);
         writer.setSampleType(sampleTypes[sampleTypeId]);
         writer.setSamplerate(samplerate);
 
@@ -249,6 +251,16 @@ public:
             return;
         }
 
+        // RECORDING_PERFORMANCE_PLAN.md phase 2: the DSP-facing side of baseband recording
+        // (complexHandler, below) now pushes into this queue instead of calling
+        // writer.write() directly -- this dedicated thread does the actual (still blocking)
+        // disk write, off whatever DSP thread is responsible for keeping the shared
+        // IQFrontEnd splitter moving. Started unconditionally rather than only for baseband
+        // mode: harmless (and simpler than a per-mode conditional) for the recording paths
+        // that don't push into it yet (dual-channel/audio -- phases 3-4), since an idle queue
+        // with nothing ever pushed just drains instantly and trivially on stop().
+        recQueue.start();
+
         // Open audio stream or baseband
         if (recMode == RECORDER_MODE_AUDIO) {
             // Start correct path depending on 
@@ -277,7 +289,10 @@ public:
             basebandStream = new dsp::stream<dsp::complex_t>();
             basebandSink.setInput(basebandStream);
             basebandSink.start();
-            sigpath::iqFrontEnd.bindIQStream(basebandStream);
+            // bindRawIQStream(), not bindIQStream() -- the recorder's copy runs on its own
+            // thread, parallel to the FFT/VFO copies, rather than serialized with them on
+            // split's single thread. See RECORDING_PERFORMANCE_PLAN.md phase 12.
+            sigpath::iqFrontEnd.bindRawIQStream(basebandStream);
         }
 
         // Say so: a dual channel capture runs at four times the data rate of an audio
@@ -332,10 +347,18 @@ public:
         }
         else {
             // Unbind and destroy IQ stream
-            sigpath::iqFrontEnd.unbindIQStream(basebandStream);
+            sigpath::iqFrontEnd.unbindRawIQStream(basebandStream);
             basebandSink.stop();
             delete basebandStream;
         }
+
+        // By this point, whichever DSP thread(s) fed the recording queue (complexHandler's
+        // dsp::sink::Handler thread, dualWorker, or the audio sinks -- each already stopped
+        // and joined above) are guaranteed to have made their last push(). Safe to drain and
+        // stop the writer thread now: everything already queued gets written before this
+        // returns, so the auxi stopTime patch and writer.close() below see the recording's
+        // true final state, not a snapshot with the last few blocks still in flight.
+        recQueue.stop();
 
         // Patch auxi's real stop time now that it's actually known -- start() had to write
         // a placeholder (equal to startTime) since addChunk() runs before the recording
@@ -391,10 +414,15 @@ private:
                 dualBuf[4 * i + 3] = b[i].im;
             }
 
-            {
-                std::lock_guard<std::recursive_mutex> lck(recMtx);
-                if (writer.isOpen()) { writer.write(dualBuf.data(), count); }
-            }
+            // RECORDING_PERFORMANCE_PLAN.md phase 3: push, don't write -- same reasoning as
+            // complexHandler's phase 2 wiring. This thread also has to keep draining two
+            // ChannelSync inputs fed from the shared IQFrontEnd splitter (plan section 2.1);
+            // it must never block on disk I/O. No recMtx lock needed around this call --
+            // recQueue has its own internal synchronization, and unlike the old direct
+            // writer.write() call, push() doesn't touch `writer` at all (wav::Writer::write()
+            // still checks isOpen() internally, on recQueue's own writer thread, exactly as
+            // before).
+            recQueue.push(dualBuf.data(), count, recChannels);
             dualSync.consume(count);
             samplesWritten += count;
         }
@@ -565,6 +593,24 @@ private:
             else {
                 ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Recording %02d:%02d:%02d", dtm->tm_hour, dtm->tm_min, dtm->tm_sec);
             }
+
+            // Diagnostic readout for RECORDING_PERFORMANCE_PLAN.md's ongoing investigation
+            // (section 2.1/phases 8-10): distinguishes "the queue is genuinely backing up
+            // toward its RAM cap" (points at the writer thread/disk not keeping up) from
+            // "queue stays near-empty" (points at something else entirely) without needing a
+            // debugger or profiler attached. Meaningful only for baseband/dual recording
+            // (recQueue is unused in audio mode -- phase 4 not done -- so this reads 0/0
+            // there, which is expected, not a bug).
+            uint64_t gaps = _this->recQueue.getGapCount();
+            size_t queuedBytes = _this->recQueue.getQueuedBytes();
+            size_t budget = _this->recQueue.getRamBudgetBytes();
+            if (gaps > 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Recording gaps: %llu", (unsigned long long)gaps);
+            }
+            else {
+                ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_Text), "Recording gaps: 0");
+            }
+            ImGui::Text("Buffered: %.1f / %.0f MB", queuedBytes / 1e6, budget / 1e6);
         }
     }
 
@@ -733,7 +779,12 @@ private:
 
     static void complexHandler(dsp::complex_t* data, int count, void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
-        _this->writer.write((float*)data, count);
+        // RECORDING_PERFORMANCE_PLAN.md phase 2: push, don't write. This is the DSP thread
+        // that also has to keep draining IQFrontEnd's shared splitter (see the plan's
+        // section 2.1) -- it must never block on disk I/O, which recQueue.push() guarantees
+        // by construction (copies and returns; the actual writer.write() call now happens on
+        // recQueue's own dedicated thread).
+        _this->recQueue.push((float*)data, count, _this->recChannels);
     }
 
     static void stereoHandler(dsp::stereo_t* data, int count, void* ctx) {
@@ -821,6 +872,17 @@ private:
     std::atomic<bool> dualRun{ false };
     std::atomic<uint64_t> samplesWritten{ 0 };
     wav::Writer writer;
+    // RECORDING_PERFORMANCE_PLAN.md phase 2: decouples the DSP-facing handlers below from
+    // the actual (still blocking) disk write. Bound once, at construction, to this
+    // instance's own `writer` -- `writer` itself persists for the module's whole lifetime
+    // (reopened per recording, never recreated), so a `this`-capturing callback stays valid
+    // across every start()/stop() cycle without needing to be rebuilt each time.
+    RecordingQueue recQueue{ [this](float* d, int c) { writer.write(d, c); } };
+    // Set in start() alongside writer.setChannels() -- the "channels" every push() into
+    // recQueue needs to report, so its RAM accounting matches what wav::Writer itself is
+    // about to multiply count by internally. 2 by default (baseband I/Q) purely so an
+    // accidental push() before the first start() has a sane divisor, not a real default.
+    int recChannels = 2;
     std::recursive_mutex recMtx;
     dsp::stream<dsp::complex_t>* basebandStream;
     dsp::stream<dsp::stereo_t> stereoStream;

@@ -4,6 +4,7 @@
 #include <string>
 #include <stack>
 #include <stdint.h>
+#include <vector>
 
 namespace riff {
 #pragma pack(push, 1)
@@ -102,6 +103,13 @@ namespace riff {
         std::recursive_mutex mtx;
         std::ofstream file;
         std::stack<ChunkDesc> chunks;
+
+        // Backing storage for file.rdbuf()->pubsetbuf() -- see open()'s own comment
+        // (RECORDING_PERFORMANCE_PLAN.md phase 6). Has to outlive the buffer's use by the
+        // stream, so it's a member, not a local; sized once (open() only resizes it if still
+        // empty) rather than reallocated on every open() of the same long-lived Writer.
+        std::vector<char> writeBuf;
+        static constexpr size_t WRITE_BUFFER_BYTES = 1 * 1024 * 1024;
 
         std::streampos ds64PlaceholderPos = 0;
         bool haveDs64Placeholder = false;
