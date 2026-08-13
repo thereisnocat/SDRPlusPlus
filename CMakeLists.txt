@@ -33,7 +33,7 @@ option(OPT_BUILD_PHASING_TEST_SOURCE "Build the two-channel phasing test signal 
 option(OPT_BUILD_PLUTOSDR_SOURCE "Build PlutoSDR Source Module (Dependencies: libiio, libad9361)" ON)
 option(OPT_BUILD_RFNM_SOURCE "Build RFNM Source Module (Dependencies: librfnm)" OFF)
 option(OPT_BUILD_RFSPACE_SOURCE "Build RFspace Source Module (no dependencies required)" ON)
-option(OPT_BUILD_RSR200_SOURCE "Build Reuter RSR200B Source Module (Dependencies: FTDI D3XX; USB transport only, LAN not yet implemented -- see RSR200_PLAN.md)" OFF)
+option(OPT_BUILD_RSR200_SOURCE "Build Reuter RSR200B Source Module (Dependencies: FTDI D3XX)" ON)
 option(OPT_BUILD_RTL_SDR_SOURCE "Build RTL-SDR Source Module (Dependencies: librtlsdr)" ON)
 option(OPT_BUILD_RTL_TCP_SOURCE "Build RTL-TCP Source Module (no dependencies required)" ON)
 option(OPT_BUILD_SDRPP_SERVER_SOURCE "Build SDR++ Server Source Module (no dependencies required)" ON)
