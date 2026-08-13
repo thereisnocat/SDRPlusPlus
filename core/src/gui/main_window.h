@@ -55,6 +55,7 @@ private:
     int menuWidth = 300;
     bool grabbingMenu = false;
     int newWidth = 300;
+    int draggingLoopMarker = -1;  // -1 = none, 0 = dragging loop marker A, 1 = dragging B
     int fftHeight = 300;
     bool showMenu = true;
     int tuningMode = tuner::TUNER_MODE_NORMAL;

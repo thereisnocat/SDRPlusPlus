@@ -5,6 +5,8 @@
 #include <ctime>
 #include <thread>
 #include <complex>
+#include <functional>
+#include <cmath>
 #include <gui/widgets/waterfall.h>
 #include <gui/widgets/frequency_select.h>
 #include <signal_path/iq_frontend.h>
@@ -260,6 +262,130 @@ void MainWindow::vfoAddedHandler(VFOManager::VFO* vfo, void* ctx) {
     double newOffset = std::clamp<double>(offset, viewLower, viewUpper);
 
     sigpath::vfoManager.setCenterOffset(name, _this->initComplete ? newOffset : offset);
+}
+
+// -----------------------------------------------------------------------------------------
+// Playback bar transport controls (RSR200_PLAN.md-adjacent feature, see the plan file for the
+// A/B loop workflow this is for: scanning a long baseband recording for a station ID, then
+// repeating just that section). No PAUSE/FF/RW/loop icon assets exist in this repo, and there's
+// no icon-authoring tooling available to add them -- every glyph below is drawn procedurally
+// with ImDrawList primitives instead, the same precedent the seek bar's own progress fill
+// (further down in this file) already established for this exact playback bar.
+// -----------------------------------------------------------------------------------------
+
+// Shared hit-region + background chrome for every new playback-bar button, so the five
+// transport buttons and three marker/loop buttons don't each reimplement the same
+// InvisibleButton/hover/disabled boilerplate. heldOut, if non-null, reports whether the button
+// is currently being pressed (not just clicked) -- used by fast-forward/reverse, which scrub
+// for as long as the button is held rather than toggling on a single click. rightClickedOut, if
+// non-null, reports a right-click separately from the (left-click) return value -- used by
+// Set A/Set B to clear a marker without needing a whole separate button for it.
+//
+// activeColor, if non-zero, overrides the theme's ImGuiCol_ButtonActive for a *persistently*
+// toggled-on state (as opposed to "currently being pressed"), with a white outline added on
+// top -- ImGuiCol_ButtonActive alone turned out to read as barely different from the normal
+// button color in this theme, which was the whole reason the Loop toggle didn't look like it
+// had done anything (live feedback: "no indication of state; I can't tell when it's been
+// invoked"). Only Loop uses this; the others don't have a comparable persistent-on state.
+static bool transportGlyphButton(const char* id, ImVec2 size,
+                                  const std::function<void(ImDrawList*, ImVec2, ImVec2)>& drawGlyph,
+                                  bool active, bool disabled, bool* heldOut = nullptr,
+                                  ImU32 activeColor = 0, bool* rightClickedOut = nullptr) {
+    ImGui::PushID(id);
+    if (disabled) { style::beginDisabled(); }
+    ImGui::InvisibleButton("##btn", size);
+    bool held = !disabled && ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    bool clicked = !disabled && ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    bool rightClicked = !disabled && ImGui::IsItemClicked(ImGuiMouseButton_Right);
+    if (heldOut) { *heldOut = held; }
+    if (rightClickedOut) { *rightClickedOut = rightClicked; }
+    ImVec2 tl = ImGui::GetItemRectMin();
+    ImVec2 br = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    bool useActiveColor = active && activeColor != 0;
+    ImU32 bg = useActiveColor ? activeColor
+               : (active || held) ? ImGui::GetColorU32(ImGuiCol_ButtonActive)
+               : (!disabled && ImGui::IsItemHovered()) ? ImGui::GetColorU32(ImGuiCol_ButtonHovered)
+                                                          : ImGui::GetColorU32(ImGuiCol_Button);
+    dl->AddRectFilled(tl, br, bg, 3.0f * style::uiScale);
+    if (useActiveColor) {
+        dl->AddRect(tl, br, IM_COL32(255, 255, 255, 220), 3.0f * style::uiScale, 0, 2.0f * style::uiScale);
+    }
+    drawGlyph(dl, tl, br);
+    if (disabled) { style::endDisabled(); }
+    ImGui::PopID();
+    return clicked;
+}
+
+static void drawPlayGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    float s = std::min(br.x - tl.x, br.y - tl.y) * 0.28f;
+    ImU32 col = IM_COL32(255, 255, 255, 255);
+    dl->AddTriangleFilled(ImVec2(c.x - s * 0.6f, c.y - s), ImVec2(c.x - s * 0.6f, c.y + s), ImVec2(c.x + s, c.y), col);
+}
+
+static void drawPauseGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    float s = std::min(br.x - tl.x, br.y - tl.y) * 0.28f;
+    float barW = s * 0.55f;
+    ImU32 col = IM_COL32(255, 255, 255, 255);
+    dl->AddRectFilled(ImVec2(c.x - s, c.y - s), ImVec2(c.x - s + barW, c.y + s), col);
+    dl->AddRectFilled(ImVec2(c.x + s - barW, c.y - s), ImVec2(c.x + s, c.y + s), col);
+}
+
+static void drawStopGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    float s = std::min(br.x - tl.x, br.y - tl.y) * 0.24f;
+    dl->AddRectFilled(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), IM_COL32(255, 255, 255, 255));
+}
+
+// dir: +1 draws two right-pointing chevrons (fast-forward), -1 draws two left-pointing ones
+// (fast-reverse).
+static void drawChevronPair(ImDrawList* dl, ImVec2 tl, ImVec2 br, int dir) {
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    float s = std::min(br.x - tl.x, br.y - tl.y) * 0.22f;
+    float gap = s * 1.1f;
+    ImU32 col = IM_COL32(255, 255, 255, 255);
+    for (int i = -1; i <= 1; i += 2) {
+        float ox = c.x + (float)i * gap * 0.5f;
+        if (dir > 0) {
+            dl->AddTriangleFilled(ImVec2(ox - s * 0.5f, c.y - s), ImVec2(ox - s * 0.5f, c.y + s), ImVec2(ox + s * 0.5f, c.y), col);
+        }
+        else {
+            dl->AddTriangleFilled(ImVec2(ox + s * 0.5f, c.y - s), ImVec2(ox + s * 0.5f, c.y + s), ImVec2(ox - s * 0.5f, c.y), col);
+        }
+    }
+}
+static void drawFFGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) { drawChevronPair(dl, tl, br, 1); }
+static void drawRewindGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) { drawChevronPair(dl, tl, br, -1); }
+
+// A colored letter, matching the marker color drawn on the timeline itself (green A / red B) --
+// simpler and more legible at button size than trying to cram a flag shape and a label into the
+// same small glyph, while still reading as a distinct icon rather than a generic text button.
+static void drawLetterGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br, const char* label, ImU32 col) {
+    ImVec2 tsz = ImGui::CalcTextSize(label);
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    dl->AddText(ImVec2(c.x - tsz.x * 0.5f, c.y - tsz.y * 0.5f), col, label);
+}
+static void drawSetAGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) { drawLetterGlyph(dl, tl, br, "A", IM_COL32(120, 255, 120, 255)); }
+static void drawSetBGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) { drawLetterGlyph(dl, tl, br, "B", IM_COL32(255, 120, 120, 255)); }
+
+// Standard hand-drawn "repeat" icon: an open circular arc plus a small arrowhead at one end,
+// oriented along the arc's own tangent there.
+static void drawLoopGlyph(ImDrawList* dl, ImVec2 tl, ImVec2 br) {
+    ImVec2 c((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+    float r = std::min(br.x - tl.x, br.y - tl.y) * 0.22f;
+    ImU32 col = IM_COL32(255, 255, 255, 255);
+    const float a0 = -2.4f, a1 = 2.0f;   // radians; the gap between them is where the arrowhead sits
+    dl->PathArcTo(c, r, a0, a1, 20);
+    dl->PathStroke(col, 0, 2.2f * style::uiScale);
+    ImVec2 tip(c.x + r * cosf(a1), c.y + r * sinf(a1));
+    ImVec2 tangent(-sinf(a1), cosf(a1));   // unit tangent, direction of travel along the arc
+    ImVec2 normal(cosf(a1), sinf(a1));     // unit outward radial
+    float aw = r * 0.55f;
+    ImVec2 p1(tip.x + tangent.x * aw, tip.y + tangent.y * aw);
+    ImVec2 p2(tip.x - normal.x * aw * 0.8f, tip.y - normal.y * aw * 0.8f);
+    dl->AddTriangleFilled(tip, p1, p2, col);
 }
 
 void MainWindow::draw() {
@@ -550,9 +676,13 @@ void MainWindow::draw() {
 
     const float pbBarH = 12.0f * style::uiScale;
     const float pbPad = 4.0f * style::uiScale;
+    const float pbBtnH = 26.0f * style::uiScale;
+    // Extra hit-region above the seek bar so the A/B marker triangles (drawn poking up above
+    // it) are actually clickable/draggable -- see the InvisibleButton further down for why.
+    const float markerFlagH = 8.0f * style::uiScale;
     bool hasRecTime = gui::playbackBar.active && (gui::playbackBar.recordingStartEpoch != 0);
     float numTextLines = hasRecTime ? 2.0f : 1.0f;
-    const float pbTotalH = (hasRecTime ? 4.0f : 3.0f) * pbPad + pbBarH + numTextLines * ImGui::GetTextLineHeight();
+    const float pbTotalH = (hasRecTime ? 5.0f : 4.0f) * pbPad + markerFlagH + pbBarH + pbBtnH + numTextLines * ImGui::GetTextLineHeight();
     float pbReserve = gui::playbackBar.active ? pbTotalH : 0.0f;
 
     ImGui::BeginChild("Waterfall", ImVec2(0, ImGui::GetContentRegionAvail().y - pbReserve));
@@ -564,13 +694,71 @@ void MainWindow::draw() {
     if (gui::playbackBar.active) {
         float barWidth = ImGui::GetContentRegionAvail().x;
 
+        // pbTotalH above is a manual sum of exactly the Dummy/InvisibleButton/button-row
+        // heights and pbPad gaps below -- it doesn't (and can't, without duplicating ImGui's
+        // own internals) account for ImGui's automatic ItemSpacing.y between each of those
+        // widgets when they land on separate lines. The original code only had one such
+        // transition (Dummy -> the seek bar); adding the button row's own Dummy and
+        // Button-row-start added two more, and each one of those untracked gaps stacked up
+        // enough to push the recording-time text below the bottom of the reserved region
+        // (live feedback: "the second line is partially cut off"). Zeroing ItemSpacing.y here
+        // (keeping .x, so the button row's own SameLine gaps still look normal) makes
+        // pbTotalH's arithmetic actually match what gets drawn, instead of chasing the exact
+        // gap count by hand.
+        ImVec2 origSpacing = ImGui::GetStyle().ItemSpacing;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(origSpacing.x, 0.0f));
+
         ImGui::Dummy(ImVec2(barWidth, pbPad));
 
-        ImGui::InvisibleButton("##playback_seek", ImVec2(barWidth, pbBarH));
-        ImVec2 barTL = ImGui::GetItemRectMin();
-        ImVec2 barBR = ImGui::GetItemRectMax();
+        // The invisible hit-region extends markerFlagH above the visually-drawn bar (barTL/
+        // barBR below are offset down into the lower portion of it) so the A/B marker
+        // triangles -- which poke up above the bar itself, see drawTimelineMarker() further
+        // down -- are actually clickable/draggable. Previously they were drawn above the
+        // InvisibleButton's own rect, in a purely decorative area no widget owned, so a click
+        // landing exactly on a marker never registered at all (live feedback: "dragging only
+        // works on the bar, not on the indicator above it").
+        ImGui::InvisibleButton("##playback_seek", ImVec2(barWidth, markerFlagH + pbBarH));
+        ImVec2 hitTL = ImGui::GetItemRectMin();
+        ImVec2 hitBR = ImGui::GetItemRectMax();
+        ImVec2 barTL(hitTL.x, hitTL.y + markerFlagH);
+        ImVec2 barBR = hitBR;
 
-        if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        auto markerX = [&](float frac) { return barTL.x + (barBR.x - barTL.x) * frac; };
+        bool hasA = gui::playbackBar.loopMarkerAFrac >= 0.0f;
+        bool hasB = gui::playbackBar.loopMarkerBFrac >= 0.0f;
+        const float markerHitPx = 6.0f * style::uiScale;
+
+        // A/B marker drag takes priority over a plain seek-click -- checked first, and the
+        // existing seek-click branch below only fires when no marker is being dragged this
+        // frame. draggingLoopMarker persists across frames (a MainWindow member) so a drag
+        // that started here keeps tracking the mouse even if it briefly leaves the bar's rect.
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            float mx = ImGui::GetMousePos().x;
+            if (hasA && std::abs(mx - markerX(gui::playbackBar.loopMarkerAFrac)) <= markerHitPx) { draggingLoopMarker = 0; }
+            else if (hasB && std::abs(mx - markerX(gui::playbackBar.loopMarkerBFrac)) <= markerHitPx) { draggingLoopMarker = 1; }
+        }
+        if (draggingLoopMarker != -1 && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float dragFrac = std::clamp((ImGui::GetMousePos().x - barTL.x) / (barBR.x - barTL.x), 0.0f, 1.0f);
+            if (gui::playbackBar.setLoopMarkerCallback) {
+                gui::playbackBar.setLoopMarkerCallback(draggingLoopMarker, dragFrac, gui::playbackBar.transportCtx);
+            }
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) { draggingLoopMarker = -1; }
+
+        // Right-click a marker directly (on the bar or on its flag above it, now that the hit
+        // region covers both) to clear it -- the on-timeline counterpart to right-clicking the
+        // Set A/Set B buttons.
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            float mx = ImGui::GetMousePos().x;
+            if (hasA && std::abs(mx - markerX(gui::playbackBar.loopMarkerAFrac)) <= markerHitPx) {
+                if (gui::playbackBar.clearLoopMarkerCallback) { gui::playbackBar.clearLoopMarkerCallback(0, gui::playbackBar.transportCtx); }
+            }
+            else if (hasB && std::abs(mx - markerX(gui::playbackBar.loopMarkerBFrac)) <= markerHitPx) {
+                if (gui::playbackBar.clearLoopMarkerCallback) { gui::playbackBar.clearLoopMarkerCallback(1, gui::playbackBar.transportCtx); }
+            }
+        }
+
+        if (draggingLoopMarker == -1 && ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             float frac = (ImGui::GetMousePos().x - barTL.x) / (barBR.x - barTL.x);
             frac = std::clamp(frac, 0.0f, 1.0f);
             if (gui::playbackBar.seekCallback) {
@@ -587,6 +775,103 @@ void MainWindow::draw() {
             dl->AddRectFilled(barTL, fillBR, ImGui::GetColorU32(ImGuiCol_PlotHistogram), 2.0f * style::uiScale);
         }
 
+        // A/B loop region highlight (only once both markers are placed) + the marker flags
+        // themselves, drawn over the progress fill so they stay visible regardless of playhead
+        // position.
+        if (hasA && hasB) {
+            float loStart = std::min(gui::playbackBar.loopMarkerAFrac, gui::playbackBar.loopMarkerBFrac);
+            float loEnd = std::max(gui::playbackBar.loopMarkerAFrac, gui::playbackBar.loopMarkerBFrac);
+            dl->AddRectFilled(ImVec2(markerX(loStart), barTL.y), ImVec2(markerX(loEnd), barBR.y), IM_COL32(255, 220, 0, 60));
+        }
+        auto drawTimelineMarker = [&](float frac, ImU32 col) {
+            float x = markerX(frac);
+            dl->AddTriangleFilled(ImVec2(x - 5 * style::uiScale, barTL.y - 6 * style::uiScale),
+                                   ImVec2(x + 5 * style::uiScale, barTL.y - 6 * style::uiScale),
+                                   ImVec2(x, barTL.y), col);
+            dl->AddLine(ImVec2(x, barTL.y), ImVec2(x, barBR.y), col, 2.0f * style::uiScale);
+        };
+        if (hasA) { drawTimelineMarker(gui::playbackBar.loopMarkerAFrac, IM_COL32(80, 220, 80, 255)); }
+        if (hasB) { drawTimelineMarker(gui::playbackBar.loopMarkerBFrac, IM_COL32(220, 80, 80, 255)); }
+
+        // --- Transport + A/B loop button row ---
+        ImGui::Dummy(ImVec2(barWidth, pbPad));
+        ImVec2 pbBtn(pbBtnH, pbBtnH);
+        bool hasFile = gui::playbackBar.stopCallback != nullptr;
+
+        if (transportGlyphButton("##pb_stop", pbBtn, drawStopGlyph, false, !hasFile) && gui::playbackBar.stopCallback) {
+            gui::playbackBar.stopCallback(gui::playbackBar.transportCtx);
+        }
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Stop (pause and rewind to start)"); }
+        ImGui::SameLine();
+
+        // Fast-reverse/fast-forward are press-and-hold, not click-to-toggle: scrubCallback is
+        // called every frame below with the live held state of both buttons, and file_source's
+        // worker loop just mirrors whatever direction is currently held.
+        bool rwHeld = false;
+        transportGlyphButton("##pb_rw", pbBtn, drawRewindGlyph, gui::playbackBar.scrubbingReverse, !hasFile, &rwHeld);
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Hold: fast reverse (silent)"); }
+        ImGui::SameLine();
+
+        bool isPlaying = !gui::playbackBar.paused;
+        if (transportGlyphButton("##pb_playpause", pbBtn, isPlaying ? drawPauseGlyph : drawPlayGlyph, false, !hasFile) && gui::playbackBar.playPauseCallback) {
+            // gui::playbackBar.paused doubles as the "should this click now play" flag: true
+            // means currently paused, so the click means play.
+            gui::playbackBar.playPauseCallback(gui::playbackBar.paused, gui::playbackBar.transportCtx);
+        }
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip(isPlaying ? "Pause" : "Play"); }
+        ImGui::SameLine();
+
+        bool ffHeld = false;
+        transportGlyphButton("##pb_ff", pbBtn, drawFFGlyph, gui::playbackBar.scrubbingForward, !hasFile, &ffHeld);
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Hold: fast forward (silent)"); }
+
+        if (hasFile && gui::playbackBar.scrubCallback) {
+            int dir = 0;
+            if (rwHeld != ffHeld) { dir = rwHeld ? -1 : 1; }   // both or neither held -> no scrub
+            gui::playbackBar.scrubCallback(dir, gui::playbackBar.transportCtx);
+        }
+
+        ImGui::SameLine(0, 20.0f * style::uiScale);
+
+        bool setARightClick = false;
+        if (transportGlyphButton("##pb_seta", pbBtn, drawSetAGlyph, false, !hasFile, nullptr, 0, &setARightClick)
+            && gui::playbackBar.setLoopMarkerCallback) {
+            gui::playbackBar.setLoopMarkerCallback(0, gui::playbackBar.progress, gui::playbackBar.transportCtx);
+        }
+        if (setARightClick && gui::playbackBar.clearLoopMarkerCallback) {
+            gui::playbackBar.clearLoopMarkerCallback(0, gui::playbackBar.transportCtx);
+        }
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Left click: set loop start here\nRight click: clear"); }
+        ImGui::SameLine();
+
+        bool setBRightClick = false;
+        if (transportGlyphButton("##pb_setb", pbBtn, drawSetBGlyph, false, !hasFile, nullptr, 0, &setBRightClick)
+            && gui::playbackBar.setLoopMarkerCallback) {
+            gui::playbackBar.setLoopMarkerCallback(1, gui::playbackBar.progress, gui::playbackBar.transportCtx);
+        }
+        if (setBRightClick && gui::playbackBar.clearLoopMarkerCallback) {
+            gui::playbackBar.clearLoopMarkerCallback(1, gui::playbackBar.transportCtx);
+        }
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Left click: set loop end here\nRight click: clear"); }
+        ImGui::SameLine();
+
+        // Bright green + white outline when on -- ImGuiCol_ButtonActive alone (used everywhere
+        // else in this row) reads as barely different from the normal button color in this
+        // theme, which was the reported problem ("no indication of state"). Loop is the only
+        // control here with a *persistent* on/off state worth calling out this strongly; the
+        // others are momentary actions or already have their own always-visible state (the
+        // Play/Pause glyph itself, the marker flags on the timeline).
+        bool canLoop = hasFile && hasA && hasB;
+        if (transportGlyphButton("##pb_loop", pbBtn, drawLoopGlyph, gui::playbackBar.loopEnabled, !canLoop,
+                                  nullptr, IM_COL32(40, 170, 60, 255))
+            && canLoop && gui::playbackBar.setLoopEnabledCallback) {
+            gui::playbackBar.setLoopEnabledCallback(!gui::playbackBar.loopEnabled, gui::playbackBar.transportCtx);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(canLoop ? (gui::playbackBar.loopEnabled ? "Loop: ON (click to disable)" : "Loop: off (click to enable)")
+                                       : "Set both loop markers first");
+        }
+
         auto fmtTime = [](float sec) -> std::string {
             int s = (int)sec; int m = s / 60; s %= 60; int h = m / 60; m %= 60;
             char buf[32];
@@ -595,7 +880,7 @@ void MainWindow::draw() {
             return buf;
         };
 
-        float textY = barBR.y + pbPad;
+        float textY = ImGui::GetItemRectMax().y + pbPad;
 
         if (hasRecTime) {
             // Line 1: recording start date and time (fixed label)
@@ -626,6 +911,8 @@ void MainWindow::draw() {
             dl->AddText(ImVec2(barTL.x + ((barBR.x - barTL.x) - textSz.x) * 0.5f, textY),
                         ImGui::GetColorU32(ImGuiCol_Text), timeStr.c_str());
         }
+
+        ImGui::PopStyleVar();
     }
 
     if (!lockWaterfallControls) {
