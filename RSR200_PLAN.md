@@ -1188,3 +1188,353 @@ Not committed yet. Files touched so far this session for this work: `main.cpp`'s
 detail to `connect()`'s error message -- was previously a bare "connect() failed" with no way
 to tell "nothing listening" from "firewalled" from "network unreachable" apart, found while
 debugging this), and the new `test/test_lan_live.cpp`.
+
+## Packet-mode handling: corrected via packet capture (2026-08-12, later same day)
+
+Original implementation (this section's earlier text) assumed every pre-streaming LAN
+command gets its own standalone reply packet, per a literal reading of DP 4.2. **Two packet
+captures against the real radio disproved this**: only "Read version numbers" actually gets
+a standalone reply (confirmed working, `serial=40 firmware=225`, byte-for-byte correct).
+Every other config command (clock, data transmission, variables) — the radio ACKs the TCP
+bytes and then sends back nothing at all, confirmed across multiple command types and
+command orders. Reverted `Device::send()`'s synchronous packet-mode branch entirely; it's
+back to always registering an async `pending` ack, same as before this whole investigation.
+`Transport::readPacket()`/`LanTcpTransport::readPacket()` stay -- still correct, still used,
+just only for the version query now (called directly by main.cpp/test_lan_live.cpp, not
+through `Device::send()`). `test_device.cpp` reverted to its pre-session state (git checkout
+-- the added tests were for the now-removed branch). `test_lan_transport.cpp`'s new
+`readPacket()` tests stay valid.
+
+**Live-retested after the revert: version reply now works correctly end-to-end.** But two
+things remain unexplained and unresolved: the block sequence counter still jitters
+(non-monotonic, occasionally negative deltas) exactly as before, and the last config command
+(`tune`/0xB0) still never gets its embedded ack recognized before timing out. Fixing the
+version reply did not fix either of these -- they're a separate, still-open problem, not
+solved by anything in this session. Next step, if resumed: another packet capture, this time
+covering the full applyConfig()-through-first-several-blocks sequence, to see directly
+whether the embedded reply for command 0xB0 is actually present in what the radio sends and
+just not being matched, or genuinely never sent.
+
+Committed state as of this entry: not yet committed. Everything from today's LAN work
+(module wiring, this packet-mode investigation and revert, the errno improvement, the two
+new source/test files) is uncommitted in the working tree.
+
+## `stop()` was leaving the radio streaming forever, contaminating every later connection (2026-08-12, later still)
+
+The jitter and the missing 0xB0 (`tune`) ack from the previous section were retested against
+what looked like a fresh connection each time, but a third packet capture — taken specifically
+because the *first* few blocks of a brand new session looked like they already contained
+streaming-shaped data before this session's own `Start Stream` had even gone out — found the
+real reason: `LanTcpTransport::stop()` called `close()` internally.
+
+`main.cpp`'s (and `test_lan_live.cpp`'s) stop sequence is: stop the transport (to unstick the
+pump thread's blocked `nextFrame()`), join the thread, *then* send `Stop Stream`, *then*
+actually close. That ordering depends on the socket still being writable after `stop()` —
+which it wasn't. `close()` tears down the whole socket, so the `sendCommand()` for `Stop
+Stream` that follows it silently failed every single time, on every test run this entire
+session. The radio was never actually told to stop. Every subsequent connection — including
+ones that looked "clean" from this end — inherited a radio still streaming from a session that
+never ended, which is a real confound for anything downstream that depends on a known-clean
+start (exactly the kind of thing that could plausibly explain jitter or a missing ack, which is
+why this got tracked down before trusting either as a genuine protocol issue).
+
+**Fixed** by replacing `close()` in `stop()` with `shutdown(fd, SHUT_RD)` (`SD_RECEIVE` on
+Windows): this makes any pending or future `recv()` return immediately, exactly like a
+peer-initiated close, while leaving the write side open — so a `Stop Stream` sent right
+afterward still actually reaches the radio. A real `close()` is still required once that send
+is done; `stop()` only ever shuts down the read side now. `test_lan_transport.cpp`'s shutdown
+test was updated to match: `stop()` alone no longer disconnects, `sendCommand()` still succeeds
+after it, and `close()` is what actually disconnects.
+
+Ralph power-cycled the radio for a genuinely clean baseline and retested. **Both the jitter and
+the missing 0xB0 ack persisted unchanged** — ruling out session contamination as their cause.
+Whatever they are, they're real, not an artifact of a radio that was never actually told to
+stop.
+
+## Decimation test: the jitter doesn't just need a longer warmup (2026-08-12, later still)
+
+With a genuinely clean baseline confirmed above, the next question was whether the counter
+jitter was a startup transient (old queued data draining before real-time samples begin) that
+would eventually settle at any rate, or something rate-dependent. `test_lan_live.cpp` was
+extended to take `decimExp` and `pumpSeconds` as CLI arguments (previously fixed at the
+`Config{}` default, decimExp=3, and a hardcoded 5-second run with output capped at 15 blocks)
+so this could actually be tested instead of guessed at.
+
+- **`decimExp=5`** (1.953 MSp/s): chaotic for roughly the first 5 blocks, then settled into a
+  clean, monotonic +1-per-block sequence for the rest of the run.
+- **`decimExp=3`** (7.8125 MSp/s), extended to 10 seconds / 112 blocks: chaotic for the first
+  ~8 blocks, then settled into a **highly regular but non-`+1` repeating pattern** — runs of
+  5–7 consecutive blocks at a steady `delta=+3`, interrupted by a recurring triplet (typically
+  `+10, -7, +11`, with some variation) — that repeated for the entire remaining run without
+  ever converging to a clean +1 sequence. The missing-0xB0-ack error also recurred partway
+  through this run (~block 34–35), same as always.
+
+Two things this rules out: it isn't a simple "needs more warmup time" problem (10 seconds and
+112 blocks did not converge it), and the steady-state delta isn't simply equal to `decimExp` —
+decimExp=3 gave delta=+3 but decimExp=5 gave delta=+1, not +5, so whatever relationship exists
+between decimation and the counter's own step size isn't a direct 1:1 mapping. It also isn't
+random: within a fixed decimExp, the pattern repeats with real structure (fixed-length runs of
+identical deltas, a recurring triplet shape), which points at something systematic in how the
+radio's firmware generates that field — not corruption, not lost data, not a resync bug on this
+side (sync words and the inverted counter validate on every single block in every one of these
+runs, with no exceptions, across every test done today).
+
+**Not investigated further today.** The natural next step, if this gets picked back up, is
+either another packet capture targeting the repeating triplet specifically, or testing more
+`decimExp` values to see if the steady-state delta and the glitch period fit some other
+relationship (e.g. tied to an internal DMA/batch size rather than to decimation directly).
+
+## Sequence-gap detection disabled for LAN, kept for USB (2026-08-12, later still)
+
+`SampleBlock::sequenceGap` (`Device::noteSequence()`) existed to flag lost data by checking
+whether the block counter advanced by exactly 1. That assumption is simply wrong for LAN, for
+two independent reasons, either of which would be enough on its own:
+
+1. **LAN is TCP.** TCP already guarantees reliable, in-order, lossless byte delivery. If
+   `LanTcpTransport::nextFrame()` hands back a block at all, its sync words and inverted
+   counter have both already validated (that's `nextFrame()`'s own resync search) — meaning it
+   is definitively the next chunk of bytes the radio sent, full stop. Nothing can have been
+   lost or reordered at the transport layer the way a USB packet genuinely can be lost on the
+   bus; a dead LAN connection is caught separately, by `nextFrame()` itself returning false.
+2. **The counter field's own value isn't reliably `+1` regardless.** The decimation testing
+   above found its steady-state delta varies by configured rate (not by any relationship this
+   session could pin down) and, even within one steady rate, jumps in a repeating,
+   non-monotonic pattern that doesn't settle out over a 10-second run. None of that reflects
+   lost data — the framing is provably correct every time — it's some quirk of how the radio's
+   own firmware generates that specific field.
+
+Using it for gap detection on LAN was producing constant false positives with no real
+diagnostic value. **Fixed**: `noteSequence()` now takes a `checkGap` bool. USB
+(`parseUsbPacket`) still passes `true` — unchanged, and still meaningful there, since USB
+packets genuinely can be lost on the bus. LAN (`parseLanBlock`) now passes `false`; the raw
+counter is still captured and exposed via `SampleBlock::sequence` for whatever diagnostic value
+it has, LAN just no longer derives `sequenceGap` from it. `test_device.cpp`'s LAN
+counter-jump test was updated to assert `!gap`, and real gap-detection coverage (consecutive
+vs. jumped counters) moved into the existing USB test block, since USB is the only place the
+flag still means anything. Full suite (39 checks) passes.
+
+Deployed (repo-root `SDR++.app`/`SDR++ RB.app`, `root_dev/modules/`) and smoke-tested to launch
+and shut down cleanly. **Note for next time:** `/Applications/SDR++.app` is Ralph's kept
+unforked comparison baseline, not a fork deploy target — it was mistakenly overwritten once
+during this work and has to be restored from Time Machine; only `/Applications/SDR++ RB.app`,
+if used at all, is a legitimate `/Applications` target.
+
+Still open, unchanged by any of the above: the sequence counter's steady-state/jitter behavior
+itself (documented above, not fixed, just no longer misread as data loss), and the missing
+0xB0 (`tune`) embedded acknowledgement. Nothing from today's LAN work is committed yet.
+
+## Live app tested: connects, tunes, shows spectrum — but audio is choppy and sounds out of order (2026-08-12, later still)
+
+Ralph tested the real module (not a standalone smoke test) against the live radio over LAN:
+connects, streams, reacts correctly to frequency and decimation changes, spectrum displays.
+Audio, though, is choppy and sounds like it may be out of order — not reliably understandable.
+The natural suspicion was the still-open counter jitter documented above, so that got checked
+directly rather than assumed.
+
+Three saved packet captures turned up in `~/Documents/` from earlier in the session
+(`rsr200_lan_capture.pcap`, `capture2.pcap` — both tiny, from the pre-streaming packet-mode
+investigation — and `capture3.pcap`, 47MB, covering a real streaming run). `capture3.pcap` was
+reanalyzed offline with a scapy script (reassemble the radio→host TCP stream, resync against
+`SYNC_BYTES` exactly like `findBlockStart()` does, extract 85 valid blocks) to test two things
+neither of which needed live hardware access, just the existing capture:
+
+1. **Does an odd-delta block's IQ payload literally duplicate an earlier block's content**
+   (i.e. is the radio re-sending a chunk of samples it already sent)? MD5-hashed each block's
+   IQ payload and checked it against the last 20 blocks' hashes. **No duplicates found, at
+   all, anywhere in the capture.** The same `+10, -7, +11`-shaped jitter pattern from the
+   earlier decimExp=3 live test reproduced exactly in this capture too (e.g. blocks 8–10:
+   counters 131645, 131655 [+10], 131648 [-7], 131659 [+11], 131662 [+3]...), which is good
+   independent confirmation the pattern is real and reproducible — but the content behind it
+   is never a repeat.
+2. **Is there an actual discontinuity in the IQ signal at odd-delta block boundaries that
+   isn't present at normal (`delta=+3`) boundaries** — i.e. does the sample stream really
+   jump/rewind in time there, even if the bytes aren't literally duplicated? Measured, at
+   every one of the 84 boundaries, the magnitude of the jump from a block's last sample to the
+   next block's first sample, and compared it against that block's own typical
+   sample-to-sample jump size. **The ratio came out essentially the same regardless of delta**
+   (normal boundaries: mean 1.04; odd boundaries: mean 1.09) — no elevated discontinuity at
+   the jittery boundaries at all.
+
+**This rules out the counter jitter as the explanation for the choppy audio.** The actual
+sample content is continuous and correctly ordered straight through the capture, jitter or no
+jitter — confirms the earlier decision to stop treating the counter as a data-loss/reordering
+signal for LAN was right, but also means the choppy audio Ralph is hearing is a *separate,
+still-unexplained* problem, not a symptom of the same root cause. Don't keep attributing it to
+"the remaining items" without evidence — this capture is fairly direct evidence against that.
+
+`deliver()` in `main.cpp` (the module's own handoff into SDR++'s stream) was checked as the
+next-most-likely suspect and looks correct: `memcpy` from `Device`'s buffer into the stream's
+own `writeBuf`, then `swap()` — the same pattern every other source module in this codebase
+uses, synchronous, no reuse-before-consumption race.
+
+**Leading remaining suspect, not yet tested: delivery pacing/throughput, not content
+correctness.** At decimExp=3 (7.8125 MSp/s, 1ch 16-bit), the block rate implies roughly 31
+MB/s sustained — `LanTcpTransport::nextFrame()`'s `recv()`-then-resync loop, or something
+downstream in SDR++ core's own audio path, may not be keeping that paced evenly in real time,
+which would produce audible glitches even with perfectly-ordered content (bursty delivery
+rather than a steady stream). `RECORDING_PERFORMANCE_PLAN.md` documents a real, previously-hit
+throughput ceiling in SDR++ core's `Splitter` at comparable rates, for an unrelated module —
+worth checking whether this is the same class of problem before assuming it's RSR200-specific.
+Not yet investigated: needs either a live profiling pass (`sample` on the running process
+while audio is actually playing, the same technique that nailed the recording throughput
+issue) or a lower-rate live A/B test (does decimExp=5, roughly a quarter the data rate, sound
+noticeably cleaner?) to confirm before chasing a fix. Checked in with Ralph before proceeding
+further on this.
+
+## Throughput/pacing theory ruled out; status fields also clean (2026-08-12, later still)
+
+Ralph ran the lower-rate A/B test himself: 64x hardware decimation (ADC clock is actually
+91.6 MHz on this radio, not the 125 MHz used in most of this doc's worked examples — 91.6/64 =
+1.431 MSp/s) plus another 8x of software decimation on top, for a final rate a small fraction
+of the decimExp=3 rate the choppiness was first noticed at. **Made no difference — audio is
+still choppy.** This rules out the leading suspect from the previous section outright: if it
+were a throughput/pacing ceiling, a rate this much lower should have shown a clear
+improvement, and it didn't.
+
+Two things make this even more conclusive:
+
+- **Decimation can't cause a live mid-stream race either way.** Every rate-affecting control in
+  `main.cpp`'s menu (ADC clock, decimation) sits inside the same `BeginDisabled`/`EndDisabled`
+  block gated on `running` — they simply can't be changed while streaming. So this was
+  necessarily a clean stop → reconfigure → restart, never a live race between the module
+  declaring a new rate to `core::setInputSampleRate()` and the radio actually switching over.
+- **91.6 MHz / 64x is essentially the same low-rate regime as the earlier decimExp=5 test**,
+  which showed *zero* counter jitter (clean, settled +1-per-block). Audio was still choppy
+  under a config already confirmed jitter-free — independent confirmation the jitter and the
+  choppy audio are genuinely two separate problems, not cause and effect.
+
+Also checked directly against `capture3.pcap` (no new hardware access needed): the per-block
+status fields (temperature/Auto-ATT byte, GPS/overload bits, `cmdNo`) across all 85 blocks,
+since a flapping Auto-ATT flag would cause a real, audible 12 dB gain pop on every flap that
+would sound exactly like "choppy." **Rock solid the entire run** — temp byte constant at 63
+(Auto-ATT never active), GPS/overload bits constant, `cmdNo` incrementing sensibly. Rules this
+out too.
+
+Ruled out so far, in total: block reordering/duplication, discontinuity at the jittery
+boundaries, throughput/pacing at a given rate, a live decimation race, and Auto-ATT gain
+flapping. That's most of the LAN-block-data-path candidates exhausted without finding the
+cause — increasingly looks like this isn't a bug in the RSR200 module's LAN parsing/delivery
+path at all.
+
+**Next step, in progress:** the same demodulation over USB, on the same radio, same
+demodulator settings — the cheapest remaining test that actually discriminates LAN-specific
+causes from something shared (the `Device` layer's `deliver()`/unpack/gain path, common to
+both transports, or the demod chain itself, unrelated to RSR200 entirely). If USB is clean,
+it's LAN-specific after all, in a way none of the above tests caught. If USB is *also* choppy,
+this has nothing to do with any of today's LAN work. Ralph is running this test now; result not
+yet in.
+
+## LAN audio choppiness: conclusion — a real RSR200 LAN firmware throughput limit, not a fixable bug (2026-08-12, later still)
+
+**USB confirmed clean; LAN confirmed choppy, same radio, same settings.** Ralph recorded ten
+seconds each of the identical demodulation over both transports for direct comparison
+(`baseband_994506Hz_19-09-18...wav` = USB, `...19-09-42...wav` = LAN). Parsing both directly
+(16-bit stereo I/Q, no live hardware needed) found them statistically identical — same mean
+RMS, no dropout runs longer than 3 frames (noise) in either, no level spikes, zero duplicate
+content in either file. **The received sample data is equally clean on both transports.** That
+matters because a WAV recording only ever stores sample *values*, never arrival timing — a
+recording can look and sound perfect even if the underlying delivery was wildly uneven,
+because disk writes have slack a live audio callback doesn't. So this ruled out any
+data-correctness bug (reordering, duplication, corruption) as the cause, without ruling out a
+timing/pacing problem specifically in *live* playback.
+
+A live profile (`sample`, 10 seconds, LAN connected and audibly choppy) then found where time
+was actually going: the network worker thread was correctly ~99.9% idle, blocked in
+`recvfrom()` waiting on the socket — not a CPU-bound bottleneck anywhere in this module's own
+code. The live CoreAudio output callback, though, spent most of its time blocked inside
+`dsp::sink::RingBuffer`/`dsp::buffer::RingBuffer` (`core/src/dsp/sink/ring_buffer.h`,
+`core/src/dsp/buffer/ring_buffer.h`) — both explicitly flagged by the original SDR++ authors
+themselves (`// NOTE: THIS IS COMPLETELY UNTESTED AND PROBABLY BROKEN!!!`, `// IMPORTANT: THIS
+IS TRASH AND MUST BE REWRITTEN IN THE FUTURE`), and which do have a real structural race
+(`readable`/`writable` tracked as two separate counters under two separate mutexes, updated as
+two separate lock/unlock pairs rather than atomically together). That's shared core code used
+by every module's audio output, not RSR200-specific, so four fixes were tried first, scoped
+entirely to this module, before considering touching it:
+
+1. **Chunk `deliver()`'s hand-off into smaller pieces** (closer to USB's own ~1020-frame
+   packet granularity, instead of one 130560-frame `swap()` per LAN block). No change — still
+   choppy. Ruled out: burst *size* as the trigger.
+2. **Individually pace each chunk to real time**, via `paceToRealTime()` copied from
+   `file_source`'s own proven `worker()` (`source_modules/file_source/src/main.cpp`) — which
+   solves an analogous problem (a file has no natural real-time pacing) for a documented,
+   previously-confirmed reason: that module's own comment records a real, measured
+   consequence of skipping this exact thing, a dual-channel RSR200 *recording* nulling 20+ dB
+   shallower on playback than the same antennas nulled live, traced to decorrelation's
+   adaptive solve being sensitive to how evenly-spaced its input blocks are. Still no change
+   live. Ruled out: burst *pacing within an already-arrived block* as the trigger — which
+   makes sense in hindsight, since neither fix touches data that hasn't arrived yet.
+3. **A genuine jitter buffer** (`deliver()` only appends to a queue; a separate
+   `deliverWorker()` thread drains it at a steady paced rate), motivated by a third piece of
+   direct evidence: cross-referencing `capture3.pcap`'s own packet timestamps against the
+   block counter found the counter's long-documented jitter (§"First live LAN connection")
+   and a real ~80ms delivery stall are *the same event*, recurring roughly every 9 blocks
+   (~450ms), with zero exceptions across the whole 85-block capture. Decimation-independent
+   (tied to a block count, not wall-clock time — Ralph's own 18x-rate A/B test earlier showed
+   no difference, which fits) and LAN-only (USB's continuous small-packet framing is a
+   different code path in the radio's own firmware). **Live result: choppiness changed shape**
+   — less frequent but longer, and the spectrum display started visibly freezing along with
+   the audio, meaning something was starving further downstream than just the audio ring
+   buffer. Added a live buffer-occupancy readout to the module's own status panel
+   (`jbMinFrames`/`jbMaxFrames`, later `measuredSampleRate`) rather than keep guessing —
+   **found the buffer chronically draining to near-zero and staying there**, the signature of
+   a persistent rate mismatch, not bounded jitter a fixed buffer can absorb.
+4. **Adapt the buffer's drain rate to a live-measured delivery rate** instead of the nominal
+   decimation formula. First attempt (a fast EWMA of instantaneous per-block rate, re-read on
+   every ~1024-frame chunk — over a thousand times a second at this rate) made things *worse*,
+   shorter and more frequent choppiness: the drain pacing itself was chasing the radio's own
+   ~450ms-period stall in near-real-time rather than smoothing over it. Fixed the estimator to
+   a proper total-frames-over-total-elapsed-time measurement across a 3-second window (long
+   enough to average out many stall cycles, updating once per window instead of every block)
+   — this settled into a *stable* reading, ~1.17-1.25 MSp/s against a nominal 1.431 MSp/s
+   (91.6 MHz ÷ 64), but audio got *worse*, not better. **Ralph caught the actual reasoning
+   error directly**: the pacing rate isn't just "whatever keeps the buffer topped up" — it's
+   what the resampler/demodulator chain, and transitively the audio hardware's own fixed
+   real-time output clock, is built around (via `core::setInputSampleRate()`, left at the
+   nominal rate throughout all of this). Draining any slower than that feeds the pipeline in
+   slow motion relative to what it's told to expect; the audio device pulls at its own
+   real-time clock regardless of what the buffer thinks, and starves waiting for correctly
+   *timed* data, not just correctly *ordered* data. Reverted the drain rate back to always the
+   nominal formula, with the jitter buffer restricted to its original, correct job — absorbing
+   the short stall, not renegotiating what the rate means. **Result: no different from before
+   any of this** — Ralph: "I'm seeing no difference. Measured rate started low and has settled
+   around 1.25... with the audio and spectrum effects that mismatch would predict." Confirmed
+   again on a full retest at unchanged settings (still 91.6 MHz, still 64x decimation, nothing
+   changed on the radio side): "Measured rate is between 1.2 and 1.35... Jitter buffer... is
+   mostly 1 or 2 digits, occasionally a third which appeared to be a 1" — i.e. still chronic
+   near-zero occupancy, still ~13-18% below nominal, regardless of what the drain rate was set
+   to.
+
+**That last result is the real finding, and it's decisive**: the buffer starves at the *same*
+measured rate whether draining at that rate, at the nominal rate, or anywhere between. Pacing
+strategy provably isn't the variable. Combined with everything above — the stall recurs on a
+fixed *block count*, not wall-clock time, and 64x is the documented maximum decimation, so
+there's no lower rate left to try that hasn't effectively already been tried; wire bandwidth at
+this rate (~5.7 MB/s) is nowhere near a real constraint for any modern LAN, and the receiving
+thread was independently confirmed via profiling to be idle almost the entire time, not
+struggling to keep up — this stopped looking like anything reachable from the receiving side.
+**The RSR200's LAN interface appears to genuinely be unable to sustain its own nominal
+decimation rate in real time, consistently, by roughly 13-18%, independent of buffering or
+pacing strategy on this end.** A jitter buffer, however large, cannot manufacture data the
+radio never sends; it can only delay how long it takes to notice the shortfall. This may be a
+genuine firmware limitation or design constraint of this radio's LAN implementation
+specifically (its continuous, small-packet USB path is architecturally quite different and
+doesn't show any of this) — not something fixable from the SDR++ side without either lying
+about the sample rate (a real tradeoff: smoother audio at the cost of incorrect tuning/filter
+math, not attempted) or understanding the radio's own firmware well enough to work around
+whatever causes the recurring stall, which is beyond what black-box testing from this side can
+determine.
+
+**Decided with Ralph: stop chasing smoothness here.** All four attempts reverted;
+`main.cpp`'s `deliver()` is back to its original simple form (one `memcpy` + `swap()` per
+block, no chunking, no pacing, no jitter buffer, no diagnostic UI). Full rebuild, redeployed to
+the repo-root bundles and `root_dev/modules/` (never `/Applications/SDR++.app` — see this
+file's `/Applications` note below and [[sdrpp-applications-deploy-boundary]] in memory),
+smoke-tested to launch and shut down cleanly. **USB remains fully functional and is the correct
+transport for actual listening on this radio today.** LAN stays usable for lower-stakes
+purposes where occasional audio degradation doesn't matter (spectrum display, remote tuning,
+command/control) but should not be relied on for real-time audio until/unless the radio's own
+firmware behavior here is better understood — worth reporting to Reuter as a possible firmware
+observation, since nothing found today points at anything fixable on the receiving end.
+
+Nothing from today's LAN work (module wiring, the packet-mode investigation, the `stop()` fix,
+sequence-gap handling, and this whole choppiness investigation) is committed yet.

@@ -135,8 +135,18 @@ int main() {
         server.waitForClient();
         check(t.isConnected(), "reports connected");
 
+        // stop() deliberately does NOT fully disconnect -- it only shuts down the read
+        // side (unsticking a blocked nextFrame()/readPacket() on another thread), leaving
+        // the write side usable so a caller can still send a Stop Stream command
+        // afterward. A full close() used to happen here instead, which meant Stop Stream
+        // could never actually reach the radio -- see stop()'s own comment and
+        // RSR200_PLAN.md's LAN section for why this matters in practice, not just in
+        // theory.
         t.stop();
-        check(!t.isConnected(), "stop() disconnects");
+        check(t.isConnected(), "stop() alone does not disconnect");
+        check(t.sendCommand((const uint8_t*)"12345678", 8), "the write side still works after stop()");
+        t.close();
+        check(!t.isConnected(), "close() is what actually disconnects");
         server.stop();
     }
 
@@ -218,6 +228,82 @@ int main() {
 
         t.stop();
         server.stop();
+    }
+
+    // -- readPacket(): the pre-streaming "packet mode" reply path -------------------
+    // See RSR200_PLAN.md's "First live LAN connection" section: before Start Stream, the
+    // radio replies to each command as its own standalone fixed-size packet (8 bytes for an
+    // ordinary confirmation, 12 for the version query specifically), not embedded in a
+    // block. This is what Device::send() calls to read one.
+    {
+        FakeServer server;
+        server.start();
+        server.acceptOne();
+
+        LanTcpTransport t;
+        t.connect("127.0.0.1", server.port);
+        server.waitForClient();
+
+        // An 8-byte confirmation, split across two writes -- the same kind of TCP-level
+        // split nextFrame()'s own test above exercises for blocks, but for a packet small
+        // enough that a real send could very plausibly land it in two recv()s too.
+        uint8_t confirmation[8] = { 0, 0, 0, 0, 0x2A, 0, 0, 0 };   // confirms command 0x2A
+        std::thread feeder([&] {
+            server.sendRaw(std::vector<uint8_t>(confirmation, confirmation + 3));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            server.sendRaw(std::vector<uint8_t>(confirmation + 3, confirmation + 8));
+        });
+        std::vector<uint8_t> got;
+        check(t.readPacket(got, 8), "an 8-byte confirmation is read despite arriving split");
+        check(got.size() == 8 && memcmp(got.data(), confirmation, 8) == 0,
+              "  and the exact bytes come through unchanged");
+        feeder.join();
+
+        // The 12-byte version-query reply, immediately followed by extra bytes that don't
+        // belong to it -- the start of what would be the first real streaming block, in
+        // real use. Those extra bytes must still be there afterward, not consumed or lost:
+        // this is exactly the boundary that was silently corrupting the first block's
+        // framing before readPacket() existed at all.
+        uint8_t verReply[12] = { 12, 0, 0, 0, instr::READ_VERSION, 0x34, 0x12, 0x00, 0x25, 0x02, 0x00, 0x00 };
+        uint8_t trailing[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+        std::vector<uint8_t> combined(verReply, verReply + 12);
+        combined.insert(combined.end(), trailing, trailing + 4);
+        server.sendRaw(combined);
+        std::vector<uint8_t> gotVer;
+        check(t.readPacket(gotVer, 12), "the 12-byte version reply is read");
+        check(gotVer.size() == 12 && memcmp(gotVer.data(), verReply, 12) == 0,
+              "  and matches exactly, not off by the trailing bytes");
+
+        // Confirms the shared-buffer design directly: whatever's left over after readPacket()
+        // consumed exactly 12 bytes must still be available to whichever reader looks next --
+        // here, another readPacket() rather than nextFrame(), since block-sized data isn't
+        // set up in this test, but the mechanism (recvBuf) is the same either way.
+        std::vector<uint8_t> gotTrailing;
+        check(t.readPacket(gotTrailing, 4) && memcmp(gotTrailing.data(), trailing, 4) == 0,
+              "leftover bytes after a readPacket() are neither lost nor duplicated");
+
+        t.stop();
+        server.stop();
+    }
+
+    // -- A dead connection makes readPacket() return false too, not hang ------------
+    {
+        FakeServer server;
+        server.start();
+        server.acceptOne();
+
+        LanTcpTransport t;
+        t.connect("127.0.0.1", server.port, /*recvTimeoutMs=*/300);
+        server.waitForClient();
+        server.stop();   // drop the connection from the far end
+
+        std::vector<uint8_t> got;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = t.readPacket(got, 8);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        check(!ok, "readPacket returns false on a dropped connection");
+        check(ms < 5000, "and does not hang indefinitely");
+        t.stop();
     }
 
     // -- A dead connection makes nextFrame return false, not hang -------------------

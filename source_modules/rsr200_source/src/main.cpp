@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 
 SDRPP_MOD_INFO{
     /* Name:            */ "rsr200_source",
@@ -202,13 +203,28 @@ private:
         }
 
         // A cheap, read-only probe -- not modelled on Device (which has no "send an
-        // unsolicited command" method), so sent directly through the transport. The reply
-        // arrives embedded in the stream like any other (DP 3.3), and Device::onReply above
-        // already watches for REPLY_VERSION regardless of who sent the command. isLan()
+        // unsolicited command" method), so sent directly through the transport. isLan()
         // picks the right (USB fixed-length vs LAN shortened) command encoding regardless
         // of which transport is actually active.
         auto verCmd = cmdReadVersion(9999, _this->activeTransport->isLan());
         _this->activeTransport->sendCommand(verCmd.data(), verCmd.size());
+        if (_this->activeTransport->isLan()) {
+            // Packet mode (streaming hasn't started yet): the version reply is its own
+            // standalone 12-byte packet, not embedded in a block -- there is no block for it
+            // to embed into yet. Read and parse it directly rather than relying on
+            // Device::onReply seeing it appear in a stream that doesn't exist. See
+            // RSR200_PLAN.md's "First live LAN connection" section.
+            std::vector<uint8_t> verReply;
+            if (_this->activeTransport->readPacket(verReply, 12)) {
+                Reply r;
+                if (parseLanVersionPacket(verReply.data(), verReply.size(), r) && _this->device.onReply) {
+                    _this->device.onReply(r);
+                }
+            }
+        }
+        // For USB the reply arrives embedded in the stream like any other (DP 3.3), and
+        // Device::onReply above already watches for REPLY_VERSION regardless of who sent
+        // the command.
 
         if (!_this->device.startStream(now)) {
             _this->lastError = "Start Stream failed";
@@ -292,6 +308,19 @@ private:
     // Device hands back pointers into its own internal buffers, already unpacked to
     // interleaved float re/im and Auto-ATT compensated -- copy straight into the stream's
     // write buffer and swap, the same shape as every other source module's worker.
+    //
+    // Simple and direct on purpose. A whole line of fixes was tried here for LAN audio
+    // choppiness -- chunking the hand-off, pacing chunks to real time, a genuine jitter
+    // buffer, adapting its drain rate to a measured delivery rate -- and none of it helped;
+    // the last version made things worse. See RSR200_PLAN.md's LAN section (2026-08-12
+    // audio choppiness investigation) for the full chain: live measurement across every one
+    // of those attempts converged on the same conclusion, that the RSR200's LAN interface
+    // genuinely cannot sustain its own nominal decimation rate in real time (a recurring
+    // stall tied to block count, present at the lowest documented decimation setting, with
+    // wire bandwidth nowhere near a real constraint) -- not a bug reachable from this
+    // module's own delivery code, so no amount of buffering or pacing on this side fixes it.
+    // Reverted to this simple form rather than carry the complexity of a fix that doesn't
+    // fix anything. USB is unaffected and remains the clean path for real-time listening.
     void deliver(const SampleBlock& b) {
         {
             std::lock_guard<std::mutex> lck(statusMtx);
@@ -552,6 +581,7 @@ private:
     // reads it while the worker thread (running Device's callbacks) writes it.
     std::thread workerThread;
     std::atomic<bool> run = false;
+
     std::mutex statusMtx;
     Status lastStatus;
     bool lastSequenceGap = false;

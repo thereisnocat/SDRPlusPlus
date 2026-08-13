@@ -52,6 +52,24 @@ namespace rsr200 {
 
         // LAN transports need the block geometry to frame at all; USB ignores it.
         virtual void setLayout(const BlockLayout&) {}
+
+        // Reads exactly one standalone, fixed-size reply packet, blocking with whatever
+        // timeout the transport itself is configured with. Only ever used for one specific
+        // case: the "Read version numbers" query, when sent before streaming has started on
+        // LAN -- that command's reply (DP section 3.2, "Report version numbers LAN", 12
+        // bytes) genuinely does arrive as its own standalone packet on real hardware,
+        // confirmed by packet capture. Nothing else does: every configuration command's own
+        // confirmation, also confirmed by packet capture (two of them, several command
+        // types, all showing the radio ACK the TCP bytes and then send back nothing at all),
+        // only ever shows up once streaming has actually started, embedded in a block --
+        // Device::send() relies on that ordinary embedded-reply path for everything except
+        // the version query, which callers (main.cpp, the LAN live test) call this directly
+        // for instead. See RSR200_PLAN.md's "First live LAN connection" section for the
+        // full account, including the wrong turn taken before this was confirmed. USB has no
+        // equivalent concept at all -- it starts streaming continuously right at power-up
+        // (DP section 4.1) -- so the default here just fails, and nothing should call this
+        // for USB.
+        virtual bool readPacket(std::vector<uint8_t>& out, size_t expectedBytes) { return false; }
     };
 
     // -----------------------------------------------------------------------------
@@ -64,7 +82,7 @@ namespace rsr200 {
         int frames = 0;
         Status status;
         uint32_t sequence = 0;        // packet or block counter
-        bool sequenceGap = false;     // counter skipped: data was lost
+        bool sequenceGap = false;     // counter skipped: data was lost -- USB only, see noteSequence()
     };
 
     struct Config {
@@ -332,6 +350,22 @@ namespace rsr200 {
                 return fail("transport rejected a command");
             }
             if (expectAck) {
+                // Deliberately always the async/embedded-reply path, never a synchronous
+                // packet-mode read, even for LAN before streaming has started. That was
+                // tried (RSR200_PLAN.md's "First live LAN connection" section) and proven
+                // wrong against real hardware, by packet capture: only "Read version
+                // numbers" (handled entirely separately -- see Transport::readPacket(),
+                // called directly by main.cpp/the LAN live test, never through here) gets an
+                // individual standalone reply on this firmware. Every configuration
+                // command's confirmation -- confirmed by two packet captures showing the
+                // radio ACK the TCP bytes and then send back nothing at all, for multiple
+                // different command types -- only ever shows up once streaming has actually
+                // started, embedded in a block, exactly like DP section 3.3's documented
+                // caution for "Set data transmission" specifically, just true for every
+                // command here rather than only that one. pending just sits registered
+                // (only the most recently sent command, since it's a single slot, not a
+                // queue) until the first streaming block's embedded reply satisfies it, or
+                // until enough calls to service() after streaming starts time it out.
                 pending.hasCommand = true;
                 pending.number = readU32(bytes.data());
                 pending.instruction = bytes[4];
@@ -342,8 +376,26 @@ namespace rsr200 {
             return true;
         }
 
-        void noteSequence(uint32_t counter) {
-            lastBlock.sequenceGap = expectSequence && (counter != lastSequence + 1);
+        // checkGap is false for LAN. USB packets can genuinely be lost on the bus, so "the
+        // counter didn't advance by exactly 1" is a real, meaningful signal there. LAN's
+        // TCP connection can't lose or reorder bytes the same way -- if nextFrame() hands
+        // back a block at all, its sync words and inverted counter have both already
+        // validated (rsr200_lan_transport.h's own resync search guarantees that), meaning
+        // it is genuinely the next chunk of bytes the radio sent, full stop; a dead
+        // connection is caught separately, by nextFrame() itself returning false. What
+        // isn't reliable on LAN is the counter *field*'s own value: live testing
+        // (RSR200_PLAN.md's LAN section) found its steady-state per-block delta isn't a
+        // constant +1 -- it was +3 at decimExp=3 and +1 at decimExp=5, not a clean multiple
+        // of decimation either -- and on top of that, even within one steady rate, it
+        // periodically jumps in a repeating but non-monotonic pattern (a run of same-size
+        // deltas, then something like +10/-7/+11) that never settles out over a 10-second,
+        // 112-block run. None of that reflects lost data; it's some quirk of how the
+        // radio's own firmware generates that field. Treating it as a gap indicator on LAN
+        // just produces constant false positives, so LAN skips the check and only stores
+        // the raw counter (still exposed via SampleBlock::sequence, for whatever
+        // diagnostic value it has) rather than deriving sequenceGap from it.
+        void noteSequence(uint32_t counter, bool checkGap) {
+            lastBlock.sequenceGap = checkGap && expectSequence && (counter != lastSequence + 1);
             lastSequence = counter;
             expectSequence = true;
             lastBlock.sequence = counter;
@@ -406,7 +458,7 @@ namespace rsr200 {
         void parseUsbPacket(const std::vector<uint8_t>& p) {
             if (p.size() < USB_PACKET_BYTES) { return; }
             lastBlock.status = parseStatus(p[USB_TEMP_OFFSET], p[USB_GPS_OFFSET], p[USB_GPS_OFFSET + 1]);
-            noteSequence(readU32(p.data()));
+            noteSequence(readU32(p.data()), /*checkGap=*/true);
             handleCommandNumber(p[USB_CMD_NO_OFFSET], p.data() + USB_COMMAND_OFFSET, 1);
             deliver(p.data() + USB_IQ_OFFSET, usbSamplesPerPacket(cfg.format));
         }
@@ -420,7 +472,7 @@ namespace rsr200 {
             }
 
             lastBlock.status = parseStatus(b[l.tempOffset], b[l.gpsOffset], b[l.gpsOffset + 1]);
-            noteSequence(readU32(b.data() + l.counterOffset));
+            noteSequence(readU32(b.data() + l.counterOffset), /*checkGap=*/false);
 
             // Embedded replies are assumed to be 8 bytes each, matching both confirmation
             // forms. The document says only that several may be present and gives their

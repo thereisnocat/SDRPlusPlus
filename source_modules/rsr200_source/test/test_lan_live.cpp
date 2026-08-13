@@ -32,6 +32,8 @@ static uint64_t nowMs() {
 int main(int argc, char** argv) {
     std::string host = argc > 1 ? argv[1] : "192.168.1.176";
     uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 55557;
+    int decimExp = argc > 3 ? atoi(argv[3]) : 3;   // 0=rate 2 .. 5=rate 64
+    int pumpSeconds = argc > 4 ? atoi(argv[4]) : 5;
 
     printf("Connecting to RSR200 at %s:%u ...\n", host.c_str(), port);
 
@@ -78,10 +80,12 @@ int main(int argc, char** argv) {
             firstIm = b.chA[1];
             haveFirstSample = true;
         }
-        // Diagnostic: raw counter delta, not just the gap flag, for the first several
-        // blocks -- to see whether it's off by a small constant (framing/offset bug) or
-        // wildly inconsistent (real loss) or something else entirely.
-        if (sampleBlocks.load() <= 15) {
+        // Diagnostic: raw counter delta, not just the gap flag, for every block this run --
+        // to see whether an initial chaotic period (a startup transient -- old queued data
+        // draining before real-time samples begin) eventually settles into a clean,
+        // monotonic +1-per-block sequence, or stays chaotic indefinitely. See
+        // RSR200_PLAN.md's LAN section.
+        {
             int64_t delta = haveLastSeq ? (int64_t)b.sequence - (int64_t)lastSeq : 0;
             printf("    [seq] block #%u: sequence=%u delta=%lld gap_flag=%s\n",
                    sampleBlocks.load(), b.sequence, (long long)delta, b.sequenceGap ? "yes" : "no");
@@ -92,8 +96,11 @@ int main(int argc, char** argv) {
 
     // Config{}'s own default member initializers already match what this needs: 125 MHz
     // clock, decimation exp 3 (rate 16), single channel 16-bit, tuned to 10 MHz -- a plain
-    // connectivity/proof-of-life check, not aiming at any particular signal.
+    // connectivity/proof-of-life check, not aiming at any particular signal. decimExp is
+    // overridable from the command line to test whether the block counter's steady-state
+    // delta (observed as +3 at the default decimExp=3) scales with decimation.
     Config cfg;
+    cfg.decimationExp = decimExp;
 
     const uint64_t start = nowMs();
     if (!device.applyConfig(cfg, start)) {
@@ -103,17 +110,34 @@ int main(int argc, char** argv) {
     printf("applyConfig() sent (%.3f MSp/s).\n", cfg.sampleRateHz() / 1e6);
 
     // Ad-hoc, not modelled on Device (which has no "send an unsolicited command" method) --
-    // same pattern main.cpp itself uses. The reply arrives embedded in the stream like any
-    // other; Device::onReply above already watches for REPLY_VERSION.
+    // same pattern main.cpp itself uses. Packet mode (streaming hasn't started yet): the
+    // reply is its own standalone 12-byte packet, not embedded in a block, so it's read and
+    // parsed directly rather than relying on Device::onReply seeing it in a stream that
+    // doesn't exist yet.
     auto verCmd = cmdReadVersion(9999, /*lan=*/true);
     lan.sendCommand(verCmd.data(), verCmd.size());
     printf("Version query sent.\n");
+    {
+        std::vector<uint8_t> verReply;
+        if (lan.readPacket(verReply, 12)) {
+            Reply r;
+            if (parseLanVersionPacket(verReply.data(), verReply.size(), r) && device.onReply) {
+                device.onReply(r);
+            }
+            else {
+                printf("  (version packet read but failed to parse)\n");
+            }
+        }
+        else {
+            printf("  (no version packet reply within timeout)\n");
+        }
+    }
 
     if (!device.startStream(start)) {
         printf("startStream() failed\n");
         return 1;
     }
-    printf("Start Stream sent. Pumping for 5 seconds...\n");
+    printf("Start Stream sent. Pumping for %d seconds...\n", pumpSeconds);
 
     std::atomic<bool> stop{ false };
     std::thread pumpThread([&]() {
@@ -124,7 +148,7 @@ int main(int argc, char** argv) {
     });
 
     const uint64_t t0 = nowMs();
-    while (nowMs() - t0 < 5000) {
+    while (nowMs() - t0 < (uint64_t)pumpSeconds * 1000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         printf("  blocks=%u frames=%llu gapEvents=%u version=%s\n",
                sampleBlocks.load(), (unsigned long long)totalFrames.load(), gapEvents.load(),

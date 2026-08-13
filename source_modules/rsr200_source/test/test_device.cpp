@@ -305,9 +305,16 @@ int main() {
         d.pump();
         check(!gap, "consecutive counters are not a gap");
 
+        // LAN doesn't derive sequenceGap from the counter at all (see noteSequence()'s own
+        // comment in rsr200_device.h): TCP can't lose or reorder bytes, so a block that
+        // makes it through nextFrame()'s sync/inverted-counter check is genuinely the next
+        // one the radio sent regardless of what its counter field says, and live testing
+        // found that field's own steady-state behavior isn't a reliable +1 anyway. Gap
+        // detection is a USB-only concept now -- see "USB framing uses the same device"
+        // below.
         t.frames.push_back(makeLanBlock(l, 20, 1, nullptr));
         d.pump();
-        check(gap, "a jump in the block counter is reported as lost data");
+        check(!gap, "a jump in the LAN block counter is not treated as lost data");
 
         // Auto-ATT scales the stream down 2 bits; the device has to scale it back.
         t.frames.push_back(makeLanBlock(l, 21, 1, nullptr, 0x80));
@@ -405,7 +412,8 @@ int main() {
         check(s && (*s)[5] == PORT_USB, "and the USB stream port");
 
         int frames = 0;
-        d.onSamples = [&](const SampleBlock& b) { frames = b.frames; };
+        bool gap = false;
+        d.onSamples = [&](const SampleBlock& b) { frames = b.frames; gap = b.sequenceGap; };
         std::vector<uint8_t> pkt(USB_PACKET_BYTES, 0);
         writeU32(pkt.data(), 1);
         pkt[USB_TEMP_OFFSET] = 30;
@@ -413,6 +421,19 @@ int main() {
         t.frames.push_back(pkt);
         d.pump();
         check(frames == 1020, "a USB packet delivers 1020 samples at 1 channel 16 bit");
+        check(!gap, "the first USB packet is not a gap");
+
+        // Unlike LAN, USB packets can genuinely be lost on the bus, so gap detection still
+        // applies to the counter here.
+        writeU32(pkt.data(), 2);
+        t.frames.push_back(pkt);
+        d.pump();
+        check(!gap, "consecutive USB counters are not a gap");
+
+        writeU32(pkt.data(), 9);
+        t.frames.push_back(pkt);
+        d.pump();
+        check(gap, "a jump in the USB packet counter is reported as lost data");
     }
 
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");

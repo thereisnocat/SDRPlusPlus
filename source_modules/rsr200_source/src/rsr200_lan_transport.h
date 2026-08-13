@@ -116,11 +116,27 @@ namespace rsr200 {
         }
 
         void stop() {
-            // Unstick a blocked nextFrame() from another thread. Closing the socket is
-            // the portable way to do that with a blocking BSD socket -- there is no
-            // cross-platform "cancel this recv()" call.
+            // Unstick a blocked nextFrame()/readPacket() from another thread WITHOUT fully
+            // closing the socket. shutdown(SHUT_RD) makes any pending or future recv()
+            // return immediately (as if the peer closed) while leaving the write side open
+            // -- unlike a full close() (what this used to do), which leaves the caller
+            // unable to send a Stop Stream command afterward, since sendCommand() needs a
+            // live socket too. That mattered a great deal in practice: closing here first
+            // meant Stop Stream never actually reached the radio, leaving it streaming
+            // indefinitely and contaminating every subsequent connection with data left
+            // over from a session that was never told to stop -- found via a packet capture
+            // showing streaming-shaped bytes arriving before this session's own Start Stream
+            // had even been sent. See RSR200_PLAN.md's LAN section. A real close() is still
+            // required afterward (call it explicitly once done sending); this only shuts
+            // down the read side.
             stopped = true;
-            close();
+            if (fd != RSR200_INVALID_SOCK) {
+#ifdef _WIN32
+                shutdown(fd, SD_RECEIVE);
+#else
+                shutdown(fd, SHUT_RD);
+#endif
+            }
         }
 
         bool isConnected() const { return connected; }
@@ -175,6 +191,34 @@ namespace rsr200 {
                 }
                 recvBuf.insert(recvBuf.end(), chunk, chunk + n);
             }
+        }
+
+        // Reads exactly expectedBytes -- the fixed size of every LAN packet-mode reply (8
+        // bytes for an ordinary Confirmation/Special confirmation, 12 for the one
+        // exception, the version query's own reply -- see rsr200_protocol.h's
+        // parseEmbeddedCommand()/parseLanVersionPacket()). Shares recvBuf with nextFrame()
+        // deliberately, so bytes read here and bytes read once streaming has switched over
+        // to block mode are never duplicated or dropped at the boundary between the two --
+        // whatever's left over (there should be nothing, if every packet-mode reply this
+        // call is used for is read before the next command is sent) just becomes the start
+        // of nextFrame()'s own resync search.
+        bool readPacket(std::vector<uint8_t>& out, size_t expectedBytes) override {
+            while (recvBuf.size() < expectedBytes) {
+                if (stopped) { return false; }
+                uint8_t chunk[4096];
+                const int n = ::recv(fd, (char*)chunk, (int)sizeof(chunk), 0);
+                if (n <= 0) {
+                    if (!stopped) {
+                        setError(n == 0 ? "connection closed by radio" : "recv() failed or timed out");
+                    }
+                    connected = false;
+                    return false;
+                }
+                recvBuf.insert(recvBuf.end(), chunk, chunk + n);
+            }
+            out.assign(recvBuf.begin(), recvBuf.begin() + (ptrdiff_t)expectedBytes);
+            recvBuf.erase(recvBuf.begin(), recvBuf.begin() + (ptrdiff_t)expectedBytes);
+            return true;
         }
 
         void setLayout(const BlockLayout& l) override {
