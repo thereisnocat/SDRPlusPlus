@@ -1,3 +1,11 @@
+// Must precede any include that could pull in <windows.h> transitively (gui/gui.h and others
+// below do, on this platform) -- otherwise its own min/max macros shadow std::min/std::max,
+// and every call below becomes "std::(" to the preprocessor, an illegal token sequence (MSVC
+// C2589). Found via Windows CI after this file's new glyph-drawing/marker code added the
+// first bare std::min/std::max calls here; file_source/src/main.cpp already carries this same
+// #define as its own first line, for the identical reason -- matching that established
+// convention rather than inventing a second one.
+#define NOMINMAX
 #include <gui/main_window.h>
 #include <gui/gui.h>
 #include "imgui.h"
