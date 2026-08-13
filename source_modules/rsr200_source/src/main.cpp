@@ -1,15 +1,19 @@
 // rsr200_lan_transport.h pulls in <winsock2.h>/<ws2tcpip.h> on Windows -- has to come before
-// any header that might drag in the legacy <winsock.h> unprotected (imgui/gui/signal_path
-// all eventually reach <windows.h> on this platform), or MSVC redefines half of winsock2.h
-// against it (found via Windows CI: ~100 C2011/C2375 errors, all in this module, all fixed by
-// reordering, nothing wrong with the socket code itself). network_sink/src/main.cpp already
-// establishes this exact convention -- its own <utils/networking.h> (the other winsock2 user
-// in this codebase) is its first include for the same reason; matching it here rather than
-// inventing a second pattern.
+// any header that might drag in the legacy <winsock.h> unprotected (imgui/gui/signal_path all
+// eventually reach <windows.h> on this platform, and so -- less obviously -- does
+// transport_usb.h's own <FTD3XX.h> on Windows, the FTDI WinUSB driver header, which needs
+// <windows.h> itself for HANDLE/DWORD/etc.), or MSVC redefines half of winsock2.h against it
+// (found via Windows CI: ~100 C2011/C2375 errors, all in this module; moving this above
+// imgui/gui/signal_path alone wasn't enough, since transport_usb.h -- included right before
+// it -- was still winning that race on its own. Neither header depends on the other, so
+// swapping their order is free). network_sink/src/main.cpp already establishes the winsock2-
+// first convention -- its own <utils/networking.h> (the other winsock2 user in this codebase)
+// is its first include for the same reason; matching it here rather than inventing a second
+// pattern.
 #include "rsr200_protocol.h"
 #include "rsr200_device.h"
-#include "transport_usb.h"
 #include "rsr200_lan_transport.h"
+#include "transport_usb.h"
 #include <imgui.h>
 #include <module.h>
 #include <gui/gui.h>
