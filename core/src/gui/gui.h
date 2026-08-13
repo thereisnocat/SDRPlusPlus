@@ -24,6 +24,42 @@ namespace gui {
         int64_t recordingStartEpoch = 0; // local-time epoch of recording start, 0 = unknown
         void (*seekCallback)(float fraction, void* ctx) = nullptr;
         void* seekCtx = nullptr;
+
+        // Transport state -- read by the GUI, written by the source module's callbacks and its
+        // own worker thread, same unlocked-write convention already used above for
+        // progress/currentTimeSec (this is an ImGui-immediate-mode display value, not something
+        // that needs a mutex to stay usable).
+        bool paused = false;
+        bool scrubbingForward = false;   // true while fast-forward is held, for button highlight
+        bool scrubbingReverse = false;   // true while fast-reverse is held
+
+        // A/B loop state. -1 = that marker hasn't been set yet. Order-agnostic by convention --
+        // every consumer treats the loop bounds as min(A,B)/max(A,B), so which one the user
+        // dropped first never matters.
+        bool loopEnabled = false;
+        float loopMarkerAFrac = -1.0f;
+        float loopMarkerBFrac = -1.0f;
+
+        // Transport callbacks. One shared ctx (transportCtx) rather than a ctx per callback --
+        // unlike seekCtx above (which predates this and is left alone), there's only ever one
+        // real producer of all five of these, so five separate ctx pointers would just be five
+        // copies of the same value.
+        void (*playPauseCallback)(bool play, void* ctx) = nullptr;
+        void (*stopCallback)(void* ctx) = nullptr;   // pause + rewind to 0, does NOT tear down
+                                                      // the source -- see main_window.cpp's
+                                                      // existing global Play/Stop button for that
+        void (*scrubCallback)(int direction, void* ctx) = nullptr; // -1/0/+1; called every GUI
+                                                                    // frame with the live
+                                                                    // held-button state, not a
+                                                                    // one-shot toggle
+        void (*setLoopMarkerCallback)(int which, float fraction, void* ctx) = nullptr; // 0=A,1=B
+        void (*clearLoopMarkerCallback)(int which, void* ctx) = nullptr; // 0=A,1=B -- unsets it
+                                                                          // (back to -1) and turns
+                                                                          // looping off, since a
+                                                                          // loop missing either
+                                                                          // marker can't run
+        void (*setLoopEnabledCallback)(bool enabled, void* ctx) = nullptr;
+        void* transportCtx = nullptr;
     };
     SDRPP_EXPORT PlaybackBarInfo playbackBar;
 
