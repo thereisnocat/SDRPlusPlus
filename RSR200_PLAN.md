@@ -1538,3 +1538,48 @@ observation, since nothing found today points at anything fixable on the receivi
 
 Nothing from today's LAN work (module wiring, the packet-mode investigation, the `stop()` fix,
 sequence-gap handling, and this whole choppiness investigation) is committed yet.
+
+## Same LAN ceiling, a different symptom: recordings coming out shorter than the real session (2026-08-13)
+
+A day later, a separate bug report turned out to very likely be this same, still-unresolved LAN
+throughput ceiling — see `RECORDING_PERFORMANCE_PLAN.md` phase 17 for the full account. Short
+version: baseband recordings made over LAN at high sample rates (single-channel ~20+ MSp/s,
+dual-channel ~10+ MSp/s per channel — the same total-byte-throughput region as the choppiness
+above) come out genuinely shorter than the real recording session, by a variable amount (46-85%
+of the session missing across four real test recordings), with no gap or backpressure
+indication anywhere in the recording pipeline itself. A fixed-duration periodic stall consuming
+a larger *fraction* of the session as the configured rate increases (each block represents
+proportionally less real time at a higher rate) is fully consistent with both this and the
+smaller (~13-18%) shortfall measured above at a much lower rate. Not yet directly confirmed —
+the clean test is the same recording over USB at a comparable rate, mirroring how this
+investigation used USB as its own control throughout. A separate, genuinely different bug
+(`sigpath::phasing`'s own splitter architecture, unrelated to RSR200 or LAN specifically) was
+also found and is a likely *compounding* factor for dual-channel recordings specifically, but
+does not explain the single-channel case — see `RECORDING_PERFORMANCE_PLAN.md` phase 17 for
+that half of it.
+
+**Correction, same day, to how the section above frames the cause.** Ralph: yesterday's
+choppiness testing (the section above, "~13-18% below nominal") was over **WiFi**; today's
+recordings showing the much larger 46-85% shortfall were over **Ethernet**. That the threshold
+is this different between the two physical links is a real, important data point the section
+above didn't have: a genuine radio-firmware-internal limitation (the framing settled on above —
+"this may be a genuine firmware limitation... independent of buffering or pacing strategy on
+this end") would be expected to hit the *same* ceiling regardless of which physical link
+carries the TCP connection, since the radio's own firmware has no visibility into that. A
+threshold that moves this much between WiFi and Ethernet instead points at the **physical link
+itself** as (at least) the dominant factor — most plausibly the radio's own WiFi interface
+specifically, which embedded instrument-grade WiFi hardware is often considerably less capable
+than a modern router or laptop chipset, well before any RSR200-firmware-internal ceiling would
+even be reached. Doesn't reopen everything above — the profiling, the ruled-out receiving-side
+causes, and the packet-capture evidence of a real, block-count-tied recurring stall are all
+still valid observations — but it does mean "independent of buffering or pacing strategy on
+this end" was too strong a claim, and "genuine firmware limitation" undersold how much of this
+might simply be WiFi's own, considerably lower, real-world throughput ceiling. Practical
+upshot, not yet fully confirmed: **Ethernet is very likely the right recommendation for any
+serious LAN use of this radio** (matching what's already true for the recording case above —
+higher sample rates hold up much better over Ethernet), with WiFi reserved for lower-rate,
+lower-stakes use. Whether Ethernet has a real ceiling of its *own* above and beyond WiFi's
+(rather than just a much higher one) is still an open question — the recording numbers above
+(clean shortfall pattern up to some point even on Ethernet, at rates far above what broke down
+over WiFi) suggest it might, but that hasn't been isolated from the `sigpath::phasing` and
+general recording-pipeline factors also in play for those specific tests.
