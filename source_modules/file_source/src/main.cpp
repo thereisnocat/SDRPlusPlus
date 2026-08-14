@@ -17,6 +17,10 @@
 #include <ctime>
 #include <chrono>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>   // timeBeginPeriod/timeEndPeriod -- see start()/stop() below
+#pragma comment(lib, "winmm.lib")
+#endif
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -110,6 +114,20 @@ private:
         if (_this->running) { return; }
         if (_this->reader == NULL) { return; }
         _this->running = true;
+#ifdef _WIN32
+        // paceToRealTime() targets ~5ms blocks, but Windows' default scheduler timer
+        // resolution is ~15.6ms: measured directly, std::this_thread::sleep_until() at this
+        // granularity delivers blocks in a 0ms/~15.5ms alternating burst-then-stall pattern
+        // instead of an even ~5ms cadence -- audible as stuttering, sounds exactly like a
+        // bit rate mismatch even though the data and rate are both correct. macOS's default
+        // sleep granularity doesn't have this floor, which is why this was invisible there.
+        // timeBeginPeriod(1) raises the whole process's timer resolution to 1ms for as long
+        // as playback runs; confirmed by direct measurement to bring sleep_until() back to
+        // a tight ~3-7ms spread around the 5ms target with no bursts. Standard, widely-used
+        // fix for exactly this class of problem (games, audio engines); has no effect on
+        // Linux/macOS, which don't have this coarse a floor to begin with.
+        timeBeginPeriod(1);
+#endif
         gui::playbackBar.active = true;
         gui::playbackBar.progress = 0.0f;
         gui::playbackBar.currentTimeSec = 0.0f;
@@ -130,6 +148,9 @@ private:
         _this->streamA.stopWriter();
         _this->streamB.stopWriter();
         _this->workerThread.join();
+#ifdef _WIN32
+        timeEndPeriod(1);   // Paired with start()'s timeBeginPeriod(1) -- see its comment.
+#endif
         _this->stream.clearWriteStop();
         _this->streamA.clearWriteStop();
         _this->streamB.clearWriteStop();
