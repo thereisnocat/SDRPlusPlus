@@ -157,9 +157,25 @@ private:
         if (_this->running) { return; }
 
         _this->lastError.clear();
+
+        // Reload (or first-time-seed) this device/host's own stored settings before touching
+        // anything else -- matches rfspace_source/spyserver_source's own connect-time reload,
+        // so a transport/host/USB-device change made in the menu since construction (or since
+        // the last Start) takes effect now rather than starting with whatever the previous
+        // device's fields happened to be.
+        _this->loadDeviceSettings();
+
         if (_this->transportSel == 0) {
             std::string err;
-            if (!_this->usb.open(0, err)) {
+            bool opened = !_this->selectedUsbSerial.empty() &&
+                          _this->usb.openBySerial(_this->selectedUsbSerial, err);
+            if (!opened) {
+                // Fall back to "whatever's plugged in first" -- matches RTL-SDR's own
+                // selectFirst() fallback when the saved/chosen device isn't present, and covers
+                // the common single-device case where there's nothing to actually choose from.
+                opened = _this->usb.open(0, err);
+            }
+            if (!opened) {
                 _this->lastError = "open failed: " + err;
                 flog::error("RSR200SourceModule '{0}': {1}", _this->name, _this->lastError);
                 return;
@@ -183,10 +199,19 @@ private:
         };
         _this->device.onReply = [_this](const Reply& r) {
             if (r.kind != REPLY_VERSION) { return; }
-            std::lock_guard<std::mutex> lck(_this->statusMtx);
-            _this->verSerial = r.serial;
-            _this->verFirmware = r.firmware;
-            _this->haveVersion = true;
+            bool learnedNewSerial;
+            {
+                std::lock_guard<std::mutex> lck(_this->statusMtx);
+                learnedNewSerial = !_this->haveVersion || _this->verSerial != r.serial;
+                _this->verSerial = r.serial;
+                _this->verFirmware = r.firmware;
+                _this->haveVersion = true;
+            }
+            // Outside statusMtx -- learnUsbRadioSerial() takes config's own lock, and this
+            // callback can fire from either the GUI thread (LAN, synchronously within start())
+            // or the worker thread (USB, from within pump()), so keeping the two locks
+            // non-overlapping avoids adding any new lock-ordering constraint between them.
+            if (learnedNewSerial) { _this->learnUsbRadioSerial(r.serial); }
         };
         _this->device.onSamples = [_this](const SampleBlock& b) { _this->deliver(b); };
 
@@ -364,7 +389,36 @@ private:
         if (SmGui::Combo(CONCAT("##_rsr200_transport_", _this->name), &_this->transportSel, "USB\0LAN (TCP)\0")) {
             dirty = true;
         }
-        if (_this->transportSel != 0) {
+        if (_this->transportSel == 0) {
+            SmGui::LeftLabel("USB device");
+            std::string devItems;
+            for (auto& [desc, serial] : _this->usbDeviceList) {
+                devItems += desc + " (" + serial + ")";
+                devItems += '\0';
+            }
+            devItems += '\0';
+            bool noDevices = _this->usbDeviceList.empty();
+            if (noDevices) { SmGui::BeginDisabled(); }
+            SmGui::FillWidth();
+            if (SmGui::Combo(CONCAT("##_rsr200_usbdev_", _this->name), &_this->usbDeviceId, devItems.c_str())) {
+                _this->selectedUsbSerial = _this->usbDeviceList[_this->usbDeviceId].second;
+                dirty = true;
+            }
+            if (noDevices) { SmGui::EndDisabled(); }
+            // Own row, not SameLine() with the combo above -- that combo already claims the
+            // panel's full width (matching every other single-combo row in this file, e.g.
+            // Transport/Decimation just above/below), so there's no room left on that line for
+            // a button; RTL-SDR's own combo+button same-line layout works there because its
+            // device combo has no LeftLabel in front of it eating into the row first.
+            if (SmGui::Button(CONCAT("Refresh##_rsr200_usbrefresh_", _this->name))) {
+                _this->refreshUsbDeviceList();
+            }
+            if (noDevices) {
+                SmGui::Text("No RSR200 (D3XX) devices found -- Start will still try the first "
+                            "one seen, if any shows up.");
+            }
+        }
+        else {
             SmGui::LeftLabel("Radio IP address");
             SmGui::FillWidth();
             if (SmGui::InputText(CONCAT("##_rsr200_lanhost_", _this->name), _this->lanHost, sizeof(_this->lanHost))) {
@@ -502,43 +556,167 @@ private:
         if (dirty) { _this->saveConfig(); }
     }
 
+    // Which device this module is currently pointed at, and therefore which slot under
+    // config.conf["devices"][...] its tunable settings (adcClockMHz, decimExp, etc.) are
+    // stored under -- host string for LAN, matching how the other network-only sources with
+    // nothing to enumerate do the same thing (rfspace_source/spyserver_source both key by
+    // "host:port"). Before this refactor RSR200 kept one flat blob regardless of which
+    // physical unit/host it was pointed at -- see RECORDING_SCHEDULER_PLAN.md section 2.2 for
+    // the survey that motivated this and AskUserQuestion confirmation to do the full refactor
+    // (2026-08-15).
+    //
+    // USB is keyed by the *radio's own* protocol-level serial ("radio-<N>", the number shown
+    // in Status as "Serial N" once connected), not the FTDI bridge chip's USB descriptor
+    // serial (selectedUsbSerial) -- real hardware testing the same day found that descriptor
+    // serial reads as "1", which looks exactly like a generic default FTDI bridge chips are
+    // often left with rather than something programmed uniquely per RSR200 unit. Keying by it
+    // would give no real per-unit distinction, just a fixed bucket dressed up as one. The
+    // radio's own serial is only known *after* a successful connect + version reply though
+    // (learnUsbRadioSerial(), called from the version-reply handler in start()), so
+    // selectedUsbSerial is still used as a provisional key ("usb-<serial>") for the very first
+    // connect to a given FTDI device; config.conf["usbRadioSerials"][selectedUsbSerial]
+    // remembers the mapping afterwards so later sessions go straight to the real key without
+    // needing to reconnect first. Must be called with `config` already acquired -- every
+    // existing call site (loadDeviceSettings/saveConfig/loadConfig's migration block) already
+    // holds it around this call.
+    std::string currentDeviceKey() {
+        if (transportSel == 0) {
+            if (!selectedUsbSerial.empty() && config.conf["usbRadioSerials"].contains(selectedUsbSerial)) {
+                return "radio-" + config.conf["usbRadioSerials"][selectedUsbSerial].get<std::string>();
+            }
+            return selectedUsbSerial.empty() ? "usb-default" : ("usb-" + selectedUsbSerial);
+        }
+        return std::string(lanHost);
+    }
+
+    // Called from the version-reply handler in start() the first time (per connect) the
+    // radio's own serial becomes known. Re-homes whatever provisional "usb-<ftdi serial>"
+    // blob this connect started from onto "radio-<radio serial>", and records the FTDI<->radio
+    // serial mapping for next time. The just-applied live settings are treated as
+    // authoritative for the real key regardless of what (if anything) was already stored there
+    // -- deliberately does not reload/replace the live in-memory fields mid-connection, to
+    // avoid a surprise behavior change while the radio's already streaming with them applied.
+    // No-op for LAN, and a no-op if this connect was already keyed by the radio's own serial
+    // (e.g. a second Start in the same session, or a session that already had the mapping).
+    void learnUsbRadioSerial(uint32_t serial) {
+        if (transportSel != 0) { return; }
+        std::string radioKey = "radio-" + std::to_string(serial);
+        config.acquire();
+        std::string oldKey = currentDeviceKey();
+        if (!selectedUsbSerial.empty()) {
+            config.conf["usbRadioSerials"][selectedUsbSerial] = std::to_string(serial);
+        }
+        if (oldKey != radioKey) {
+            writeDeviceSettingsJson(config.conf["devices"][radioKey]);
+            // Only ever a "usb-..." provisional key by construction (see currentDeviceKey()
+            // above) -- can't be a real LAN host or a different radio's own key, so this can
+            // never remove anything but its own leftover.
+            if (oldKey.rfind("usb-", 0) == 0) { config.conf["devices"].erase(oldKey); }
+        }
+        config.release(true);
+    }
+
+    // Serializes the live, GUI-editable per-device fields into `d` -- shared by saveConfig()
+    // and loadDeviceSettings()'s first-time-seeing-this-device seed path, so a freshly-seen
+    // device's stored blob starts out matching whatever's currently on screen rather than
+    // empty/default.
+    void writeDeviceSettingsJson(json& d) {
+        d["adcClockMHz"] = adcClockMHz;
+        d["gpsDiscipline"] = gpsDiscipline;
+        d["decimExp"] = decimExp;
+        d["bits24"] = bits24;
+        d["dualChannel"] = dualChannel;
+        d["swapChannels"] = swapChannels;
+        d["useVhf"] = useVhf;
+        d["vhfPreamp"] = vhfPreamp;
+        d["atten1"] = atten1;
+        d["atten2"] = atten2;
+    }
+
+    // (Re)loads the per-device fields for whatever currentDeviceKey() is *right now* into the
+    // live fields. Called once at construction (after the flat fields below are loaded, so the
+    // key is already known) and again at the top of start() -- mirroring rfspace_source/
+    // spyserver_source, which likewise only recompute their own device key and reload at
+    // connect time, not on every keystroke while the host field is being edited. A device seen
+    // for the first time gets its stored blob seeded from whatever's currently live (matching
+    // rtl_sdr_source's own "if devices doesn't contain this name yet, seed it" pattern at
+    // rtl_sdr_source/src/main.cpp:199-209) rather than silently reading nothing.
+    void loadDeviceSettings() {
+        config.acquire();
+        std::string key = currentDeviceKey();
+        bool isNew = !config.conf["devices"].contains(key);
+        json& d = config.conf["devices"][key];
+        if (isNew) { writeDeviceSettingsJson(d); }
+        if (d.contains("adcClockMHz")) { adcClockMHz = d["adcClockMHz"]; }
+        if (d.contains("gpsDiscipline")) { gpsDiscipline = d["gpsDiscipline"]; }
+        if (d.contains("decimExp")) { decimExp = d["decimExp"]; }
+        if (d.contains("bits24")) { bits24 = d["bits24"]; }
+        if (d.contains("dualChannel")) { dualChannel = d["dualChannel"]; }
+        if (d.contains("swapChannels")) { swapChannels = d["swapChannels"]; }
+        if (d.contains("useVhf")) { useVhf = d["useVhf"]; }
+        if (d.contains("vhfPreamp")) { vhfPreamp = d["vhfPreamp"]; }
+        if (d.contains("atten1")) { atten1 = d["atten1"]; }
+        if (d.contains("atten2")) { atten2 = d["atten2"]; }
+        config.release(isNew);
+    }
+
+    // Scans currently-connected D3XX devices and re-syncs usbDeviceId to whichever one
+    // matches selectedUsbSerial (if it's still plugged in) -- called once at construction and
+    // from the menu's own Refresh button. Mirrors rtl_sdr_source's own refresh()-at-construction
+    // convention (main.cpp:82).
+    void refreshUsbDeviceList() {
+        usbDeviceList = UsbTransport::listDeviceInfo();
+        usbDeviceId = 0;
+        for (size_t i = 0; i < usbDeviceList.size(); i++) {
+            if (usbDeviceList[i].second == selectedUsbSerial) {
+                usbDeviceId = (int)i;
+                break;
+            }
+        }
+    }
+
     void loadConfig() {
         config.acquire();
         json& c = config.conf;
-        if (c.contains("adcClockMHz")) { adcClockMHz = c["adcClockMHz"]; }
-        if (c.contains("gpsDiscipline")) { gpsDiscipline = c["gpsDiscipline"]; }
-        if (c.contains("decimExp")) { decimExp = c["decimExp"]; }
-        if (c.contains("bits24")) { bits24 = c["bits24"]; }
-        if (c.contains("dualChannel")) { dualChannel = c["dualChannel"]; }
-        if (c.contains("swapChannels")) { swapChannels = c["swapChannels"]; }
-        if (c.contains("useVhf")) { useVhf = c["useVhf"]; }
-        if (c.contains("vhfPreamp")) { vhfPreamp = c["vhfPreamp"]; }
-        if (c.contains("atten1")) { atten1 = c["atten1"]; }
-        if (c.contains("atten2")) { atten2 = c["atten2"]; }
         if (c.contains("transportSel")) { transportSel = c["transportSel"]; }
         if (c.contains("lanHost")) {
             std::string h = c["lanHost"];
             strncpy(lanHost, h.c_str(), sizeof(lanHost) - 1);
             lanHost[sizeof(lanHost) - 1] = '\0';
         }
-        config.release();
+        if (c.contains("selectedUsbSerial")) { selectedUsbSerial = c["selectedUsbSerial"].get<std::string>(); }
+
+        // One-time migration from the pre-refactor flat schema (adcClockMHz etc. sitting
+        // directly on config.conf, shared across every device/host this module was ever
+        // pointed at) into devices.<currentDeviceKey()> -- keyed by whatever device/host is
+        // current right now, since that's the only association the old flat data ever had.
+        // Only runs once: guarded on "devices" not existing yet, and erases the old flat keys
+        // as it copies them so it can never re-migrate (and re-overwrite a real per-device
+        // edit) on a later load.
+        bool migrated = false;
+        if (c.contains("adcClockMHz") && !c.contains("devices")) {
+            json& d = c["devices"][currentDeviceKey()];
+            static const char* legacyKeys[] = { "adcClockMHz", "gpsDiscipline", "decimExp", "bits24",
+                                                  "dualChannel", "swapChannels", "useVhf", "vhfPreamp",
+                                                  "atten1", "atten2" };
+            for (const char* k : legacyKeys) {
+                if (c.contains(k)) { d[k] = c[k]; c.erase(k); }
+            }
+            migrated = true;
+        }
+        config.release(migrated);
+
+        refreshUsbDeviceList();
+        loadDeviceSettings();
     }
 
     void saveConfig() {
         config.acquire();
         json& c = config.conf;
-        c["adcClockMHz"] = adcClockMHz;
-        c["gpsDiscipline"] = gpsDiscipline;
-        c["decimExp"] = decimExp;
-        c["bits24"] = bits24;
-        c["dualChannel"] = dualChannel;
-        c["swapChannels"] = swapChannels;
-        c["useVhf"] = useVhf;
-        c["vhfPreamp"] = vhfPreamp;
-        c["atten1"] = atten1;
-        c["atten2"] = atten2;
         c["transportSel"] = transportSel;
         c["lanHost"] = std::string(lanHost);
+        c["selectedUsbSerial"] = selectedUsbSerial;
+        writeDeviceSettingsJson(c["devices"][currentDeviceKey()]);
         config.release(true);
     }
 
@@ -577,6 +755,20 @@ private:
     // field (network_source, rtl_tcp_source, spyserver_source, ...).
     int transportSel = 0;
     char lanHost[64] = "192.168.1.10";
+
+    // USB device selection. selectedUsbSerial is persisted flat (like RTL-SDR's own "device"
+    // key) and identifies *which FTDI bridge chip* to open -- it's the provisional
+    // devices.<key> lookup key via currentDeviceKey() until the radio's own serial is learned
+    // (see currentDeviceKey()/learnUsbRadioSerial() above), and always what selects which
+    // physical USB device open()/openBySerial() targets, regardless of that. Empty until a
+    // device's been picked at least once, in which case start() falls back to "whatever's
+    // plugged in first" (UsbTransport::open(0, ...)), covering the common single-device case
+    // where there's nothing to actually choose between. usbDeviceList/usbDeviceId are GUI-only
+    // (not persisted) -- refreshUsbDeviceList() re-derives usbDeviceId from selectedUsbSerial
+    // on every scan.
+    std::string selectedUsbSerial;
+    std::vector<std::pair<std::string, std::string>> usbDeviceList;
+    int usbDeviceId = 0;
 
     // Transport + protocol layer. Device (rsr200_device.h) is fully transport-agnostic --
     // it only ever talks to whichever Transport* was handed to setTransport(), and asks

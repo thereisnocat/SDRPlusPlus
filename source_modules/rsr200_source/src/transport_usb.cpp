@@ -61,8 +61,8 @@ namespace rsr200 {
         }
     }
 
-    std::vector<std::string> UsbTransport::listDevices() {
-        std::vector<std::string> out;
+    std::vector<std::pair<std::string, std::string>> UsbTransport::listDeviceInfo() {
+        std::vector<std::pair<std::string, std::string>> out;
         DWORD count = 0;
         if (!refreshDeviceList(count) || count == 0) { return out; }
 
@@ -74,7 +74,15 @@ namespace rsr200 {
             char serial[17] = { 0 };
             memcpy(desc, nodes[i].Description, 32);
             memcpy(serial, nodes[i].SerialNumber, 16);
-            out.push_back(std::string(desc) + " (" + serial + ")");
+            out.push_back({ std::string(desc), std::string(serial) });
+        }
+        return out;
+    }
+
+    std::vector<std::string> UsbTransport::listDevices() {
+        std::vector<std::string> out;
+        for (auto& [desc, serial] : listDeviceInfo()) {
+            out.push_back(desc + " (" + serial + ")");
         }
         return out;
     }
