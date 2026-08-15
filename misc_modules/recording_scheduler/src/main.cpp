@@ -1,16 +1,18 @@
 // Recording Scheduler -- schedule recordings by start/stop time, per entry, against a chosen
 // radio + Recorder settings. See RECORDING_SCHEDULER_PLAN.md at the repo root for the full
-// design and phased build order. This file currently covers phases 0-2 only:
+// design and phased build order. This file currently covers phases 0-4 only:
 //
 //   Phase 0: module skeleton -- builds/loads/toggles cleanly, empty menu panel.
 //   Phase 1: entry data model, own persisted config file, Add/Duplicate/Delete/Enable list UI.
 //   Phase 2: radio settings capture/apply/view (RSR200 only for now -- the only source module
 //            that implements SourceHandler::captureConfigHandler/applyConfigHandler so far).
+//   Phase 3: Recorder settings capture/edit (any Recorder instance -- that module's schema is
+//            fixed/known, unlike a radio's, so it's edited in place rather than opaque).
+//   Phase 4: recurrence editing -- Once/Daily/Weekly, start/stop time.
 //
-// Deliberately NOT here yet (later phases, see the plan doc): recurrence editing, Recorder
-// settings capture/apply, and the engine thread that actually fires anything. An entry today
-// picks a radio and can capture/view its settings, but nothing ever applies them automatically
-// -- that's phase 5.
+// Deliberately NOT here yet: the engine thread that actually fires anything. Every entry today
+// can be fully configured -- radio, recorder, and now when -- but nothing is ever applied or
+// started automatically. That's phase 5.
 //
 // New module, not an extension of the existing (abandoned, non-functional) misc_modules/
 // scheduler -- see RECORDING_SCHEDULER_PLAN.md section 0 for why.
@@ -30,6 +32,8 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <ctime>
+#include <cstdio>
 
 SDRPP_MOD_INFO{
     /* Name:            */ "recording_scheduler",
@@ -42,6 +46,82 @@ SDRPP_MOD_INFO{
 ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
+
+// "YYYY-MM-DD HH:MM:SS" <-> unix seconds (local time). sscanf/mktime/localtime_r|s rather than
+// strptime -- strptime is POSIX-only and this codebase also builds under MSVC (no strptime in
+// its CRT), matching the portability constraint already established elsewhere in this tree
+// (e.g. the file_source Windows timer fix earlier this session).
+static int64_t parseDateTime(const std::string& s) {
+    struct tm tmv = {};
+    int y, mo, d, h, mi, se;
+    if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) { return 0; }
+    tmv.tm_year = y - 1900;
+    tmv.tm_mon = mo - 1;
+    tmv.tm_mday = d;
+    tmv.tm_hour = h;
+    tmv.tm_min = mi;
+    tmv.tm_sec = se;
+    tmv.tm_isdst = -1;
+    return (int64_t)mktime(&tmv);
+}
+
+static std::string formatDateTime(int64_t epoch) {
+    if (epoch == 0) { return ""; }
+    time_t t = (time_t)epoch;
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return std::string(buf);
+}
+
+// Once/Daily/Weekly, matching RECORDING_SCHEDULER_PLAN.md section 3's schema exactly.
+// "once" uses absolute instants (startEpoch/stopEpoch); "daily"/"weekly" instead use a
+// wall-clock time-of-day + duration, evaluated against whichever date is next due -- that
+// evaluation is phase 5's job (the engine), not this struct's. No end-date for daily/weekly
+// yet (plan section 8, open decision 4) -- runs indefinitely until the entry is disabled.
+struct Recurrence {
+    std::string type = "once";          // "once" | "daily" | "weekly"
+    int64_t startEpoch = 0;             // "once" only
+    int64_t stopEpoch = 0;              // "once" only
+    std::string startTimeOfDay = "00:00:00";   // "daily"/"weekly" only, "HH:MM:SS"
+    int durationMin = 60;               // "daily"/"weekly" only, minutes
+    bool daysOfWeek[7] = { false, false, false, false, false, false, false };   // Sun..Sat, "weekly" only
+
+    json toJson() const {
+        json j;
+        j["type"] = type;
+        j["startEpoch"] = startEpoch;
+        j["stopEpoch"] = stopEpoch;
+        j["startTimeOfDay"] = startTimeOfDay;
+        j["durationMin"] = durationMin;
+        json dow = json::array();
+        for (int i = 0; i < 7; i++) { if (daysOfWeek[i]) { dow.push_back(i); } }
+        j["daysOfWeek"] = dow;
+        return j;
+    }
+
+    static Recurrence fromJson(const json& j) {
+        Recurrence r;
+        if (j.contains("type")) { r.type = j["type"]; }
+        if (j.contains("startEpoch")) { r.startEpoch = j["startEpoch"]; }
+        if (j.contains("stopEpoch")) { r.stopEpoch = j["stopEpoch"]; }
+        if (j.contains("startTimeOfDay")) { r.startTimeOfDay = j["startTimeOfDay"]; }
+        if (j.contains("durationMin")) { r.durationMin = j["durationMin"]; }
+        if (j.contains("daysOfWeek")) {
+            for (auto& v : j["daysOfWeek"]) {
+                int d = v;
+                if (d >= 0 && d < 7) { r.daysOfWeek[d] = true; }
+            }
+        }
+        return r;
+    }
+};
 
 // One schedule entry. Deliberately minimal for phase 1 -- name/enabled/status only. The full
 // schema (recurrence, source snapshot, recorder snapshot -- RECORDING_SCHEDULER_PLAN.md
@@ -73,6 +153,11 @@ struct Entry {
     std::string recorderName;
     json recorderConfigSnapshot;
 
+    // Phase 4: when this entry runs. Default matches Recurrence's own default (a "once" entry
+    // with no start/stop set yet -- a freshly Added entry is inert until edited, same as its
+    // radio/recorder sections above already are).
+    Recurrence recurrence;
+
     bool selected = false;
 
     json toJson() const {
@@ -86,6 +171,7 @@ struct Entry {
         j["sourceConfigCapturedAt"] = sourceConfigCapturedAt;
         j["recorderName"] = recorderName;
         j["recorderConfigSnapshot"] = recorderConfigSnapshot;
+        j["recurrence"] = recurrence.toJson();
         return j;
     }
 
@@ -101,6 +187,7 @@ struct Entry {
         if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
         if (j.contains("recorderName")) { e.recorderName = j["recorderName"]; }
         if (j.contains("recorderConfigSnapshot")) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
+        if (j.contains("recurrence")) { e.recurrence = Recurrence::fromJson(j["recurrence"]); }
         return e;
     }
 };
@@ -377,9 +464,80 @@ private:
                     }
 
                     ImGui::Separator();
-                    ImGui::TextDisabled("Schedule (start/stop time, once/repeating) isn't wired");
-                    ImGui::TextDisabled("up yet, and nothing fires automatically -- see");
-                    ImGui::TextDisabled("RECORDING_SCHEDULER_PLAN.md phases 4-5.");
+                    ImGui::TextUnformatted("Schedule");
+
+                    Recurrence& rec = it->second.recurrence;
+                    bool recurDirty = false;
+
+                    int typeId = (rec.type == "daily") ? 1 : (rec.type == "weekly") ? 2 : 0;
+                    ImGui::LeftLabel("Repeats");
+                    ImGui::FillWidth();
+                    if (ImGui::Combo(CONCAT("##recsched_rectype_", _this->name), &typeId, "Once\0Daily\0Weekly\0")) {
+                        rec.type = (typeId == 1) ? "daily" : (typeId == 2) ? "weekly" : "once";
+                        recurDirty = true;
+                    }
+
+                    if (rec.type == "once") {
+                        char startBuf[32];
+                        strncpy(startBuf, formatDateTime(rec.startEpoch).c_str(), sizeof(startBuf) - 1);
+                        startBuf[sizeof(startBuf) - 1] = 0;
+                        ImGui::LeftLabel("Start (YYYY-MM-DD HH:MM:SS)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_recstart_", _this->name), startBuf, sizeof(startBuf))) {
+                            rec.startEpoch = parseDateTime(startBuf);
+                            recurDirty = true;
+                        }
+
+                        char stopBuf[32];
+                        strncpy(stopBuf, formatDateTime(rec.stopEpoch).c_str(), sizeof(stopBuf) - 1);
+                        stopBuf[sizeof(stopBuf) - 1] = 0;
+                        ImGui::LeftLabel("Stop (YYYY-MM-DD HH:MM:SS)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_recstop_", _this->name), stopBuf, sizeof(stopBuf))) {
+                            rec.stopEpoch = parseDateTime(stopBuf);
+                            recurDirty = true;
+                        }
+
+                        if (rec.startEpoch != 0 && rec.stopEpoch != 0 && rec.stopEpoch <= rec.startEpoch) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "Stop should be after start.");
+                        }
+                    }
+                    else {
+                        char todBuf[16];
+                        strncpy(todBuf, rec.startTimeOfDay.c_str(), sizeof(todBuf) - 1);
+                        todBuf[sizeof(todBuf) - 1] = 0;
+                        ImGui::LeftLabel("Start time of day (HH:MM:SS)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_rectod_", _this->name), todBuf, sizeof(todBuf))) {
+                            rec.startTimeOfDay = std::string(todBuf);
+                            recurDirty = true;
+                        }
+
+                        ImGui::LeftLabel("Duration (minutes)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputInt(CONCAT("##recsched_recdur_", _this->name), &rec.durationMin)) {
+                            if (rec.durationMin < 1) { rec.durationMin = 1; }
+                            recurDirty = true;
+                        }
+
+                        if (rec.type == "weekly") {
+                            static const char* dayLabels[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+                            ImGui::TextUnformatted("Days");
+                            for (int i = 0; i < 7; i++) {
+                                if (i > 0) { ImGui::SameLine(); }
+                                std::string cbId = std::string(dayLabels[i]) + "##recsched_recdow_" + std::to_string(i) + "_" + _this->name;
+                                if (ImGui::Checkbox(cbId.c_str(), &rec.daysOfWeek[i])) {
+                                    recurDirty = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (recurDirty) { _this->saveConfig(); }
+
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Nothing fires automatically yet -- see");
+                    ImGui::TextDisabled("RECORDING_SCHEDULER_PLAN.md phase 5.");
 
                     if (ImGui::Button(CONCAT("Apply##recsched_edit_apply_", _this->name))) {
                         it->second.name = _this->editedName;
