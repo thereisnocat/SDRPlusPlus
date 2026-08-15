@@ -1583,3 +1583,40 @@ lower-stakes use. Whether Ethernet has a real ceiling of its *own* above and bey
 (clean shortfall pattern up to some point even on Ethernet, at rates far above what broke down
 over WiFi) suggest it might, but that hasn't been isolated from the `sigpath::phasing` and
 general recording-pipeline factors also in play for those specific tests.
+
+## Per-device settings keying refactor (2026-08-15)
+
+Prompted by designing `RECORDING_SCHEDULER_PLAN.md` (a separate, not-yet-started plan for a new
+scheduling module): that plan's survey of every source module in the tree found that essentially
+all of them — including RFspace and SpyServer, RSR200's closest architectural peers (network
+sources with no hardware enumeration, just a user-typed host) — key their tunable settings under
+`config.conf["devices"][<connection identity>]`, even when that identity is nothing more than a
+typed hostname. RSR200 was the outlier: one flat blob (`adcClockMHz`, `decimExp`, `bits24`, etc.
+directly on `config.conf`) shared regardless of which physical unit `lanHost` pointed at, or
+whether USB or LAN was selected.
+
+Confirmed via a direct AskUserQuestion ("full refactor now") and implemented on branch
+`rsr200DevicesKeying`:
+
+- Settings now live under `config.conf["devices"][key]`, `key` = the connected device's serial
+  for USB, `lanHost` for LAN — matching RTL-SDR's serial-keying and RFspace/SpyServer's
+  host-keying exactly.
+- USB gained real device enumeration and a device-select combo + Refresh button in the menu.
+  This uses `UsbTransport::listDeviceInfo()`/`openBySerial()`, both of which already existed in
+  `transport_usb.h`/`.cpp` but were unused by `main.cpp` — it previously just opened device index
+  0 unconditionally. Falls back to index-0 open if no serial is selected/present, matching every
+  other enumerated source module's own fallback-to-first-device behavior.
+- One-time migration on first load of an old-schema config file: the flat legacy keys move into
+  `devices.<key>`, keyed by whatever device/host was current at that moment, then are erased from
+  the top level so the migration can't re-run and clobber a real edit later.
+- Verified against the user's actual live `rsr200_config.json` (not a synthetic test file): real
+  settings (LAN, `192.168.1.176`, atten2=14, VHF+preamp on, etc.) migrated with every value
+  preserved exactly, flat keys removed, `transportSel`/`lanHost` correctly left flat. Backed up
+  before testing.
+- Not verified: real USB device enumeration/serial-open against physical hardware — no USB
+  pass-through available in this environment. The code path is built on `transport_usb.cpp`'s
+  already-tested `openBySerial()`/`listDeviceInfo()`, but hasn't itself been exercised live.
+
+See `RECORDING_SCHEDULER_PLAN.md` section 2.2 for the full survey this came out of (and its own
+2026-08-15 correction: RTL-SDR does *not* actually reload settings on `SourceManager::selectSource()`
+either, contrary to that section's first draft — traced more carefully while doing this refactor).

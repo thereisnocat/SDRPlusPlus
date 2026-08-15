@@ -19,6 +19,7 @@
                               // call with a millisecond timeout instead -- see transport_usb.cpp.
 #include <string>
 #include <vector>
+#include <utility>
 
 // USB transport over FTDI's D3XX driver. See RSR200_PLAN.md section 3.1 and 8.
 //
@@ -44,7 +45,17 @@ namespace rsr200 {
         Kind kind() const override { return KIND_USB; }
 
         // One line per connected D3XX device, "description (serial)", for a source menu.
+        // Built from listDeviceInfo() below -- kept as its own function since
+        // test_usb_live.cpp/test_usb_dual_live.cpp already call it for a plain printed list.
         static std::vector<std::string> listDevices();
+
+        // Structured version of listDevices(): one (description, serial) pair per connected
+        // D3XX device. Used by main.cpp to build a device-select combo and to key this
+        // module's own per-device settings by serial (RECORDING_SCHEDULER_PLAN.md section 2.2
+        // -- matching how every other multi-device source module in this codebase persists
+        // settings, e.g. rtl_sdr_source's config.conf["devices"][serial]) without parsing
+        // listDevices()'s "desc (serial)" display string back apart.
+        static std::vector<std::pair<std::string, std::string>> listDeviceInfo();
 
         // Whether device `index` negotiated USB 3.0 SuperSpeed vs. falling back to 2.0
         // Hi-Speed -- straight from FT_DEVICE_LIST_INFO_NODE.Flags (FT_FLAGS_SUPERSPEED /
