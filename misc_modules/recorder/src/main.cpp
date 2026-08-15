@@ -835,6 +835,63 @@ private:
         else if (code == RECORDER_IFACE_CMD_STOP) {
             if (_this->recording) { _this->stop(); }
         }
+        else if (code == RECORDER_IFACE_CMD_GET_CONFIG) {
+            json* _out = (json*)out;
+            json& j = *_out;
+            j["mode"] = _this->recMode;
+            j["recPath"] = _this->folderSelect.path;
+            j["timezone"] = _this->timezones.key(_this->timezoneId);
+            j["container"] = _this->containers.key(_this->containerId);
+            j["sampleType"] = _this->sampleTypes.key(_this->sampleTypeId);
+            j["audioStream"] = _this->selectedStreamName;
+            j["audioVolume"] = _this->audioVolume;
+            j["stereo"] = _this->stereo;
+            j["ignoreSilence"] = _this->ignoreSilence;
+            j["recordDualChannel"] = _this->recordDualChannel;
+            j["nameTemplate"] = std::string(_this->nameTemplate);
+        }
+        else if (code == RECORDER_IFACE_CMD_SET_CONFIG) {
+            if (_this->recording) { return; }
+            const json* _in = (const json*)in;
+            const json& j = *_in;
+            if (j.contains("mode")) { _this->recMode = std::clamp<int>(j["mode"], 0, 1); }
+            if (j.contains("recPath")) { _this->folderSelect.setPath(j["recPath"]); }
+            if (j.contains("timezone") && _this->timezones.keyExists(j["timezone"])) {
+                _this->timezoneId = _this->timezones.keyId(j["timezone"]);
+            }
+            if (j.contains("container") && _this->containers.keyExists(j["container"].get<std::string>())) {
+                _this->containerId = _this->containers.keyId(j["container"].get<std::string>());
+            }
+            if (j.contains("sampleType") && _this->sampleTypes.keyExists(j["sampleType"].get<int>())) {
+                _this->sampleTypeId = _this->sampleTypes.keyId(j["sampleType"].get<int>());
+            }
+            if (j.contains("audioStream")) { _this->selectedStreamName = j["audioStream"].get<std::string>(); }
+            if (j.contains("audioVolume")) { _this->audioVolume = j["audioVolume"]; }
+            if (j.contains("stereo")) { _this->stereo = j["stereo"]; }
+            if (j.contains("ignoreSilence")) { _this->ignoreSilence = j["ignoreSilence"]; }
+            if (j.contains("recordDualChannel")) { _this->recordDualChannel = j["recordDualChannel"]; }
+            if (j.contains("nameTemplate")) {
+                std::string t = j["nameTemplate"];
+                if (t.length() > sizeof(_this->nameTemplate) - 1) { t = t.substr(0, sizeof(_this->nameTemplate) - 1); }
+                strcpy(_this->nameTemplate, t.c_str());
+            }
+            // Persisted immediately, matching every individual menuHandler control's own
+            // acquire/release-per-change convention (this is a deliberate settings change --
+            // the recording scheduler applying a saved snapshot -- not a transient preview).
+            config.acquire();
+            config.conf[_this->name]["mode"] = _this->recMode;
+            config.conf[_this->name]["recPath"] = _this->folderSelect.path;
+            config.conf[_this->name]["timezone"] = _this->timezones.key(_this->timezoneId);
+            config.conf[_this->name]["container"] = _this->containers.key(_this->containerId);
+            config.conf[_this->name]["sampleType"] = _this->sampleTypes.key(_this->sampleTypeId);
+            config.conf[_this->name]["audioStream"] = _this->selectedStreamName;
+            config.conf[_this->name]["audioVolume"] = _this->audioVolume;
+            config.conf[_this->name]["stereo"] = _this->stereo;
+            config.conf[_this->name]["ignoreSilence"] = _this->ignoreSilence;
+            config.conf[_this->name]["recordDualChannel"] = _this->recordDualChannel;
+            config.conf[_this->name]["nameTemplate"] = std::string(_this->nameTemplate);
+            config.release(true);
+        }
     }
 
     std::string name;

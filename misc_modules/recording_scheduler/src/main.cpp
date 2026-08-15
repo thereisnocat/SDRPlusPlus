@@ -23,7 +23,9 @@
 #include <config.h>
 #include <core.h>
 #include <signal_path/signal_path.h>
+#include <recorder_interface.h>
 #include <map>
+#include <vector>
 #include <string>
 #include <chrono>
 #include <atomic>
@@ -63,6 +65,14 @@ struct Entry {
     json sourceConfigSnapshot;
     int64_t sourceConfigCapturedAt = 0;   // unix seconds, 0 = never captured
 
+    // Phase 3: which Recorder instance this entry targets, and its settings -- unlike the
+    // radio snapshot above, this one *is* editable in place (RECORDING_SCHEDULER_PLAN.md
+    // section 2.3: the Recorder module is identical for every radio and has a small, fixed
+    // field set, so this module can reasonably know its schema). "Reset to current" overwrites
+    // it wholesale from RECORDER_IFACE_CMD_GET_CONFIG; otherwise it's just edited here directly.
+    std::string recorderName;
+    json recorderConfigSnapshot;
+
     bool selected = false;
 
     json toJson() const {
@@ -74,6 +84,8 @@ struct Entry {
         j["sourceModuleType"] = sourceModuleType;
         j["sourceConfigSnapshot"] = sourceConfigSnapshot;
         j["sourceConfigCapturedAt"] = sourceConfigCapturedAt;
+        j["recorderName"] = recorderName;
+        j["recorderConfigSnapshot"] = recorderConfigSnapshot;
         return j;
     }
 
@@ -87,6 +99,8 @@ struct Entry {
         if (j.contains("sourceModuleType")) { e.sourceModuleType = j["sourceModuleType"]; }
         if (j.contains("sourceConfigSnapshot")) { e.sourceConfigSnapshot = j["sourceConfigSnapshot"]; }
         if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
+        if (j.contains("recorderName")) { e.recorderName = j["recorderName"]; }
+        if (j.contains("recorderConfigSnapshot")) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
         return e;
     }
 };
@@ -237,8 +251,135 @@ private:
                     }
 
                     ImGui::Separator();
-                    ImGui::TextDisabled("Schedule/recorder settings aren't wired up yet");
-                    ImGui::TextDisabled("(RECORDING_SCHEDULER_PLAN.md phases 3-5).");
+                    ImGui::TextUnformatted("Recorder");
+
+                    // No dedicated "list interfaces of a type" API on ModuleComManager, but
+                    // every instance's own module type is already tracked on ModuleManager
+                    // regardless (RECORDING_SCHEDULER_PLAN.md section 2.3).
+                    std::vector<std::string> recNames;
+                    for (auto& [instName, inst] : core::moduleManager.instances) {
+                        if (core::moduleManager.getInstanceModuleName(instName) == "recorder") {
+                            recNames.push_back(instName);
+                        }
+                    }
+                    int recId = -1;
+                    std::string recItems;
+                    for (size_t i = 0; i < recNames.size(); i++) {
+                        if (recNames[i] == it->second.recorderName) { recId = (int)i; }
+                        recItems += recNames[i];
+                        recItems += '\0';
+                    }
+                    recItems += '\0';
+                    int recComboId = (recId < 0) ? 0 : recId;
+                    ImGui::LeftLabel("Recorder instance");
+                    ImGui::FillWidth();
+                    if (!recNames.empty() && ImGui::Combo(CONCAT("##recsched_rec_", _this->name), &recComboId, recItems.c_str())) {
+                        it->second.recorderName = recNames[recComboId];
+                        _this->saveConfig();
+                    }
+                    if (recNames.empty()) { ImGui::TextDisabled("No Recorder instances currently exist."); }
+
+                    bool haveRecorder = !it->second.recorderName.empty();
+                    if (!haveRecorder) { style::beginDisabled(); }
+                    if (ImGui::Button(CONCAT("Reset to current Recorder settings##recsched_recreset_", _this->name))) {
+                        if (core::modComManager.interfaceExists(it->second.recorderName)) {
+                            json cfg;
+                            core::modComManager.callInterface(it->second.recorderName, RECORDER_IFACE_CMD_GET_CONFIG, nullptr, &cfg);
+                            it->second.recorderConfigSnapshot = cfg;
+                            _this->saveConfig();
+                        }
+                    }
+                    if (!haveRecorder) { style::endDisabled(); }
+
+                    if (haveRecorder) {
+                        json& rc = it->second.recorderConfigSnapshot;
+                        bool recDirty = false;
+
+                        int mode = rc.value("mode", 0);
+                        if (ImGui::RadioButton(CONCAT("Baseband##recsched_recmode_bb_", _this->name), mode == 0)) { rc["mode"] = 0; recDirty = true; }
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton(CONCAT("Audio##recsched_recmode_au_", _this->name), mode == 1)) { rc["mode"] = 1; recDirty = true; }
+
+                        char pathBuf[1024];
+                        strncpy(pathBuf, rc.value("recPath", std::string("")).c_str(), sizeof(pathBuf) - 1);
+                        pathBuf[sizeof(pathBuf) - 1] = 0;
+                        ImGui::LeftLabel("Folder");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_recpath_", _this->name), pathBuf, sizeof(pathBuf))) {
+                            rc["recPath"] = std::string(pathBuf);
+                            recDirty = true;
+                        }
+
+                        char tzBuf[64];
+                        strncpy(tzBuf, rc.value("timezone", std::string("local")).c_str(), sizeof(tzBuf) - 1);
+                        tzBuf[sizeof(tzBuf) - 1] = 0;
+                        ImGui::LeftLabel("Timezone (local/utc)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_rectz_", _this->name), tzBuf, sizeof(tzBuf))) {
+                            rc["timezone"] = std::string(tzBuf);
+                            recDirty = true;
+                        }
+
+                        ImGui::LeftLabel("Container");
+                        // Only WAV is offered by the Recorder module's own UI today (RF64 is
+                        // deliberately disabled there too) -- read-only here for the same reason.
+                        ImGui::TextUnformatted(rc.value("container", std::string("WAV")).c_str());
+
+                        static const struct { int value; const char* label; } sampleTypeOpts[] = {
+                            { 0, "Uint8" }, { 1, "Int16" }, { 3, "Float32" }, { 2, "Int32" }
+                        };
+                        int sampleType = rc.value("sampleType", 1);
+                        int stId = 1;
+                        std::string stItems;
+                        for (size_t i = 0; i < 4; i++) {
+                            if (sampleTypeOpts[i].value == sampleType) { stId = (int)i; }
+                            stItems += sampleTypeOpts[i].label;
+                            stItems += '\0';
+                        }
+                        stItems += '\0';
+                        ImGui::LeftLabel("Sample type");
+                        ImGui::FillWidth();
+                        if (ImGui::Combo(CONCAT("##recsched_recst_", _this->name), &stId, stItems.c_str())) {
+                            rc["sampleType"] = sampleTypeOpts[stId].value;
+                            recDirty = true;
+                        }
+
+                        char asBuf[256];
+                        strncpy(asBuf, rc.value("audioStream", std::string("")).c_str(), sizeof(asBuf) - 1);
+                        asBuf[sizeof(asBuf) - 1] = 0;
+                        ImGui::LeftLabel("Audio stream (Audio mode)");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_recas_", _this->name), asBuf, sizeof(asBuf))) {
+                            rc["audioStream"] = std::string(asBuf);
+                            recDirty = true;
+                        }
+
+                        bool stereo = rc.value("stereo", true);
+                        if (ImGui::Checkbox(CONCAT("Stereo##recsched_recstereo_", _this->name), &stereo)) { rc["stereo"] = stereo; recDirty = true; }
+
+                        bool ignoreSilence = rc.value("ignoreSilence", false);
+                        if (ImGui::Checkbox(CONCAT("Ignore silence##recsched_recignsil_", _this->name), &ignoreSilence)) { rc["ignoreSilence"] = ignoreSilence; recDirty = true; }
+
+                        bool dualChannel = rc.value("recordDualChannel", false);
+                        if (ImGui::Checkbox(CONCAT("Dual channel##recsched_recdual_", _this->name), &dualChannel)) { rc["recordDualChannel"] = dualChannel; recDirty = true; }
+
+                        char ntBuf[1024];
+                        strncpy(ntBuf, rc.value("nameTemplate", std::string("$t_$f_$h-$m-$s_$d-$M-$y")).c_str(), sizeof(ntBuf) - 1);
+                        ntBuf[sizeof(ntBuf) - 1] = 0;
+                        ImGui::LeftLabel("Name template");
+                        ImGui::FillWidth();
+                        if (ImGui::InputText(CONCAT("##recsched_recnt_", _this->name), ntBuf, sizeof(ntBuf))) {
+                            rc["nameTemplate"] = std::string(ntBuf);
+                            recDirty = true;
+                        }
+
+                        if (recDirty) { _this->saveConfig(); }
+                    }
+
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Schedule (start/stop time, once/repeating) isn't wired");
+                    ImGui::TextDisabled("up yet, and nothing fires automatically -- see");
+                    ImGui::TextDisabled("RECORDING_SCHEDULER_PLAN.md phases 4-5.");
 
                     if (ImGui::Button(CONCAT("Apply##recsched_edit_apply_", _this->name))) {
                         it->second.name = _this->editedName;

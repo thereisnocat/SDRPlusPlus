@@ -5,4 +5,4 @@ file(GLOB SRC "src/*.cpp")
 
 include(${SDRPP_MODULE_CMAKE})
 
-target_include_directories(recording_scheduler PRIVATE "src/")
+target_include_directories(recording_scheduler PRIVATE "src/" "../recorder/src")
