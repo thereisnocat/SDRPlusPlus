@@ -121,6 +121,13 @@ void SourceManager::applySourceConfig(const std::string& name, const nlohmann::j
     it->second->applyConfigHandler(cfg, it->second->ctx);
 }
 
+std::string SourceManager::getSourceModuleType(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
+    auto it = sources.find(name);
+    if (it == sources.end()) { return ""; }
+    return it->second->moduleType;
+}
+
 void SourceManager::selectSource(std::string name) {
     std::lock_guard<std::recursive_mutex> lck(mtx);
     if (sources.find(name) == sources.end()) {

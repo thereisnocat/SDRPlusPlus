@@ -74,6 +74,7 @@ public:
         handler.stream = &out;
         handler.captureConfigHandler = captureConfig;
         handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "rsr200_source";   // must match SDRPP_MOD_INFO's Name above
 
         // Two coherent channels, offered to core for the phasing front end -- the payoff
         // described in RSR200_PLAN.md section 7. Only registered while dual channel mode is

@@ -180,12 +180,19 @@ struct Entry {
     std::string status = "scheduled";   // placeholder until phase 5's engine gives it meaning
 
     // Phase 2: which radio this entry targets, and a captured snapshot of its settings.
-    // sourceModuleType (core::moduleManager.getInstanceModuleName(sourceName) at capture time)
-    // guards against applying a stale snapshot to a same-named-but-different-module source
-    // later (device swapped, name reused) -- not enforced yet (that's phase 5's job), just
-    // recorded now. sourceConfigSnapshot is opaque on purpose -- see source.h/
-    // RECORDING_SCHEDULER_PLAN.md section 2.2 -- this module never interprets its fields,
-    // only captures/stores/displays/re-applies it whole.
+    // sourceModuleType (sigpath::sourceManager.getSourceModuleType(sourceName) at capture
+    // time) guards against applying a stale snapshot to a same-named-but-different-module
+    // source later (device swapped, name reused) -- not enforced yet (that's phase 5's job),
+    // just recorded now. Deliberately *not* core::moduleManager.getInstanceModuleName(sourceName)
+    // (used here through 2026-08-15) -- sourceName is a source-registration name, a fixed
+    // display string every source module hardcodes ("RSR200", "RTL-SDR", ...), while
+    // ModuleManager's own lookup is keyed by instance name, a free-typed field with no
+    // default the user assigns in Module Manager. The two only coincide by convention, not
+    // guarantee -- confirmed live: this silently saved "" for the user's own RSR200 instance,
+    // since their instance name didn't happen to match the source name exactly.
+    // sourceConfigSnapshot is opaque on purpose -- see source.h/RECORDING_SCHEDULER_PLAN.md
+    // section 2.2 -- this module never interprets its fields, only captures/stores/displays/
+    // re-applies it whole.
     std::string sourceName;
     std::string sourceModuleType;
     // = json::object(), not the bare default (which nlohmann default-constructs as JSON
@@ -569,7 +576,7 @@ private:
                     if (ImGui::Button(CONCAT("Update from current settings##recsched_capture_", _this->name))) {
                         json snap = sigpath::sourceManager.captureSourceConfig(it->second.sourceName);
                         it->second.sourceConfigSnapshot = snap;
-                        it->second.sourceModuleType = core::moduleManager.getInstanceModuleName(it->second.sourceName);
+                        it->second.sourceModuleType = sigpath::sourceManager.getSourceModuleType(it->second.sourceName);
                         // Frequency is a waterfall/VFO-level concept, not per-source-module
                         // state like the settings snapshot -- only meaningful to grab it when
                         // this entry's radio is actually the one currently tuned.

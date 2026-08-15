@@ -76,6 +76,21 @@ public:
         // source.
         nlohmann::json (*captureConfigHandler)(void* ctx) = nullptr;
         void (*applyConfigHandler)(const nlohmann::json& cfg, void* ctx) = nullptr;
+
+        // Optional -- the registering module's own SDRPP_MOD_INFO name (e.g. "rsr200_source"),
+        // for callers that need to know which *module type* a given source name maps to
+        // (RECORDING_SCHEDULER_PLAN.md section 3's sourceModuleType, guarding a saved snapshot
+        // against later being applied to a same-named-but-different-module source). There is no
+        // reliable way to derive this after the fact: the string passed to registerSource() is a
+        // fixed display name every source module hardcodes ("RSR200", "RTL-SDR", "HackRF", ...),
+        // completely independent of whatever instance name the user typed when creating the
+        // module in Module Manager (a free-typed field with no default -- see
+        // core/src/gui/menus/module_manager.cpp's `modName` combo) -- the two only coincide by
+        // convention, not guarantee, so core::moduleManager.getInstanceModuleName(sourceName)
+        // silently returns empty for anyone who named their instance anything else. Left blank
+        // by any module that doesn't set it (matches every module's behavior before this field
+        // existed -- getSourceModuleType() below just returns "" for those, same as today).
+        std::string moduleType;
     };
 
     enum TuningMode {
@@ -109,6 +124,11 @@ public:
     // one that doesn't implement capture; applySourceConfig is a no-op in both those cases.
     nlohmann::json captureSourceConfig(const std::string& name);
     void applySourceConfig(const std::string& name, const nlohmann::json& cfg);
+
+    // The registering module's own SDRPP_MOD_INFO name for a given source name (see
+    // SourceHandler::moduleType above) -- empty for a nonexistent source or one whose module
+    // never set it.
+    std::string getSourceModuleType(const std::string& name);
 
     void selectSource(std::string name);
     void showSelectedMenu();
