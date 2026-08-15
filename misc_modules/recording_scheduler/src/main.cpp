@@ -1,6 +1,6 @@
 // Recording Scheduler -- schedule recordings by start/stop time, per entry, against a chosen
 // radio + Recorder settings. See RECORDING_SCHEDULER_PLAN.md at the repo root for the full
-// design and phased build order. This file currently covers phases 0-4 only:
+// design and phased build order. This file covers all five phases:
 //
 //   Phase 0: module skeleton -- builds/loads/toggles cleanly, empty menu panel.
 //   Phase 1: entry data model, own persisted config file, Add/Duplicate/Delete/Enable list UI.
@@ -9,10 +9,16 @@
 //   Phase 3: Recorder settings capture/edit (any Recorder instance -- that module's schema is
 //            fixed/known, unlike a radio's, so it's edited in place rather than opaque).
 //   Phase 4: recurrence editing -- Once/Daily/Weekly, start/stop time.
-//
-// Deliberately NOT here yet: the engine thread that actually fires anything. Every entry today
-// can be fully configured -- radio, recorder, and now when -- but nothing is ever applied or
-// started automatically. That's phase 5.
+//   Phase 5: the engine -- a background thread that actually fires/stops entries. Deliberately
+//            narrower in scope than the plan's own section 5: it automates the *Recorder*
+//            (start/stop/configure) safely (core::modComManager has its own locking), but does
+//            NOT automate *radio* switching/settings-apply -- sigpath::sourceManager has no
+//            locking of its own, and there's no existing per-frame hook safe to use from a
+//            background thread instead (see the engine's own comment, above tick(), for the
+//            full reasoning). An entry only fires if its target radio is already the selected,
+//            running source; otherwise it's skipped with a clear reason. Automating radio
+//            switching needs SourceManager locking added first -- deliberately left for later,
+//            separate work, not rushed in alongside this.
 //
 // New module, not an extension of the existing (abandoned, non-functional) misc_modules/
 // scheduler -- see RECORDING_SCHEDULER_PLAN.md section 0 for why.
@@ -31,6 +37,8 @@
 #include <string>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <ctime>
 #include <cstdio>
@@ -78,6 +86,47 @@ static std::string formatDateTime(int64_t epoch) {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     return std::string(buf);
+}
+
+static int64_t nowEpoch() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// True if `a` and `b` fall on the same local calendar day. Used to tell whether a daily/weekly
+// entry has already run today, since lastRunEpoch (set when a run *stops*, not starts) is the
+// only record kept of the last completed run -- see Entry::lastRunEpoch.
+static bool sameLocalDay(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) { return false; }
+    time_t ta = (time_t)a, tb = (time_t)b;
+    struct tm tma, tmb;
+#ifdef _WIN32
+    localtime_s(&tma, &ta);
+    localtime_s(&tmb, &tb);
+#else
+    localtime_r(&ta, &tma);
+    localtime_r(&tb, &tmb);
+#endif
+    return tma.tm_year == tmb.tm_year && tma.tm_yday == tmb.tm_yday;
+}
+
+static int timeOfDaySeconds(const std::string& s) {
+    int h = 0, mi = 0, se = 0;
+    sscanf(s.c_str(), "%d:%d:%d", &h, &mi, &se);
+    return h * 3600 + mi * 60 + se;
+}
+
+// Seconds since local midnight for `epoch`, and (via `wday`) which day of week it falls on --
+// 0=Sunday..6=Saturday, matching Recurrence::daysOfWeek's own indexing.
+static int nowTimeOfDaySeconds(int64_t epoch, int* wday) {
+    time_t t = (time_t)epoch;
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    if (wday) { *wday = tmv.tm_wday; }
+    return tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
 }
 
 // Once/Daily/Weekly, matching RECORDING_SCHEDULER_PLAN.md section 3's schema exactly.
@@ -158,6 +207,15 @@ struct Entry {
     // radio/recorder sections above already are).
     Recurrence recurrence;
 
+    // Phase 5: engine bookkeeping. lastRunEpoch/lastSkipReason are persisted (surfaced in the
+    // table, and part of the "kept, editable" story for expired one-shots -- section 3).
+    // currentRunStartEpoch is deliberately NOT persisted -- it only means anything while
+    // status=="running" in the current process; see loadConfig()'s startup reconciliation for
+    // what happens to an entry stuck at "running" from an unclean shutdown.
+    int64_t lastRunEpoch = 0;
+    std::string lastSkipReason;
+    int64_t currentRunStartEpoch = 0;
+
     bool selected = false;
 
     json toJson() const {
@@ -172,6 +230,8 @@ struct Entry {
         j["recorderName"] = recorderName;
         j["recorderConfigSnapshot"] = recorderConfigSnapshot;
         j["recurrence"] = recurrence.toJson();
+        j["lastRunEpoch"] = lastRunEpoch;
+        j["lastSkipReason"] = lastSkipReason;
         return j;
     }
 
@@ -187,6 +247,8 @@ struct Entry {
         if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
         if (j.contains("recorderName")) { e.recorderName = j["recorderName"]; }
         if (j.contains("recorderConfigSnapshot")) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
+        if (j.contains("lastRunEpoch")) { e.lastRunEpoch = j["lastRunEpoch"]; }
+        if (j.contains("lastSkipReason")) { e.lastSkipReason = j["lastSkipReason"]; }
         if (j.contains("recurrence")) { e.recurrence = Recurrence::fromJson(j["recurrence"]); }
         return e;
     }
@@ -211,9 +273,16 @@ public:
         this->name = name;
         gui::menu.registerEntry(name, menuHandler, this, NULL);
         loadConfig();
+        // Started here, not postInit() -- the engine's own first tick sleeps 1s before doing
+        // anything, which is ample time for the rest of the app's startup (doPostInitAll(),
+        // module registration) to finish well before the first real tick runs.
+        engineRun = true;
+        engineThread = std::thread(&RecordingSchedulerModule::engineWorker, this);
     }
 
     ~RecordingSchedulerModule() {
+        engineRun = false;
+        if (engineThread.joinable()) { engineThread.join(); }
         gui::menu.removeEntry(name);
     }
 
@@ -224,6 +293,7 @@ public:
 
 private:
     void loadConfig() {
+        std::lock_guard<std::recursive_mutex> lck(entriesMtx);
         config.acquire();
         entries.clear();
         if (config.conf.contains("entries")) {
@@ -232,9 +302,23 @@ private:
             }
         }
         config.release();
+        // Startup reconciliation: a "running" entry loaded from disk means the app closed
+        // (cleanly or not) while a scheduled recording was in progress. There is no way to
+        // know whether the Recorder itself is actually still running (it isn't -- it's a
+        // fresh process), so trust that and reset bookkeeping rather than leave a permanently
+        // stuck "running" status this session's engine would otherwise never revisit (its own
+        // due-checks only fire from "scheduled"/"ran", never re-examine "running" except for
+        // its own stop condition).
+        for (auto& [id, e] : entries) {
+            if (e.status == "running") {
+                e.status = "scheduled";
+                e.currentRunStartEpoch = 0;
+            }
+        }
     }
 
     void saveConfig() {
+        std::lock_guard<std::recursive_mutex> lck(entriesMtx);
         config.acquire();
         json ej;
         for (auto& [id, e] : entries) {
@@ -273,8 +357,139 @@ private:
         saveConfig();
     }
 
+    // ==================== Phase 5: engine ====================
+    //
+    // Ticks once a second, deciding which entries are due to start or stop and acting on it.
+    // Deliberately scoped narrower than RECORDING_SCHEDULER_PLAN.md section 5 describes:
+    // automating the *Recorder* (start/stop/configure) is safe to do from this background
+    // thread, because core::modComManager has its own internal recursive_mutex around every
+    // method (core/src/module_com.cpp) -- but automating the *radio* (selectSource/start/stop/
+    // tune/applySourceConfig, all on sigpath::sourceManager) is NOT safe today: SourceManager
+    // has no locking of its own at all, and is both read (every frame, via
+    // sourcemenu::draw()'s showSelectedMenu() call) and written (on user interaction) from the
+    // GUI thread continuously. There's also no existing per-frame hook this module could use
+    // to safely defer that work to the GUI thread instead -- a module's own menuHandler only
+    // runs while its panel is actually expanded (core/src/gui/widgets/menu.cpp's
+    // ImGui::CollapsingHeader gate), which defeats the purpose for something meant to run
+    // unattended with its panel collapsed.
+    //
+    // So for now: an entry only fires if its target radio is *already* the selected, running
+    // source (checked via cheap reads of getSelectedName()/sdrIsRunning() -- not a full write
+    // into SourceManager, and a narrow, low-realistic-risk gap on every platform this actually
+    // runs on, but a real one, not swept under the rug). Otherwise it's skipped with a clear
+    // reason. Automatic radio switching/settings-apply needs SourceManager locking added
+    // first, which is a deliberately separate, more careful piece of work -- not rushed in
+    // alongside this.
+
+    void engineWorker() {
+        while (engineRun) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!engineRun) { break; }
+            if (enabled) { tick(); }
+        }
+    }
+
+    // Only proceeds if the entry's target radio is already the selected + running source
+    // (see the big comment above) -- otherwise skips with a clear reason. Recorder start +
+    // config push both go through core::modComManager, which is safe to call from this thread.
+    void fireEntry(Entry& e) {
+        if (e.sourceName.empty() || sigpath::sourceManager.getSelectedName() != e.sourceName || !gui::mainWindow.sdrIsRunning()) {
+            e.status = "skipped";
+            e.lastSkipReason = "radio \"" + e.sourceName + "\" isn't currently selected and running "
+                                "(automatic radio switching isn't implemented yet)";
+            return;
+        }
+        if (e.recorderName.empty() || !core::modComManager.interfaceExists(e.recorderName)) {
+            e.status = "skipped";
+            e.lastSkipReason = "recorder \"" + e.recorderName + "\" not found";
+            return;
+        }
+        core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_SET_CONFIG, (void*)&e.recorderConfigSnapshot, nullptr);
+        core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_START, nullptr, nullptr);
+        e.status = "running";
+        e.currentRunStartEpoch = nowEpoch();
+    }
+
+    void stopEntryNow(Entry& e) {
+        if (!e.recorderName.empty() && core::modComManager.interfaceExists(e.recorderName)) {
+            core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_STOP, nullptr, nullptr);
+        }
+        e.status = "ran";
+        e.lastRunEpoch = nowEpoch();
+        e.currentRunStartEpoch = 0;
+    }
+
+    bool isStartDue(Entry& e, int64_t now) {
+        Recurrence& r = e.recurrence;
+        if (r.type == "once") {
+            if (e.status != "scheduled") { return false; }
+            if (r.startEpoch <= 0 || r.stopEpoch <= r.startEpoch) { return false; }
+            if (now >= r.stopEpoch) {
+                // Whole window passed without ever firing -- app almost certainly wasn't
+                // running through it. Mark it so rather than leave it silently "scheduled"
+                // forever for a window that's already gone; editing the date/time re-arms it
+                // (status back to "scheduled"), same as any other re-arm.
+                e.status = "skipped";
+                e.lastSkipReason = "missed -- the scheduled window passed while the app wasn't running";
+                return false;
+            }
+            return now >= r.startEpoch;
+        }
+        // daily/weekly
+        if (e.status != "scheduled" && e.status != "ran") { return false; }
+        if (e.status == "ran" && sameLocalDay(e.lastRunEpoch, now)) { return false; }
+        int wday;
+        int tod = nowTimeOfDaySeconds(now, &wday);
+        if (r.type == "weekly" && !r.daysOfWeek[wday]) { return false; }
+        return tod >= timeOfDaySeconds(r.startTimeOfDay);
+    }
+
+    bool isStopDue(Entry& e, int64_t now) {
+        Recurrence& r = e.recurrence;
+        if (r.type == "once") { return now >= r.stopEpoch; }
+        return now >= e.currentRunStartEpoch + (int64_t)r.durationMin * 60;
+    }
+
+    void tick() {
+        std::lock_guard<std::recursive_mutex> lck(entriesMtx);
+        int64_t now = nowEpoch();
+        bool dirty = false;
+
+        // At most one entry may be "running" at a time -- the whole app has exactly one
+        // active radio (SourceManager's own single-selected-source design), so two entries
+        // can never really run concurrently regardless of which radios they name.
+        bool somethingRunning = false;
+        for (auto& [id, e] : entries) { if (e.status == "running") { somethingRunning = true; } }
+
+        for (auto& [id, e] : entries) {
+            if (!e.enabled) { continue; }
+            if (e.status == "running") {
+                if (isStopDue(e, now)) { stopEntryNow(e); dirty = true; }
+                continue;
+            }
+            if (somethingRunning) { continue; }
+            std::string prevStatus = e.status;
+            if (isStartDue(e, now)) {
+                fireEntry(e);
+                somethingRunning = (e.status == "running");
+                dirty = true;
+            }
+            else if (e.status != prevStatus) {
+                // isStartDue() itself flagged a missed one-shot as skipped.
+                dirty = true;
+            }
+        }
+
+        if (dirty) { saveConfig(); }
+    }
+
     static void menuHandler(void* ctx) {
         RecordingSchedulerModule* _this = (RecordingSchedulerModule*)ctx;
+        // Held for the whole draw -- the engine thread (tick(), below) takes the same lock,
+        // so this GUI-thread frame and any concurrent engine tick can never touch `entries` at
+        // the same time. recursive_mutex: safe even though saveConfig()/addEntry()/etc. called
+        // from within this function also lock it themselves.
+        std::lock_guard<std::recursive_mutex> lck(_this->entriesMtx);
 
         // Edit popup -- opened on double-click, matching frequency_manager's own
         // double-click-to-edit convention. Phase 1+2 scope: name, enabled, and the radio
@@ -606,6 +821,9 @@ private:
 
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextUnformatted(e.status.c_str());
+                if (e.status == "skipped" && !e.lastSkipReason.empty() && ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", e.lastSkipReason.c_str());
+                }
 
                 ImGui::TableSetColumnIndex(2);
                 bool en = e.enabled;
@@ -650,14 +868,19 @@ private:
             _this->deleteEntry(_this->deleteTargetId);
         }
 
-        ImGui::TextDisabled("This module doesn't schedule anything yet -- entries are just");
-        ImGui::TextDisabled("stored/edited for now. See RECORDING_SCHEDULER_PLAN.md.");
+        ImGui::TextDisabled("Recorder start/stop is automated; the app must be running for");
+        ImGui::TextDisabled("an entry to fire. Automatic radio switching isn't implemented");
+        ImGui::TextDisabled("yet -- the target radio must already be selected and running.");
     }
 
     std::string name;
     bool enabled = true;
 
     std::map<std::string, Entry> entries;
+    std::recursive_mutex entriesMtx;
+
+    std::atomic<bool> engineRun{ false };
+    std::thread engineThread;
 
     std::string editedId;
     char editedName[1024] = { 0 };
