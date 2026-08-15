@@ -72,6 +72,8 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &out;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
 
         // Two coherent channels, offered to core for the phasing front end -- the payoff
         // described in RSR200_PLAN.md section 7. Only registered while dual channel mode is
@@ -633,6 +635,23 @@ private:
         d["atten2"] = atten2;
     }
 
+    // Reads the live per-device fields out of `d` -- shared by loadDeviceSettings() (reading
+    // this module's own persisted devices.<key> blob) and applyConfig() (the SourceHandler
+    // capture/apply hook, reading an externally-supplied snapshot -- see source.h and
+    // RECORDING_SCHEDULER_PLAN.md section 2.2).
+    void readDeviceSettingsJson(const json& d) {
+        if (d.contains("adcClockMHz")) { adcClockMHz = d["adcClockMHz"]; }
+        if (d.contains("gpsDiscipline")) { gpsDiscipline = d["gpsDiscipline"]; }
+        if (d.contains("decimExp")) { decimExp = d["decimExp"]; }
+        if (d.contains("bits24")) { bits24 = d["bits24"]; }
+        if (d.contains("dualChannel")) { dualChannel = d["dualChannel"]; }
+        if (d.contains("swapChannels")) { swapChannels = d["swapChannels"]; }
+        if (d.contains("useVhf")) { useVhf = d["useVhf"]; }
+        if (d.contains("vhfPreamp")) { vhfPreamp = d["vhfPreamp"]; }
+        if (d.contains("atten1")) { atten1 = d["atten1"]; }
+        if (d.contains("atten2")) { atten2 = d["atten2"]; }
+    }
+
     // (Re)loads the per-device fields for whatever currentDeviceKey() is *right now* into the
     // live fields. Called once at construction (after the flat fields below are loaded, so the
     // key is already known) and again at the top of start() -- mirroring rfspace_source/
@@ -647,17 +666,33 @@ private:
         bool isNew = !config.conf["devices"].contains(key);
         json& d = config.conf["devices"][key];
         if (isNew) { writeDeviceSettingsJson(d); }
-        if (d.contains("adcClockMHz")) { adcClockMHz = d["adcClockMHz"]; }
-        if (d.contains("gpsDiscipline")) { gpsDiscipline = d["gpsDiscipline"]; }
-        if (d.contains("decimExp")) { decimExp = d["decimExp"]; }
-        if (d.contains("bits24")) { bits24 = d["bits24"]; }
-        if (d.contains("dualChannel")) { dualChannel = d["dualChannel"]; }
-        if (d.contains("swapChannels")) { swapChannels = d["swapChannels"]; }
-        if (d.contains("useVhf")) { useVhf = d["useVhf"]; }
-        if (d.contains("vhfPreamp")) { vhfPreamp = d["vhfPreamp"]; }
-        if (d.contains("atten1")) { atten1 = d["atten1"]; }
-        if (d.contains("atten2")) { atten2 = d["atten2"]; }
+        readDeviceSettingsJson(d);
         config.release(isNew);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- lets an external
+    // module (the recording scheduler) capture/reproduce this radio's settings without going
+    // through config.conf["devices"][...] at all, sidestepping the "re-selecting a source
+    // doesn't reload from disk" problem that section applies to every module, this one
+    // included (RECORDING_SCHEDULER_PLAN.md section 2.2).
+    static json captureConfig(void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        json d;
+        _this->writeDeviceSettingsJson(d);
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        RSR200SourceModule* _this = (RSR200SourceModule*)ctx;
+        _this->readDeviceSettingsJson(cfg);
+        _this->saveConfig();
+        // Must be safe to call whether or not RSR200 is the currently selected source (a
+        // scheduled apply may target a radio that isn't active right now) -- setInputSampleRate
+        // affects whatever source *is* selected, so only touch it when that's actually this one,
+        // matching every other rate-affecting control in menuHandler below.
+        if (sigpath::sourceManager.getSelectedName() == "RSR200") {
+            core::setInputSampleRate(_this->buildConfig().sampleRateHz());
+        }
     }
 
     // Scans currently-connected D3XX devices and re-syncs usbDeviceId to whichever one

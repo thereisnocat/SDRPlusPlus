@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <json.hpp>
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <utils/event.h>
@@ -21,6 +22,27 @@ public:
         void (*stopHandler)(void* ctx);
         void (*tuneHandler)(double freq, void* ctx);
         void* ctx;
+
+        // Optional, additive -- both null by default, so every existing source module keeps
+        // compiling and behaving identically without any change on their part. Lets an
+        // external module (the recording scheduler -- RECORDING_SCHEDULER_PLAN.md section 2.2)
+        // capture a snapshot of this source's current settings and re-apply it later, without
+        // knowing anything about that source's own field names/semantics. There is no reliable
+        // way to get this "for free" from a module's own persisted config: re-selecting a
+        // source (selectHandler above) does not reload its settings from disk in any module
+        // checked so far (RECORDING_SCHEDULER_PLAN.md section 2.2's survey, corrected
+        // 2026-08-15 -- this was first thought to work for some modules and does not).
+        //
+        // captureConfigHandler returns an opaque snapshot of the source's current live
+        // settings (empty json{} if unimplemented). applyConfigHandler applies a
+        // previously-captured snapshot back -- must be safe to call whether or not this source
+        // is currently the selected/running one (a scheduled apply may target a radio that
+        // isn't active right now), so implementations must not assume they can safely touch
+        // anything beyond their own live fields and config file -- e.g. not call
+        // core::setInputSampleRate() unless first confirming they're actually the selected
+        // source.
+        nlohmann::json (*captureConfigHandler)(void* ctx) = nullptr;
+        void (*applyConfigHandler)(const nlohmann::json& cfg, void* ctx) = nullptr;
     };
 
     enum TuningMode {
@@ -42,6 +64,13 @@ public:
     // Name of the currently selected source, empty if none. Lets a module key its
     // settings per radio rather than sharing one set across all of them.
     const std::string& getSelectedName() const { return selectedName; }
+
+    // Capture/apply a named source's settings via its optional captureConfigHandler/
+    // applyConfigHandler (above) -- works regardless of whether `name` is the currently
+    // selected source. captureSourceConfig returns empty json{} for a nonexistent source or
+    // one that doesn't implement capture; applySourceConfig is a no-op in both those cases.
+    nlohmann::json captureSourceConfig(const std::string& name);
+    void applySourceConfig(const std::string& name, const nlohmann::json& cfg);
 
     void selectSource(std::string name);
     void showSelectedMenu();

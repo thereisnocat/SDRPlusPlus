@@ -95,6 +95,18 @@ std::vector<std::string> SourceManager::getSourceNames() {
     return names;
 }
 
+nlohmann::json SourceManager::captureSourceConfig(const std::string& name) {
+    auto it = sources.find(name);
+    if (it == sources.end() || it->second->captureConfigHandler == NULL) { return nlohmann::json{}; }
+    return it->second->captureConfigHandler(it->second->ctx);
+}
+
+void SourceManager::applySourceConfig(const std::string& name, const nlohmann::json& cfg) {
+    auto it = sources.find(name);
+    if (it == sources.end() || it->second->applyConfigHandler == NULL) { return; }
+    it->second->applyConfigHandler(cfg, it->second->ctx);
+}
+
 void SourceManager::selectSource(std::string name) {
     if (sources.find(name) == sources.end()) {
         flog::error("Tried to select non existent source: {0}", name);

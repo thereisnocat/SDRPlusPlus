@@ -1,14 +1,16 @@
 // Recording Scheduler -- schedule recordings by start/stop time, per entry, against a chosen
 // radio + Recorder settings. See RECORDING_SCHEDULER_PLAN.md at the repo root for the full
-// design and phased build order. This file currently covers phases 0-1 only:
+// design and phased build order. This file currently covers phases 0-2 only:
 //
 //   Phase 0: module skeleton -- builds/loads/toggles cleanly, empty menu panel.
 //   Phase 1: entry data model, own persisted config file, Add/Duplicate/Delete/Enable list UI.
+//   Phase 2: radio settings capture/apply/view (RSR200 only for now -- the only source module
+//            that implements SourceHandler::captureConfigHandler/applyConfigHandler so far).
 //
-// Deliberately NOT here yet (later phases, see the plan doc): recurrence editing, radio
-// settings capture/apply, Recorder settings capture/apply, and the engine thread that actually
-// fires anything. An entry today is just a named, enabled/disabled, persisted, re-orderable
-// row -- inert otherwise.
+// Deliberately NOT here yet (later phases, see the plan doc): recurrence editing, Recorder
+// settings capture/apply, and the engine thread that actually fires anything. An entry today
+// picks a radio and can capture/view its settings, but nothing ever applies them automatically
+// -- that's phase 5.
 //
 // New module, not an extension of the existing (abandoned, non-functional) misc_modules/
 // scheduler -- see RECORDING_SCHEDULER_PLAN.md section 0 for why.
@@ -20,6 +22,7 @@
 #include <gui/dialogs/dialog_box.h>
 #include <config.h>
 #include <core.h>
+#include <signal_path/signal_path.h>
 #include <map>
 #include <string>
 #include <chrono>
@@ -48,6 +51,18 @@ struct Entry {
     bool enabled = true;
     std::string status = "scheduled";   // placeholder until phase 5's engine gives it meaning
 
+    // Phase 2: which radio this entry targets, and a captured snapshot of its settings.
+    // sourceModuleType (core::moduleManager.getInstanceModuleName(sourceName) at capture time)
+    // guards against applying a stale snapshot to a same-named-but-different-module source
+    // later (device swapped, name reused) -- not enforced yet (that's phase 5's job), just
+    // recorded now. sourceConfigSnapshot is opaque on purpose -- see source.h/
+    // RECORDING_SCHEDULER_PLAN.md section 2.2 -- this module never interprets its fields,
+    // only captures/stores/displays/re-applies it whole.
+    std::string sourceName;
+    std::string sourceModuleType;
+    json sourceConfigSnapshot;
+    int64_t sourceConfigCapturedAt = 0;   // unix seconds, 0 = never captured
+
     bool selected = false;
 
     json toJson() const {
@@ -55,6 +70,10 @@ struct Entry {
         j["name"] = name;
         j["enabled"] = enabled;
         j["status"] = status;
+        j["sourceName"] = sourceName;
+        j["sourceModuleType"] = sourceModuleType;
+        j["sourceConfigSnapshot"] = sourceConfigSnapshot;
+        j["sourceConfigCapturedAt"] = sourceConfigCapturedAt;
         return j;
     }
 
@@ -64,6 +83,10 @@ struct Entry {
         if (j.contains("name")) { e.name = j["name"]; }
         if (j.contains("enabled")) { e.enabled = j["enabled"]; }
         if (j.contains("status")) { e.status = j["status"]; }
+        if (j.contains("sourceName")) { e.sourceName = j["sourceName"]; }
+        if (j.contains("sourceModuleType")) { e.sourceModuleType = j["sourceModuleType"]; }
+        if (j.contains("sourceConfigSnapshot")) { e.sourceConfigSnapshot = j["sourceConfigSnapshot"]; }
+        if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
         return e;
     }
 };
@@ -153,7 +176,9 @@ private:
         RecordingSchedulerModule* _this = (RecordingSchedulerModule*)ctx;
 
         // Edit popup -- opened on double-click, matching frequency_manager's own
-        // double-click-to-edit convention. Phase 1 scope: name + enabled only.
+        // double-click-to-edit convention. Phase 1+2 scope: name, enabled, and the radio
+        // section (pick a source, capture/view its settings). Recurrence and Recorder
+        // sections are still phases 3-4.
         if (!_this->editedId.empty()) {
             gui::mainWindow.lockWaterfallControls = true;
             std::string popupId = "Edit Schedule Entry##recsched_edit_" + _this->name;
@@ -167,8 +192,53 @@ private:
                     ImGui::LeftLabel("Name");
                     if (ImGui::InputText(CONCAT("##recsched_edit_name_", _this->name), _this->editedName, sizeof(_this->editedName))) {}
                     ImGui::Checkbox(CONCAT("Enabled##recsched_edit_enabled_", _this->name), &it->second.enabled);
-                    ImGui::TextDisabled("Schedule/radio/recorder settings aren't wired up yet");
-                    ImGui::TextDisabled("(RECORDING_SCHEDULER_PLAN.md phases 2-5).");
+
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Radio");
+
+                    auto sourceNames = sigpath::sourceManager.getSourceNames();
+                    int srcId = -1;
+                    std::string srcItems;
+                    for (size_t i = 0; i < sourceNames.size(); i++) {
+                        if (sourceNames[i] == it->second.sourceName) { srcId = (int)i; }
+                        srcItems += sourceNames[i];
+                        srcItems += '\0';
+                    }
+                    srcItems += '\0';
+                    int comboId = (srcId < 0) ? 0 : srcId;
+                    ImGui::LeftLabel("Source");
+                    ImGui::FillWidth();
+                    if (!sourceNames.empty() && ImGui::Combo(CONCAT("##recsched_src_", _this->name), &comboId, srcItems.c_str())) {
+                        it->second.sourceName = sourceNames[comboId];
+                    }
+                    if (sourceNames.empty()) { ImGui::TextDisabled("No radios currently registered."); }
+
+                    bool haveSource = !it->second.sourceName.empty();
+                    if (!haveSource) { style::beginDisabled(); }
+                    if (ImGui::Button(CONCAT("Update from current settings##recsched_capture_", _this->name))) {
+                        json snap = sigpath::sourceManager.captureSourceConfig(it->second.sourceName);
+                        it->second.sourceConfigSnapshot = snap;
+                        it->second.sourceModuleType = core::moduleManager.getInstanceModuleName(it->second.sourceName);
+                        it->second.sourceConfigCapturedAt = snap.empty() ? 0 :
+                            (int64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        _this->saveConfig();
+                    }
+                    ImGui::SameLine();
+                    bool haveSnapshot = !it->second.sourceConfigSnapshot.empty();
+                    if (!haveSnapshot) { style::beginDisabled(); }
+                    if (ImGui::Button(CONCAT("View saved settings##recsched_view_", _this->name))) {
+                        _this->showViewSettings = true;
+                    }
+                    if (!haveSnapshot) { style::endDisabled(); }
+                    if (!haveSource) { style::endDisabled(); }
+
+                    if (haveSource && it->second.sourceConfigCapturedAt != 0) {
+                        ImGui::Text("Settings captured for %s.", it->second.sourceName.c_str());
+                    }
+
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Schedule/recorder settings aren't wired up yet");
+                    ImGui::TextDisabled("(RECORDING_SCHEDULER_PLAN.md phases 3-5).");
 
                     if (ImGui::Button(CONCAT("Apply##recsched_edit_apply_", _this->name))) {
                         it->second.name = _this->editedName;
@@ -178,6 +248,31 @@ private:
                     ImGui::SameLine();
                     if (ImGui::Button(CONCAT("Cancel##recsched_edit_cancel_", _this->name))) {
                         _this->editedId.clear();
+                    }
+
+                    // Read-only dump of the captured snapshot -- deliberately just a raw
+                    // JSON text block, not a per-field editor: this module doesn't know (and
+                    // per RECORDING_SCHEDULER_PLAN.md section 2.2, deliberately doesn't need
+                    // to know) what any of a given radio's fields mean. Never touches
+                    // sigpath::sourceManager, so viewing this can't disturb whatever's
+                    // actually running right now -- satisfies plan requirement 6.
+                    if (_this->showViewSettings) {
+                        std::string viewId = "Saved Settings##recsched_view_popup_" + _this->name;
+                        ImGui::OpenPopup(viewId.c_str());
+                        if (ImGui::BeginPopup(viewId.c_str(), ImGuiWindowFlags_NoResize)) {
+                            std::string dump = it->second.sourceConfigSnapshot.dump(2);
+                            ImGui::InputTextMultiline(CONCAT("##recsched_view_text_", _this->name),
+                                                       (char*)dump.c_str(), dump.size() + 1,
+                                                       ImVec2(400.0f * style::uiScale, 300.0f * style::uiScale),
+                                                       ImGuiInputTextFlags_ReadOnly);
+                            if (ImGui::Button(CONCAT("Close##recsched_view_close_", _this->name))) {
+                                _this->showViewSettings = false;
+                            }
+                            ImGui::EndPopup();
+                        }
+                        else {
+                            _this->showViewSettings = false;
+                        }
                     }
                 }
                 ImGui::EndPopup();
@@ -270,6 +365,8 @@ private:
 
     bool showDeleteConfirm = false;
     std::string deleteTargetId;
+
+    bool showViewSettings = false;
 };
 
 MOD_EXPORT void _INIT_() {
