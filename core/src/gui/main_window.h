@@ -48,6 +48,20 @@ private:
     float fftMin = -70.0;
     float fftMax = 0.0;
     float bw = 8000000;
+    // `playing` used to be touched only from the GUI thread (the Play/Stop button, ultimately
+    // via setPlayState()); the recording scheduler's engine thread (RECORDING_SCHEDULER_PLAN.md
+    // phase 5, extended 2026-08-15 to actually call setPlayState() once sigpath::sourceManager
+    // itself was made thread-safe) is the first thing to call setPlayState()/sdrIsRunning()/
+    // isPlaying() from anywhere else. recursive_mutex: setPlayState() calls
+    // sigpath::sourceManager.start()/stop()/tune(), which is safe on its own now, but
+    // onPlayStateChange.emit() (Event::emit() calls handlers synchronously on the calling
+    // thread, utils/event.h) could in principle reach back into isPlaying()/sdrIsRunning() on
+    // the same thread -- same-thread reentry, which recursive_mutex allows and plain
+    // std::mutex would deadlock on. Never held while calling into core::modComManager or
+    // acquiring sigpath::sourceManager's own lock from a *different* nesting order than
+    // setPlayState()'s own (this lock outer, SourceManager's inner) -- matches the ordering
+    // discipline documented in core/src/signal_path/source.h.
+    mutable std::recursive_mutex playStateMtx;
     bool playing = false;
     bool showCredits = false;
     std::string audioStreamName = "";

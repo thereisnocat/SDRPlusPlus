@@ -1,8 +1,13 @@
 # Recording Scheduler: design & implementation plan
 
-**Status: 2026-08-15 — PLANNING, not started.** This document is the plan only. Whether/when
-implementation begins is a separate decision (per the user: depends on session budget left
-after the plan itself is written). No branch, module directory, or CMake change exists yet.
+**Status: 2026-08-15 — All five phases implemented**, on branch `recordingScheduler`, not yet
+merged into `working`. Phase 5 (the engine) shipped in two steps the same day: first scoped to
+Recorder-only automation (radio switching held back because `SourceManager` had no locking of
+its own and a background thread touching it would have raced the GUI thread), then extended to
+the full design once `SourceManager` and `MainWindow`'s play-state each gained a
+`std::recursive_mutex` for exactly this purpose. See those two commits' own messages for the
+full reasoning; the substance is also folded into section 2.1 below. Phase 6 (a second radio
+module) is the only phase from the original plan not started.
 
 ## 0. Why a new module, not `misc_modules/scheduler`
 
@@ -70,6 +75,24 @@ Source instances are looked up by name via `sigpath::sourceManager.getSourceName
 (`source.h:75`) and switched with `selectSource(name)` (`source.h:46`, implemented
 `source.cpp`); `start()`/`stop()`/`tune()` round out the control surface the scheduler needs
 (`source.h:48-50`).
+
+**Update, 2026-08-15:** at the time phase 5 (the engine) was first built, none of this was
+actually safe to call from a background thread — `SourceManager` had no locking of its own,
+and its state (`sources`/`selectedName`/`selectedHandler`) was read every frame by the GUI
+thread (`sourcemenu::draw()`'s `showSelectedMenu()` call). Phase 5 initially shipped with radio
+automation held back for exactly that reason, then `SourceManager` (and `MainWindow`'s own
+`playing` flag, which the engine also needs — see below) gained a `std::recursive_mutex` each,
+and the engine was extended to the full design the same day. See `source.h`'s own top-of-file
+comment for the full locking design (why `std::recursive_mutex`, why the lock is held across
+the `SourceHandler` callback itself, and the lock-ordering invariant against
+`ModuleComManager`).
+
+One more wrinkle worth recording: `MainWindow::playing` (what the main Play/Stop button
+displays) is a *separate* flag from anything `SourceManager` tracks. Calling
+`sigpath::sourceManager.start()`/`stop()` directly from the engine — bypassing
+`MainWindow::setPlayState()` — would desync the button's displayed state from the radio's
+actual state. The engine calls `gui::mainWindow.setPlayState()` instead, and that gained its
+own lock alongside `SourceManager`'s for the same reason (`core/src/gui/main_window.h`/`.cpp`).
 
 ### 2.2 No generic "get/reproduce a radio's settings" hook exists — this is the central open problem
 
