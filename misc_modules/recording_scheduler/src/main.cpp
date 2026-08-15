@@ -188,7 +188,14 @@ struct Entry {
     // only captures/stores/displays/re-applies it whole.
     std::string sourceName;
     std::string sourceModuleType;
-    json sourceConfigSnapshot;
+    // = json::object(), not the bare default (which nlohmann default-constructs as JSON
+    // *null*, not {}) -- recorderConfigSnapshot's own .value() calls below throw on a null
+    // json (crash, confirmed 2026-08-15: selecting a Recorder for the first time on a fresh
+    // entry hit this immediately, since it starts out never having been assigned). Kept
+    // consistent here too even though nothing currently calls .value() on this one --
+    // .empty()/.dump() (used for it) are null-safe, but no reason to leave a second latent
+    // trap for the next thing that touches it.
+    json sourceConfigSnapshot = json::object();
     int64_t sourceConfigCapturedAt = 0;   // unix seconds, 0 = never captured
     double frequency = 0.0;               // captured VFO/tune frequency, 0 = never captured;
                                            // applied via sigpath::sourceManager.tune() at fire
@@ -202,7 +209,12 @@ struct Entry {
     // field set, so this module can reasonably know its schema). "Reset to current" overwrites
     // it wholesale from RECORDER_IFACE_CMD_GET_CONFIG; otherwise it's just edited here directly.
     std::string recorderName;
-    json recorderConfigSnapshot;
+    // json::object(), not the bare default -- see sourceConfigSnapshot's comment above. This
+    // is the field that actually crashed: rc.value("mode", 0) etc. (menuHandler's Recorder
+    // field editor, below) throws on a null json, and a fresh Entry's default-constructed
+    // json member is null, not {} -- so selecting a Recorder for the very first time on any
+    // entry crashed immediately, every time, before this fix.
+    json recorderConfigSnapshot = json::object();
 
     // Phase 4: when this entry runs. Default matches Recurrence's own default (a "once" entry
     // with no start/stop set yet -- a freshly Added entry is inert until edited, same as its
@@ -246,11 +258,16 @@ struct Entry {
         if (j.contains("status")) { e.status = j["status"]; }
         if (j.contains("sourceName")) { e.sourceName = j["sourceName"]; }
         if (j.contains("sourceModuleType")) { e.sourceModuleType = j["sourceModuleType"]; }
-        if (j.contains("sourceConfigSnapshot")) { e.sourceConfigSnapshot = j["sourceConfigSnapshot"]; }
+        // .is_object() guard, not just .contains(): a config file saved before 2026-08-15's
+        // fix may have "sourceConfigSnapshot"/"recorderConfigSnapshot" stored as JSON null
+        // (toJson() happily serialized whatever a fresh Entry's then-default-null member
+        // held) -- loading that back verbatim would undo the fix and reintroduce the crash.
+        // Falls through to the json::object() default set at the member declaration.
+        if (j.contains("sourceConfigSnapshot") && j["sourceConfigSnapshot"].is_object()) { e.sourceConfigSnapshot = j["sourceConfigSnapshot"]; }
         if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
         if (j.contains("frequency")) { e.frequency = j["frequency"]; }
         if (j.contains("recorderName")) { e.recorderName = j["recorderName"]; }
-        if (j.contains("recorderConfigSnapshot")) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
+        if (j.contains("recorderConfigSnapshot") && j["recorderConfigSnapshot"].is_object()) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
         if (j.contains("lastRunEpoch")) { e.lastRunEpoch = j["lastRunEpoch"]; }
         if (j.contains("lastSkipReason")) { e.lastSkipReason = j["lastSkipReason"]; }
         if (j.contains("recurrence")) { e.recurrence = Recurrence::fromJson(j["recurrence"]); }
@@ -622,6 +639,14 @@ private:
                     if (!haveRecorder) { style::endDisabled(); }
 
                     if (haveRecorder) {
+                        // Belt-and-suspenders on top of the Entry-struct default and the
+                        // fromJson() guard (both 2026-08-15): a config file saved by a build
+                        // before this fix can still have a literal JSON null on disk. Normalize
+                        // right at the point of use too, so this can never crash regardless of
+                        // how a non-object value got here.
+                        if (!it->second.recorderConfigSnapshot.is_object()) {
+                            it->second.recorderConfigSnapshot = json::object();
+                        }
                         json& rc = it->second.recorderConfigSnapshot;
                         bool recDirty = false;
 
