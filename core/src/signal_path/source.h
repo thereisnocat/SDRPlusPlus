@@ -3,12 +3,45 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <mutex>
 #include <json.hpp>
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <utils/event.h>
 #include "channel_set.h"
 
+// Every public method here locks `mtx` (below) for its whole body, including whatever
+// SourceHandler callback it invokes (selectHandler/startHandler/.../captureConfigHandler) --
+// added 2026-08-15 alongside the recording scheduler's engine thread (RECORDING_SCHEDULER_PLAN.md
+// phase 5), the first thing in this codebase to call into SourceManager from anywhere other
+// than the GUI thread. Before that, `sources`/`selectedName`/`selectedHandler`/etc. had no
+// synchronization at all -- fine when only the GUI thread ever touched them (every frame, via
+// sourcemenu::draw()'s showSelectedMenu() call), a genuine data race once a second thread does.
+//
+// std::recursive_mutex, not std::mutex: setTuningOffset()/setTuningMode()/setPanadapterIF() all
+// call tune() internally, and Event::emit() (utils/event.h) calls every bound handler
+// synchronously on the calling thread -- e.g. unregisterSource()'s onSourceUnregistered can
+// reach back into sourcemenu::onSourcesChanged(), which calls SourceManager::selectSource()
+// again, same thread, while the outer unregisterSource() call is still on the stack. Both are
+// same-thread re-entry, which recursive_mutex allows and plain std::mutex would deadlock on.
+//
+// Held across the handler call itself (not released-then-reacquired around it), matching
+// ModuleComManager::callInterface's own established pattern (core/src/module_com.cpp) --
+// accepted here for the same reason it was accepted there: a handler that blocks for a while
+// (RSR200's start(), for instance, opening USB or connecting over LAN) already stalls the GUI
+// thread today regardless of this lock, since source start/stop has always run synchronously
+// on whichever thread calls it. This lock adds a small, honest cost on top of that pre-existing
+// behavior -- a second caller (e.g. the engine thread trying to read getSelectedName() while
+// the GUI thread is mid-start()) waits for that same call to finish, rather than racing it.
+//
+// Lock-ordering invariant, to avoid a deadlock between this mutex and ModuleComManager's own:
+// RecorderModule::start()/stop() call sigpath::sourceManager.lockTuning() while
+// ModuleComManager::mtx is held (reached via callInterface()) -- i.e. ModuleComManager is the
+// *outer* lock, SourceManager the *inner* one, in that one path. Nothing in this class may call
+// into ModuleComManager (directly or transitively) while holding `mtx` -- that would be the
+// reverse nesting and a real deadlock risk against the path above. In particular, no
+// SourceHandler callback (captureConfigHandler/applyConfigHandler included) may call
+// core::modComManager, only its own module's fields/config.
 class SourceManager {
 public:
     SourceManager();
@@ -62,8 +95,13 @@ public:
     ChannelSet* getChannels(const std::string& name);
 
     // Name of the currently selected source, empty if none. Lets a module key its
-    // settings per radio rather than sharing one set across all of them.
-    const std::string& getSelectedName() const { return selectedName; }
+    // settings per radio rather than sharing one set across all of them. Returns a copy, not
+    // a reference -- a reference into `selectedName` would let a caller read it outside the
+    // lock that's supposed to protect it, exactly the kind of race this whole locking scheme
+    // exists to close. (Existing callers that bind the result to `const std::string&` still
+    // work unchanged -- that extends the temporary's lifetime to the reference's scope, same
+    // as binding to any other prvalue.)
+    std::string getSelectedName() const;
 
     // Capture/apply a named source's settings via its optional captureConfigHandler/
     // applyConfigHandler (above) -- works regardless of whether `name` is the currently
@@ -98,8 +136,17 @@ public:
     // Parenthesised (std::max) -- windows.h's max() macro turns an unparenthesised
     // std::max(...) in a header into error C2589 on MSVC. Same trap as bare M_PI; see
     // ENGINEERING_NOTES.md / project memory for the others this has already caught.
-    void lockTuning(bool locked) { tuningLockCount = (std::max)(0, tuningLockCount + (locked ? 1 : -1)); }
-    bool isTuningLocked() const { return tuningLockCount > 0; }
+    // Reached from RecorderModule::start()/stop() while ModuleComManager::mtx is already held
+    // (via callInterface()) -- ModuleComManager outer, SourceManager inner, consistent with
+    // the lock-ordering invariant documented at the top of this file.
+    void lockTuning(bool locked) {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        tuningLockCount = (std::max)(0, tuningLockCount + (locked ? 1 : -1));
+    }
+    bool isTuningLocked() const {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        return tuningLockCount > 0;
+    }
 
     std::vector<std::string> getSourceNames();
 
@@ -112,8 +159,12 @@ public:
 
 private:
     // Point the IQ front end at either the phaser's output or the source's own stream,
-    // depending on whether the selected source currently offers channels.
+    // depending on whether the selected source currently offers channels. Private and only
+    // ever called from methods that already hold `mtx` -- does not lock it itself.
     void updateInput();
+
+    // See the big comment at the top of this file for what this protects and why.
+    mutable std::recursive_mutex mtx;
 
     std::map<std::string, SourceHandler*> sources;
     std::map<std::string, ChannelSet*> channelSets;

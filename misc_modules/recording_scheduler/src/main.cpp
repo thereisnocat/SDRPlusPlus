@@ -9,16 +9,13 @@
 //   Phase 3: Recorder settings capture/edit (any Recorder instance -- that module's schema is
 //            fixed/known, unlike a radio's, so it's edited in place rather than opaque).
 //   Phase 4: recurrence editing -- Once/Daily/Weekly, start/stop time.
-//   Phase 5: the engine -- a background thread that actually fires/stops entries. Deliberately
-//            narrower in scope than the plan's own section 5: it automates the *Recorder*
-//            (start/stop/configure) safely (core::modComManager has its own locking), but does
-//            NOT automate *radio* switching/settings-apply -- sigpath::sourceManager has no
-//            locking of its own, and there's no existing per-frame hook safe to use from a
-//            background thread instead (see the engine's own comment, above tick(), for the
-//            full reasoning). An entry only fires if its target radio is already the selected,
-//            running source; otherwise it's skipped with a clear reason. Automating radio
-//            switching needs SourceManager locking added first -- deliberately left for later,
-//            separate work, not rushed in alongside this.
+//   Phase 5: the engine -- a background thread that fires/stops entries. Automates both the
+//            radio (select/start/apply-settings/tune) and the Recorder (configure/start/stop),
+//            per the plan's own section 5. Radio automation initially shipped narrower than
+//            that -- sigpath::sourceManager had no locking of its own, so a background thread
+//            calling into it would have raced the GUI thread -- and was extended to the full
+//            design the same day, once source.h/.cpp and MainWindow's own play-state gained
+//            the locking this needed (see the engine's own comment, above tick(), for details).
 //
 // New module, not an extension of the existing (abandoned, non-functional) misc_modules/
 // scheduler -- see RECORDING_SCHEDULER_PLAN.md section 0 for why.
@@ -193,6 +190,11 @@ struct Entry {
     std::string sourceModuleType;
     json sourceConfigSnapshot;
     int64_t sourceConfigCapturedAt = 0;   // unix seconds, 0 = never captured
+    double frequency = 0.0;               // captured VFO/tune frequency, 0 = never captured;
+                                           // applied via sigpath::sourceManager.tune() at fire
+                                           // time (phase 5) -- captured alongside the radio
+                                           // snapshot since it's the same "current settings" the
+                                           // user means when hitting that button.
 
     // Phase 3: which Recorder instance this entry targets, and its settings -- unlike the
     // radio snapshot above, this one *is* editable in place (RECORDING_SCHEDULER_PLAN.md
@@ -227,6 +229,7 @@ struct Entry {
         j["sourceModuleType"] = sourceModuleType;
         j["sourceConfigSnapshot"] = sourceConfigSnapshot;
         j["sourceConfigCapturedAt"] = sourceConfigCapturedAt;
+        j["frequency"] = frequency;
         j["recorderName"] = recorderName;
         j["recorderConfigSnapshot"] = recorderConfigSnapshot;
         j["recurrence"] = recurrence.toJson();
@@ -245,6 +248,7 @@ struct Entry {
         if (j.contains("sourceModuleType")) { e.sourceModuleType = j["sourceModuleType"]; }
         if (j.contains("sourceConfigSnapshot")) { e.sourceConfigSnapshot = j["sourceConfigSnapshot"]; }
         if (j.contains("sourceConfigCapturedAt")) { e.sourceConfigCapturedAt = j["sourceConfigCapturedAt"]; }
+        if (j.contains("frequency")) { e.frequency = j["frequency"]; }
         if (j.contains("recorderName")) { e.recorderName = j["recorderName"]; }
         if (j.contains("recorderConfigSnapshot")) { e.recorderConfigSnapshot = j["recorderConfigSnapshot"]; }
         if (j.contains("lastRunEpoch")) { e.lastRunEpoch = j["lastRunEpoch"]; }
@@ -360,26 +364,29 @@ private:
     // ==================== Phase 5: engine ====================
     //
     // Ticks once a second, deciding which entries are due to start or stop and acting on it.
-    // Deliberately scoped narrower than RECORDING_SCHEDULER_PLAN.md section 5 describes:
-    // automating the *Recorder* (start/stop/configure) is safe to do from this background
-    // thread, because core::modComManager has its own internal recursive_mutex around every
-    // method (core/src/module_com.cpp) -- but automating the *radio* (selectSource/start/stop/
-    // tune/applySourceConfig, all on sigpath::sourceManager) is NOT safe today: SourceManager
-    // has no locking of its own at all, and is both read (every frame, via
-    // sourcemenu::draw()'s showSelectedMenu() call) and written (on user interaction) from the
-    // GUI thread continuously. There's also no existing per-frame hook this module could use
-    // to safely defer that work to the GUI thread instead -- a module's own menuHandler only
-    // runs while its panel is actually expanded (core/src/gui/widgets/menu.cpp's
-    // ImGui::CollapsingHeader gate), which defeats the purpose for something meant to run
-    // unattended with its panel collapsed.
+    // Automates both the radio (select/start/apply-settings/tune, all on
+    // sigpath::sourceManager) and the Recorder (configure/start/stop, via
+    // core::modComManager) from this background thread. Both are safe to call from here:
     //
-    // So for now: an entry only fires if its target radio is *already* the selected, running
-    // source (checked via cheap reads of getSelectedName()/sdrIsRunning() -- not a full write
-    // into SourceManager, and a narrow, low-realistic-risk gap on every platform this actually
-    // runs on, but a real one, not swept under the rug). Otherwise it's skipped with a clear
-    // reason. Automatic radio switching/settings-apply needs SourceManager locking added
-    // first, which is a deliberately separate, more careful piece of work -- not rushed in
-    // alongside this.
+    // - core::modComManager has its own internal recursive_mutex around every method
+    //   (core/src/module_com.cpp) -- was always safe.
+    // - sigpath::sourceManager gained its own recursive_mutex 2026-08-15
+    //   (core/src/signal_path/source.h/.cpp), specifically so this engine could do the above --
+    //   before that, it had no locking at all, and was read every frame by the GUI thread
+    //   (sourcemenu::draw()'s showSelectedMenu() call), a genuine data race against a second
+    //   thread touching it. See source.h's own top-of-file comment for the full design
+    //   (recursive_mutex requirement, why the lock is held across the handler call itself, and
+    //   the lock-ordering invariant against ModuleComManager).
+    // - Switching/starting the radio goes through gui::mainWindow.setPlayState(), not a raw
+    //   sigpath::sourceManager.start()/stop() -- MainWindow keeps its own `playing` flag
+    //   (what the main Play/Stop button displays), separate from anything SourceManager
+    //   tracks; calling SourceManager directly would desync it. setPlayState() also gained its
+    //   own lock alongside SourceManager's, for the same reason (core/src/gui/main_window.h).
+    //
+    // Not yet handled: multiple entries whose windows overlap on different radios still can't
+    // both run (the whole app has exactly one active source, by SourceManager's own design --
+    // see the "somethingRunning" check in tick(), below) -- a second entry due while one is
+    // already running is skipped with a reason, not queued.
 
     void engineWorker() {
         while (engineRun) {
@@ -389,14 +396,10 @@ private:
         }
     }
 
-    // Only proceeds if the entry's target radio is already the selected + running source
-    // (see the big comment above) -- otherwise skips with a clear reason. Recorder start +
-    // config push both go through core::modComManager, which is safe to call from this thread.
     void fireEntry(Entry& e) {
-        if (e.sourceName.empty() || sigpath::sourceManager.getSelectedName() != e.sourceName || !gui::mainWindow.sdrIsRunning()) {
+        if (e.sourceName.empty()) {
             e.status = "skipped";
-            e.lastSkipReason = "radio \"" + e.sourceName + "\" isn't currently selected and running "
-                                "(automatic radio switching isn't implemented yet)";
+            e.lastSkipReason = "no radio selected for this entry";
             return;
         }
         if (e.recorderName.empty() || !core::modComManager.interfaceExists(e.recorderName)) {
@@ -404,6 +407,21 @@ private:
             e.lastSkipReason = "recorder \"" + e.recorderName + "\" not found";
             return;
         }
+
+        if (sigpath::sourceManager.getSelectedName() != e.sourceName) {
+            gui::mainWindow.setPlayState(false);
+            sigpath::sourceManager.selectSource(e.sourceName);
+        }
+        if (!e.sourceConfigSnapshot.empty()) {
+            sigpath::sourceManager.applySourceConfig(e.sourceName, e.sourceConfigSnapshot);
+        }
+        if (!gui::mainWindow.sdrIsRunning()) {
+            gui::mainWindow.setPlayState(true);
+        }
+        if (e.frequency > 0) {
+            sigpath::sourceManager.tune(e.frequency);
+        }
+
         core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_SET_CONFIG, (void*)&e.recorderConfigSnapshot, nullptr);
         core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_START, nullptr, nullptr);
         e.status = "running";
@@ -535,8 +553,13 @@ private:
                         json snap = sigpath::sourceManager.captureSourceConfig(it->second.sourceName);
                         it->second.sourceConfigSnapshot = snap;
                         it->second.sourceModuleType = core::moduleManager.getInstanceModuleName(it->second.sourceName);
-                        it->second.sourceConfigCapturedAt = snap.empty() ? 0 :
-                            (int64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        // Frequency is a waterfall/VFO-level concept, not per-source-module
+                        // state like the settings snapshot -- only meaningful to grab it when
+                        // this entry's radio is actually the one currently tuned.
+                        if (sigpath::sourceManager.getSelectedName() == it->second.sourceName) {
+                            it->second.frequency = gui::waterfall.getCenterFrequency();
+                        }
+                        it->second.sourceConfigCapturedAt = snap.empty() ? 0 : nowEpoch();
                         _this->saveConfig();
                     }
                     ImGui::SameLine();
@@ -549,7 +572,12 @@ private:
                     if (!haveSource) { style::endDisabled(); }
 
                     if (haveSource && it->second.sourceConfigCapturedAt != 0) {
-                        ImGui::Text("Settings captured for %s.", it->second.sourceName.c_str());
+                        if (it->second.frequency > 0) {
+                            ImGui::Text("Settings captured for %s at %.6f MHz.", it->second.sourceName.c_str(), it->second.frequency / 1e6);
+                        }
+                        else {
+                            ImGui::Text("Settings captured for %s.", it->second.sourceName.c_str());
+                        }
                     }
 
                     ImGui::Separator();
@@ -868,9 +896,9 @@ private:
             _this->deleteEntry(_this->deleteTargetId);
         }
 
-        ImGui::TextDisabled("Recorder start/stop is automated; the app must be running for");
-        ImGui::TextDisabled("an entry to fire. Automatic radio switching isn't implemented");
-        ImGui::TextDisabled("yet -- the target radio must already be selected and running.");
+        ImGui::TextDisabled("Radio switching + Recorder start/stop are both automated. The");
+        ImGui::TextDisabled("app must be running for an entry to fire -- this is not a");
+        ImGui::TextDisabled("system service, it can't wake the app up or catch up later.");
     }
 
     std::string name;

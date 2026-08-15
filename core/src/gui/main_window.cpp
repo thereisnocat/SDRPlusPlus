@@ -1048,6 +1048,7 @@ void MainWindow::draw() {
 }
 
 void MainWindow::setPlayState(bool _playing) {
+    std::lock_guard<std::recursive_mutex> lck(playStateMtx);
     if (_playing == playing) { return; }
     if (_playing) {
         sigpath::iqFrontEnd.flushInputBuffer();
@@ -1069,10 +1070,12 @@ void MainWindow::setViewBandwidthSlider(float bandwidth) {
 }
 
 bool MainWindow::sdrIsRunning() {
+    std::lock_guard<std::recursive_mutex> lck(playStateMtx);
     return playing;
 }
 
 bool MainWindow::isPlaying() {
+    std::lock_guard<std::recursive_mutex> lck(playStateMtx);
     return playing;
 }
 

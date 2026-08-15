@@ -8,6 +8,7 @@ SourceManager::SourceManager() {
 }
 
 void SourceManager::registerSource(std::string name, SourceHandler* handler) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (sources.find(name) != sources.end()) {
         flog::error("Tried to register new source with existing name: {0}", name);
         return;
@@ -17,6 +18,7 @@ void SourceManager::registerSource(std::string name, SourceHandler* handler) {
 }
 
 void SourceManager::unregisterSource(std::string name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (sources.find(name) == sources.end()) {
         flog::error("Tried to unregister non existent source: {0}", name);
         return;
@@ -38,6 +40,7 @@ void SourceManager::unregisterSource(std::string name) {
 }
 
 void SourceManager::registerChannels(const std::string& name, ChannelSet* set) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (set == NULL || set->count < 2) {
         flog::error("Tried to register a channel set with fewer than 2 channels for source: {0}", name);
         return;
@@ -53,6 +56,7 @@ void SourceManager::registerChannels(const std::string& name, ChannelSet* set) {
 }
 
 void SourceManager::unregisterChannels(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (channelSets.find(name) == channelSets.end()) { return; }
     channelSets.erase(name);
     if (name == selectedName) { updateInput(); }
@@ -60,11 +64,13 @@ void SourceManager::unregisterChannels(const std::string& name) {
 }
 
 ChannelSet* SourceManager::getChannels(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     auto it = channelSets.find(name);
     return (it == channelSets.end()) ? NULL : it->second;
 }
 
 void SourceManager::updateInput() {
+    // No lock here -- always called from a method that already holds `mtx` (see source.h).
     ChannelSet* set = getChannels(selectedName);
     sigpath::phasing.setChannelSet(set);
 
@@ -90,24 +96,33 @@ void SourceManager::updateInput() {
 }
 
 std::vector<std::string> SourceManager::getSourceNames() {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     std::vector<std::string> names;
     for (auto const& [name, src] : sources) { names.push_back(name); }
     return names;
 }
 
+std::string SourceManager::getSelectedName() const {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
+    return selectedName;
+}
+
 nlohmann::json SourceManager::captureSourceConfig(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     auto it = sources.find(name);
     if (it == sources.end() || it->second->captureConfigHandler == NULL) { return nlohmann::json{}; }
     return it->second->captureConfigHandler(it->second->ctx);
 }
 
 void SourceManager::applySourceConfig(const std::string& name, const nlohmann::json& cfg) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     auto it = sources.find(name);
     if (it == sources.end() || it->second->applyConfigHandler == NULL) { return; }
     it->second->applyConfigHandler(cfg, it->second->ctx);
 }
 
 void SourceManager::selectSource(std::string name) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (sources.find(name) == sources.end()) {
         flog::error("Tried to select non existent source: {0}", name);
         return;
@@ -122,6 +137,7 @@ void SourceManager::selectSource(std::string name) {
 }
 
 void SourceManager::showSelectedMenu() {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (selectedHandler == NULL) {
         return;
     }
@@ -129,6 +145,7 @@ void SourceManager::showSelectedMenu() {
 }
 
 void SourceManager::start() {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (selectedHandler == NULL) {
         return;
     }
@@ -136,6 +153,7 @@ void SourceManager::start() {
 }
 
 void SourceManager::stop() {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (selectedHandler == NULL) {
         return;
     }
@@ -143,6 +161,7 @@ void SourceManager::stop() {
 }
 
 void SourceManager::tune(double freq) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     if (selectedHandler == NULL) {
         return;
     }
@@ -157,16 +176,19 @@ void SourceManager::tune(double freq) {
 }
 
 void SourceManager::setTuningOffset(double offset) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     tuneOffset = offset;
     tune(currentFreq);
 }
 
 void SourceManager::setTuningMode(TuningMode mode) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     tuneMode = mode;
     tune(currentFreq);
 }
 
 void SourceManager::setPanadapterIF(double freq) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
     ifFreq = freq;
     tune(currentFreq);
 }
