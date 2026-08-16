@@ -113,6 +113,9 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &stream;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "sdrplay_source";   // must match SDRPP_MOD_INFO's Name above
 
         // Dual tuner: rspDuoSampleFreq picks the low IF, and both choices decimate to the
         // same 2 MS/s at the callback -- measured, not assumed. Decimation divides that.
@@ -557,6 +560,198 @@ private:
             sigpath::sourceManager.unregisterChannels("SDRplay");
         }
         core::setInputSampleRate(sampleRate);
+    }
+
+    // Writes the live per-device fields into this device's own stored config -- shared by
+    // applyConfig() below and mirrors exactly what each individual menuHandler/RSP*Menu control
+    // already writes piecemeal on its own change, gated by the currently selected RSP model the
+    // same way selectDev()'s own load branches are. Deliberately does NOT touch the RSPduo
+    // "fmmwnotch" (lowercase) key that RSPduoMenu's own checkbox writes at line ~1190 --
+    // selectDev() only ever reads "fmmwNotch" (capital N) back for that device family (line
+    // ~449), so writing the lowercase key here would just recreate that pre-existing dead-key
+    // bug rather than actually persisting anything. Not fixing that bug here -- out of scope for
+    // phase 6 -- just not propagating it into new code.
+    void persistDeviceSettings() {
+        if (selectedName.empty()) { return; }
+        config.acquire();
+        json& d = config.conf["devices"][selectedName];
+        d["samplerate"] = samplerates.key(srId);
+        d["ifModeId"] = ifModeId;
+        d["bwMode"] = bandwidthId;
+        d["lnaGain"] = lnaGain;
+        d["ifGain"] = gain;
+        d["agc"] = agc;
+        d["agcAttack"] = agcAttack;
+        d["agcDecay"] = agcDecay;
+        d["agcDecayDelay"] = agcDecayDelay;
+        d["agcDecayThreshold"] = agcDecayThreshold;
+        d["agcSetPoint"] = agcSetPoint;
+        if (openDev.hwVer == SDRPLAY_RSP1A_ID || openDev.hwVer == SDRPLAY_RSP1B_ID) {
+            d["fmmwNotch"] = rsp1a_fmmwNotch;
+            d["dabNotch"] = rsp1a_dabNotch;
+            d["biast"] = rsp1a_biasT;
+        }
+        else if (openDev.hwVer == SDRPLAY_RSP2_ID) {
+            d["antenna"] = rsp2_antennaPort;
+            d["fmmwNotch"] = rsp2_fmmwNotch;
+            d["biast"] = rsp2_biasT;
+        }
+        else if (openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            d["dualTuner"] = rspduo_dualTuner;
+            d["duoFs"] = duoFsList.key(duoFsId);
+            d["duoDecim"] = duoDecimList.key(duoDecimId);
+            d["antenna"] = rspduo_antennaPort;
+            d["fmmwNotch"] = rspduo_fmmwNotch;
+            d["dabNotch"] = rspduo_dabNotch;
+            d["biast"] = rspduo_biasT;
+        }
+        else if (openDev.hwVer == SDRPLAY_RSPdx_ID || openDev.hwVer == SDRPLAY_RSPdxR2_ID) {
+            d["antenna"] = rspdx_antennaPort;
+            d["fmmwNotch"] = rspdx_fmmwNotch;
+            d["dabNotch"] = rspdx_dabNotch;
+            d["biast"] = rspdx_biasT;
+        }
+        config.release(true);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- RECORDING_SCHEDULER_PLAN.md
+    // phase 6, third module (FobosSDR, then SDRplay). Unlike FobosSDR, per-device fields here are
+    // also gated by which RSP model is *currently selected* (openDev.hwVer) -- mirrors
+    // selectDev()'s own per-hwVer branching exactly, so a snapshot captured from one RSP model's
+    // fields never gets misapplied to a different model that happens to be selected later (e.g.
+    // an RSPduo's dualTuner/duoFs/duoDecim fields have no meaning on an RSP2). samplerates/
+    // bandwidths/duoFsList/duoDecimList are only populated once selectDev() has actually run for
+    // the currently open device this session -- degrade gracefully rather than crash if applied
+    // cold, same caveat as FobosSDR.
+    static json captureConfig(void* ctx) {
+        SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
+        json d;
+        if (_this->samplerates.size()) { d["samplerate"] = _this->samplerates.key(_this->srId); }
+        d["ifModeId"] = _this->ifModeId;
+        if (_this->bandwidths.size()) { d["bwMode"] = _this->bandwidthId; }
+        d["lnaGain"] = _this->lnaGain;
+        d["ifGain"] = _this->gain;
+        d["agc"] = _this->agc;
+        d["agcAttack"] = _this->agcAttack;
+        d["agcDecay"] = _this->agcDecay;
+        d["agcDecayDelay"] = _this->agcDecayDelay;
+        d["agcDecayThreshold"] = _this->agcDecayThreshold;
+        d["agcSetPoint"] = _this->agcSetPoint;
+
+        if (_this->openDev.hwVer == SDRPLAY_RSP1A_ID || _this->openDev.hwVer == SDRPLAY_RSP1B_ID) {
+            d["fmmwNotch"] = _this->rsp1a_fmmwNotch;
+            d["dabNotch"] = _this->rsp1a_dabNotch;
+            d["biast"] = _this->rsp1a_biasT;
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSP2_ID) {
+            d["antenna"] = _this->rsp2_antennaPort;
+            d["fmmwNotch"] = _this->rsp2_fmmwNotch;
+            d["biast"] = _this->rsp2_biasT;
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            d["dualTuner"] = _this->rspduo_dualTuner;
+            if (_this->duoFsList.size()) { d["duoFs"] = _this->duoFsList.key(_this->duoFsId); }
+            if (_this->duoDecimList.size()) { d["duoDecim"] = _this->duoDecimList.key(_this->duoDecimId); }
+            d["antenna"] = _this->rspduo_antennaPort;
+            d["fmmwNotch"] = _this->rspduo_fmmwNotch;
+            d["dabNotch"] = _this->rspduo_dabNotch;
+            d["biast"] = _this->rspduo_biasT;
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSPdx_ID || _this->openDev.hwVer == SDRPLAY_RSPdxR2_ID) {
+            d["antenna"] = _this->rspdx_antennaPort;
+            d["fmmwNotch"] = _this->rspdx_fmmwNotch;
+            d["dabNotch"] = _this->rspdx_dabNotch;
+            d["biast"] = _this->rspdx_biasT;
+        }
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
+
+        if (cfg.contains("samplerate") && _this->samplerates.keyExists(cfg["samplerate"].get<int>())) {
+            _this->srId = _this->samplerates.keyId(cfg["samplerate"].get<int>());
+            _this->sampleRate = _this->samplerates[_this->srId];
+            if (_this->bandwidthId == 8) { _this->bandwidth = preferedBandwidth[_this->srId]; }
+        }
+        if (cfg.contains("ifModeId")) {
+            int im = cfg["ifModeId"];
+            if (im >= 0 && im < (int)(sizeof(ifModes) / sizeof(ifModes[0]))) {
+                _this->ifModeId = im;
+                if (im != 0) {
+                    _this->bandwidth = ifModes[im].bw;
+                    _this->sampleRate = ifModes[im].effectiveSamplerate;
+                }
+            }
+        }
+        if (cfg.contains("bwMode") && _this->bandwidths.size()) {
+            int bw = cfg["bwMode"];
+            if (bw >= 0 && bw < _this->bandwidths.size()) {
+                _this->bandwidthId = bw;
+                _this->bandwidth = (bw == 8) ? preferedBandwidth[_this->srId] : _this->bandwidths[bw];
+            }
+        }
+        if (cfg.contains("lnaGain")) {
+            _this->lnaGain = std::clamp<int>((int)cfg["lnaGain"], 0, _this->lnaSteps - 1);
+        }
+        if (cfg.contains("ifGain")) {
+            _this->gain = std::clamp<int>((int)cfg["ifGain"], 20, 59);
+        }
+        if (cfg.contains("agc")) { _this->agc = cfg["agc"]; }
+        if (cfg.contains("agcAttack")) { _this->agcAttack = std::clamp<int>((int)cfg["agcAttack"], 0, 65535); }
+        if (cfg.contains("agcDecay")) { _this->agcDecay = std::clamp<int>((int)cfg["agcDecay"], 0, 65535); }
+        if (cfg.contains("agcDecayDelay")) { _this->agcDecayDelay = std::clamp<int>((int)cfg["agcDecayDelay"], 0, 65535); }
+        if (cfg.contains("agcDecayThreshold")) { _this->agcDecayThreshold = std::clamp<int>((int)cfg["agcDecayThreshold"], 0, 100); }
+        if (cfg.contains("agcSetPoint")) { _this->agcSetPoint = std::clamp<int>((int)cfg["agcSetPoint"], -60, -20); }
+
+        if (_this->openDev.hwVer == SDRPLAY_RSP1A_ID || _this->openDev.hwVer == SDRPLAY_RSP1B_ID) {
+            if (cfg.contains("fmmwNotch")) { _this->rsp1a_fmmwNotch = cfg["fmmwNotch"]; }
+            if (cfg.contains("dabNotch")) { _this->rsp1a_dabNotch = cfg["dabNotch"]; }
+            if (cfg.contains("biast")) { _this->rsp1a_biasT = cfg["biast"]; }
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSP2_ID) {
+            if (cfg.contains("antenna")) { _this->rsp2_antennaPort = cfg["antenna"]; }
+            if (cfg.contains("fmmwNotch")) { _this->rsp2_fmmwNotch = cfg["fmmwNotch"]; }
+            if (cfg.contains("biast")) { _this->rsp2_biasT = cfg["biast"]; }
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSPduo_ID) {
+            if (cfg.contains("dualTuner")) { _this->rspduo_dualTuner = cfg["dualTuner"]; }
+            if (cfg.contains("duoFs") && _this->duoFsList.keyExists(cfg["duoFs"].get<int>())) {
+                _this->duoFsId = _this->duoFsList.keyId(cfg["duoFs"].get<int>());
+            }
+            if (cfg.contains("duoDecim") && _this->duoDecimList.keyExists(cfg["duoDecim"].get<int>())) {
+                _this->duoDecimId = _this->duoDecimList.keyId(cfg["duoDecim"].get<int>());
+            }
+            if (cfg.contains("antenna")) { _this->rspduo_antennaPort = cfg["antenna"]; }
+            if (cfg.contains("fmmwNotch")) { _this->rspduo_fmmwNotch = cfg["fmmwNotch"]; }
+            if (cfg.contains("dabNotch")) { _this->rspduo_dabNotch = cfg["dabNotch"]; }
+            if (cfg.contains("biast")) { _this->rspduo_biasT = cfg["biast"]; }
+        }
+        else if (_this->openDev.hwVer == SDRPLAY_RSPdx_ID || _this->openDev.hwVer == SDRPLAY_RSPdxR2_ID) {
+            if (cfg.contains("antenna")) { _this->rspdx_antennaPort = cfg["antenna"]; }
+            if (cfg.contains("fmmwNotch")) { _this->rspdx_fmmwNotch = cfg["fmmwNotch"]; }
+            if (cfg.contains("dabNotch")) { _this->rspdx_dabNotch = cfg["dabNotch"]; }
+            if (cfg.contains("biast")) { _this->rspdx_biasT = cfg["biast"]; }
+        }
+
+        _this->persistDeviceSettings();
+
+        // Push to live hardware and re-derive sample rate / channel registration exactly the
+        // way selectDev() itself does at the end of device selection (line ~480) -- applyDualMode()
+        // already no-ops safely into the single-tuner path for every non-RSPduo model.
+        _this->applyDualMode();
+        if (_this->running) {
+            _this->channelParams->tunerParams.gain.LNAstate = _this->lnaGain;
+            _this->channelParams->tunerParams.gain.gRdB = _this->gain;
+            _this->channelParams->ctrlParams.agc.attack_ms = _this->agcAttack;
+            _this->channelParams->ctrlParams.agc.decay_ms = _this->agcDecay;
+            _this->channelParams->ctrlParams.agc.decay_delay_ms = _this->agcDecayDelay;
+            _this->channelParams->ctrlParams.agc.decay_threshold_dB = _this->agcDecayThreshold;
+            _this->channelParams->ctrlParams.agc.setPoint_dBfs = _this->agcSetPoint;
+            _this->channelParams->ctrlParams.agc.enable = _this->agc ? sdrplay_api_AGC_CTRL_EN : sdrplay_api_AGC_DISABLE;
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        }
     }
 
     static void menuSelected(void* ctx) {
