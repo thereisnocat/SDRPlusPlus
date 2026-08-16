@@ -105,6 +105,8 @@ cp $build_dir/misc_modules/iq_exporter/Release/iq_exporter.dll sdrpp_windows_x64
 
 cp $build_dir/misc_modules/recorder/Release/recorder.dll sdrpp_windows_x64/modules/
 
+cp $build_dir/misc_modules/recording_scheduler/Release/recording_scheduler.dll sdrpp_windows_x64/modules/
+
 cp $build_dir/misc_modules/rigctl_client/Release/rigctl_client.dll sdrpp_windows_x64/modules/
 
 cp $build_dir/misc_modules/rigctl_server/Release/rigctl_server.dll sdrpp_windows_x64/modules/
