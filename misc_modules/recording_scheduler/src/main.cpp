@@ -106,15 +106,9 @@ static bool sameLocalDay(int64_t a, int64_t b) {
     return tma.tm_year == tmb.tm_year && tma.tm_yday == tmb.tm_yday;
 }
 
-static int timeOfDaySeconds(const std::string& s) {
-    int h = 0, mi = 0, se = 0;
-    sscanf(s.c_str(), "%d:%d:%d", &h, &mi, &se);
-    return h * 3600 + mi * 60 + se;
-}
-
-// Seconds since local midnight for `epoch`, and (via `wday`) which day of week it falls on --
-// 0=Sunday..6=Saturday, matching Recurrence::daysOfWeek's own indexing.
-static int nowTimeOfDaySeconds(int64_t epoch, int* wday) {
+// Which day of week `epoch` falls on locally -- 0=Sunday..6=Saturday, matching
+// Recurrence::daysOfWeek's own indexing.
+static int localWeekday(int64_t epoch) {
     time_t t = (time_t)epoch;
     struct tm tmv;
 #ifdef _WIN32
@@ -122,8 +116,25 @@ static int nowTimeOfDaySeconds(int64_t epoch, int* wday) {
 #else
     localtime_r(&t, &tmv);
 #endif
-    if (wday) { *wday = tmv.tm_wday; }
-    return tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
+    return tmv.tm_wday;
+}
+
+// Absolute epoch for `timeOfDay` ("HH:MM:SS") on the same local calendar day as `now`.
+static int64_t todaysThresholdEpoch(int64_t now, const std::string& timeOfDay) {
+    time_t t = (time_t)now;
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    int h = 0, mi = 0, se = 0;
+    sscanf(timeOfDay.c_str(), "%d:%d:%d", &h, &mi, &se);
+    tmv.tm_hour = h;
+    tmv.tm_min = mi;
+    tmv.tm_sec = se;
+    tmv.tm_isdst = -1;
+    return (int64_t)mktime(&tmv);
 }
 
 // Once/Daily/Weekly, matching RECORDING_SCHEDULER_PLAN.md section 3's schema exactly.
@@ -236,6 +247,10 @@ struct Entry {
     int64_t lastRunEpoch = 0;
     std::string lastSkipReason;
     int64_t currentRunStartEpoch = 0;
+    // Daily/weekly due-checking is edge-triggered on this (see isStartDue()) -- also
+    // deliberately not persisted, 0 = "never checked", matching currentRunStartEpoch's own
+    // reasoning: a fresh process shouldn't assume it knows what happened before it existed.
+    int64_t lastEngineCheckEpoch = 0;
 
     bool selected = false;
 
@@ -477,13 +492,28 @@ private:
             }
             return now >= r.startEpoch;
         }
-        // daily/weekly
-        if (e.status != "scheduled" && e.status != "ran") { return false; }
-        if (e.status == "ran" && sameLocalDay(e.lastRunEpoch, now)) { return false; }
-        int wday;
-        int tod = nowTimeOfDaySeconds(now, &wday);
-        if (r.type == "weekly" && !r.daysOfWeek[wday]) { return false; }
-        return tod >= timeOfDaySeconds(r.startTimeOfDay);
+        // daily/weekly -- edge-triggered on the threshold instant falling within
+        // (lastEngineCheckEpoch, now], not level-triggered on "is `now` currently past the
+        // threshold". The level-triggered version (this function's shape through
+        // 2026-08-15) fired the instant *any* condition made it true, including the very
+        // first tick after an entry was created or the app relaunched -- so a freshly-made
+        // Daily entry whose target time hadn't been changed from the "00:00:00" default (or
+        // simply already fell earlier in the day than "now") started recording immediately
+        // on save, regardless of the time actually configured. lastEngineCheckEpoch starts
+        // at 0 ("never checked"), so the first tick after creation/load only ever establishes
+        // a baseline and never fires by itself -- only a *later* tick that actually observes
+        // the threshold instant pass between two checks can fire, which is what "wait for the
+        // scheduled time" is supposed to mean. Updated on every path through here (including
+        // the early-outs below) so the window stays tight (~1s, this engine's own poll
+        // interval) rather than going stale across disabled/off-day stretches.
+        if (e.status != "scheduled" && e.status != "ran") { e.lastEngineCheckEpoch = now; return false; }
+        if (e.status == "ran" && sameLocalDay(e.lastRunEpoch, now)) { e.lastEngineCheckEpoch = now; return false; }
+        if (r.type == "weekly" && !r.daysOfWeek[localWeekday(now)]) { e.lastEngineCheckEpoch = now; return false; }
+
+        int64_t thresholdEpoch = todaysThresholdEpoch(now, r.startTimeOfDay);
+        bool crossed = e.lastEngineCheckEpoch > 0 && e.lastEngineCheckEpoch < thresholdEpoch && now >= thresholdEpoch;
+        e.lastEngineCheckEpoch = now;
+        return crossed;
     }
 
     bool isStopDue(Entry& e, int64_t now) {
