@@ -7,6 +7,7 @@
 #include <utils/flog.h>
 #include <gui/gui.h>
 #include <gui/style.h>
+#include <signal_path/signal_path.h>
 
 float DEFAULT_COLOR_MAP[][3] = {
     { 0x00, 0x00, 0x20 },
@@ -380,10 +381,25 @@ namespace ImGui {
 
             viewOffset -= viewDelta;
 
+            // Recorder::genFileName() and its "auxi" chunk metadata both read
+            // getCenterFrequency() (== centerFreq) directly, not the actual hardware tuning --
+            // so moving centerFreq here silently corrupts a recording's own filename/embedded
+            // frequency even on a source where sourceManager.tune() below is itself blocked by
+            // an active recording's tuning lock (RECORDING_REFACTOR_PLAN.md section 6.1). That
+            // lock already exists and is already reference-counted for exactly this purpose;
+            // it just wasn't being consulted here. Confirmed missing 2026-08-15 (real hardware,
+            // scheduled recording): the display could still be dragged mid-recording even
+            // though the actual RF tuning correctly never moved, and the file that came out of
+            // it had a frequency scale/metadata that didn't match what was actually recorded.
+            // viewOffset itself (a few lines above) is untouched by this -- panning within the
+            // already-tuned span doesn't touch centerFreq and so doesn't affect anything a
+            // recording's metadata depends on.
+            bool tuningLocked = sigpath::sourceManager.isTuningLocked();
+
             if (viewOffset + (viewBandwidth / 2.0) > wholeBandwidth / 2.0) {
                 double freqOffset = (viewOffset + (viewBandwidth / 2.0)) - (wholeBandwidth / 2.0);
                 viewOffset = (wholeBandwidth / 2.0) - (viewBandwidth / 2.0);
-                if (!centerFrequencyLocked) {
+                if (!centerFrequencyLocked && !tuningLocked) {
                     centerFreq += freqOffset;
                     centerFreqMoved = true;
                 }
@@ -391,7 +407,7 @@ namespace ImGui {
             if (viewOffset - (viewBandwidth / 2.0) < -(wholeBandwidth / 2.0)) {
                 double freqOffset = (viewOffset - (viewBandwidth / 2.0)) + (wholeBandwidth / 2.0);
                 viewOffset = (viewBandwidth / 2.0) - (wholeBandwidth / 2.0);
-                if (!centerFrequencyLocked) {
+                if (!centerFrequencyLocked && !tuningLocked) {
                     centerFreq += freqOffset;
                     centerFreqMoved = true;
                 }
@@ -990,6 +1006,13 @@ namespace ImGui {
     }
 
     void WaterFall::setCenterFrequency(double freq) {
+        // buf_mtx, matching setViewOffset() just below -- both touch the same
+        // centerFreq/viewOffset/lowerFreq/upperFreq state and call the same unlocked
+        // updateAllVFOs(), but this one had no lock of its own until 2026-08-15, when the
+        // recording scheduler's engine thread became the first caller of this function from
+        // anywhere but the GUI thread (RECORDING_SCHEDULER_PLAN.md phase 5's radio-switching
+        // automation calls tuner::iqTuning(), which calls this).
+        std::lock_guard<std::recursive_mutex> lck(buf_mtx);
         centerFreq = freq;
         lowerFreq = (centerFreq + viewOffset) - (viewBandwidth / 2.0);
         upperFreq = (centerFreq + viewOffset) + (viewBandwidth / 2.0);

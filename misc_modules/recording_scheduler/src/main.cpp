@@ -24,6 +24,7 @@
 #include <module.h>
 #include <gui/gui.h>
 #include <gui/style.h>
+#include <gui/tuner.h>
 #include <gui/dialogs/dialog_box.h>
 #include <config.h>
 #include <core.h>
@@ -496,7 +497,21 @@ private:
             gui::mainWindow.setPlayState(true);
         }
         if (e.frequency > 0) {
-            sigpath::sourceManager.tune(e.frequency);
+            // tuner::iqTuning(), not a bare sigpath::sourceManager.tune() -- the captured
+            // frequency is a raw waterfall center frequency with no VFO concept (that's how
+            // it was captured, via gui::waterfall.getCenterFrequency()), and iqTuning() is
+            // the app's own established path for exactly that: it updates
+            // gui::waterfall's displayed center frequency (setCenterFrequency() +
+            // centerFreqMoved) *and* retunes the real source together, matching what every
+            // other tuning path in the app already does. Calling sourceManager.tune() alone,
+            // as this did through 2026-08-15, retuned the real hardware correctly but left
+            // the displayed frequency scale showing wherever it was before -- and since
+            // RecorderModule::genFileName()/its "auxi" chunk both read
+            // gui::waterfall.getCenterFrequency() directly, not the actual hardware tuning,
+            // a scheduled recording's own filename and embedded metadata came out wrong even
+            // though the recorded RF content itself was correct. Found live, on real
+            // hardware, by the user.
+            tuner::tune(tuner::TUNER_MODE_IQ_ONLY, "", e.frequency);
         }
 
         core::modComManager.callInterface(e.recorderName, RECORDER_IFACE_CMD_SET_CONFIG, (void*)&e.recorderConfigSnapshot, nullptr);
