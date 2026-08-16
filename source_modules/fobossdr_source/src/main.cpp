@@ -58,6 +58,9 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &ddc.out;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "fobossdr_source";   // must match SDRPP_MOD_INFO's Name above
 
         // Refresh devices
         refresh();
@@ -292,6 +295,76 @@ private:
         }
         else {
             sigpath::sourceManager.unregisterChannels("FobosSDR");
+        }
+    }
+
+    // Writes the live per-device fields into this device's own stored config -- shared by
+    // applyConfig() below and mirrors exactly what each individual menuHandler control below
+    // already writes piecemeal on its own change.
+    void persistDeviceSettings() {
+        if (selectedSerial.empty()) { return; }
+        config.acquire();
+        config.conf["devices"][selectedSerial]["samplerate"] = samplerates.key(srId);
+        config.conf["devices"][selectedSerial]["port"] = ports.key(portId);
+        config.conf["devices"][selectedSerial]["clkSrc"] = clockSources.key(clkSrcId);
+        config.conf["devices"][selectedSerial]["lnaGain"] = lnaGain;
+        config.conf["devices"][selectedSerial]["vgaGain"] = vgaGain;
+        config.release(true);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- RECORDING_SCHEDULER_PLAN.md
+    // phase 6, second module after RSR200. samplerates/ports/clockSources are only populated
+    // once select() has actually opened the device at least once this session (they come from
+    // a live hardware query, unlike RSR200's fixed protocol-defined ranges) -- applyConfig()
+    // degrades gracefully (a field silently not applied) rather than crashing if a snapshot is
+    // applied before that's happened, e.g. no FobosSDR connected yet this session.
+    static json captureConfig(void* ctx) {
+        FobosSDRSourceModule* _this = (FobosSDRSourceModule*)ctx;
+        json d;
+        if (_this->samplerates.size()) { d["samplerate"] = _this->samplerates.key(_this->srId); }
+        if (_this->ports.size()) { d["port"] = _this->ports.key(_this->portId); }
+        if (_this->clockSources.size()) { d["clkSrc"] = _this->clockSources.key(_this->clkSrcId); }
+        d["lnaGain"] = _this->lnaGain;
+        d["vgaGain"] = _this->vgaGain;
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        FobosSDRSourceModule* _this = (FobosSDRSourceModule*)ctx;
+        bool portChanged = false;
+        if (cfg.contains("samplerate") && _this->samplerates.keyExists(cfg["samplerate"].get<double>())) {
+            _this->srId = _this->samplerates.keyId(cfg["samplerate"].get<double>());
+            _this->sampleRate = _this->samplerates[_this->srId];
+        }
+        if (cfg.contains("port") && _this->ports.keyExists(cfg["port"].get<std::string>())) {
+            std::string newPort = cfg["port"];
+            if (_this->ports.key(_this->portId) != newPort) { portChanged = true; }
+            _this->portId = _this->ports.keyId(newPort);
+            _this->port = _this->ports[_this->portId];
+        }
+        if (cfg.contains("clkSrc") && _this->clockSources.keyExists(cfg["clkSrc"].get<std::string>())) {
+            _this->clkSrcId = _this->clockSources.keyId(cfg["clkSrc"].get<std::string>());
+        }
+        if (cfg.contains("lnaGain")) {
+            _this->lnaGain = std::clamp<int>((int)cfg["lnaGain"], FOBOS_LNA_GAIN_MIN, FOBOS_LNA_GAIN_MAX);
+        }
+        if (cfg.contains("vgaGain")) {
+            _this->vgaGain = std::clamp<int>((int)cfg["vgaGain"], FOBOS_VGA_GAIN_MIN, FOBOS_VGA_GAIN_MAX);
+        }
+
+        _this->persistDeviceSettings();
+
+        // registerChannels/unregisterChannels (inside applyPortMode()) are safe regardless of
+        // selection state -- select() and the port combo's own onChange handler both already
+        // call this unconditionally, and SourceManager itself has been safe to call from any
+        // thread since 2026-08-15 (core/src/signal_path/source.h's own locking).
+        if (portChanged) { _this->applyPortMode(); }
+        // Must be safe to call whether or not this source is currently selected/running (a
+        // scheduled apply may target a radio that isn't active right now) -- setInputSampleRate
+        // affects whatever source *is* selected, so only touch it when that's actually this one,
+        // matching RSR200's own applyConfig() and source.h's documented safety contract.
+        if (sigpath::sourceManager.getSelectedName() == "FobosSDR") {
+            core::setInputSampleRate(_this->sampleRate);
         }
     }
 
