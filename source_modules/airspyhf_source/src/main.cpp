@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utils/flog.h>
 #include <module.h>
 #include <gui/gui.h>
@@ -42,6 +43,9 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &stream;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "airspyhf_source";   // must match SDRPP_MOD_INFO's Name above
 
         refresh();
 
@@ -222,6 +226,70 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    // Writes the live per-device fields into this device's own stored config -- shared by
+    // applyConfig() below and mirrors exactly what each individual menuHandler control already
+    // writes piecemeal on its own change.
+    void persistDeviceSettings() {
+        if (selectedSerStr.empty()) { return; }
+        config.acquire();
+        config.conf["devices"][selectedSerStr]["sampleRate"] = sampleRate;
+        config.conf["devices"][selectedSerStr]["agcMode"] = agcMode;
+        config.conf["devices"][selectedSerStr]["lna"] = hfLNA;
+        config.conf["devices"][selectedSerStr]["attenuation"] = atten;
+        config.release(true);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- RECORDING_SCHEDULER_PLAN.md
+    // phase 6, fourth module (RSR200, FobosSDR, SDRplay, then this). sampleRateList is only
+    // populated once selectBySerial() has actually opened the physical device at least once this
+    // session (a live hardware query), unlike RSR200's fixed protocol-defined ranges --
+    // applyConfig() degrades gracefully (the sample rate is silently left unapplied) rather than
+    // crashing if a snapshot is applied before that's happened.
+    static json captureConfig(void* ctx) {
+        AirspyHFSourceModule* _this = (AirspyHFSourceModule*)ctx;
+        json d;
+        if (!_this->sampleRateList.empty()) { d["sampleRate"] = _this->sampleRateList[_this->srId]; }
+        d["agcMode"] = _this->agcMode;
+        d["lna"] = _this->hfLNA;
+        d["attenuation"] = _this->atten;
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        AirspyHFSourceModule* _this = (AirspyHFSourceModule*)ctx;
+        if (cfg.contains("sampleRate") && !_this->sampleRateList.empty()) {
+            uint32_t sr = cfg["sampleRate"];
+            for (int i = 0; i < (int)_this->sampleRateList.size(); i++) {
+                if (_this->sampleRateList[i] == sr) {
+                    _this->srId = i;
+                    _this->sampleRate = sr;
+                    break;
+                }
+            }
+        }
+        if (cfg.contains("agcMode")) {
+            _this->agcMode = std::clamp<int>((int)cfg["agcMode"], AGC_MODE_OFF, AGC_MODE_HIGG);
+        }
+        if (cfg.contains("lna")) { _this->hfLNA = cfg["lna"]; }
+        if (cfg.contains("attenuation")) {
+            _this->atten = std::clamp<float>((float)cfg["attenuation"], 0.0f, 48.0f);
+        }
+
+        _this->persistDeviceSettings();
+
+        if (_this->running) {
+            airspyhf_set_hf_agc(_this->openDev, (_this->agcMode != 0));
+            if (_this->agcMode > 0) {
+                airspyhf_set_hf_agc_threshold(_this->openDev, _this->agcMode - 1);
+            }
+            airspyhf_set_hf_att(_this->openDev, _this->atten / 6.0f);
+            airspyhf_set_hf_lna(_this->openDev, _this->hfLNA);
+        }
+        if (sigpath::sourceManager.getSelectedName() == "Airspy HF+") {
+            core::setInputSampleRate(_this->sampleRate);
+        }
     }
 
     static void menuSelected(void* ctx) {
