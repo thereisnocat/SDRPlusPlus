@@ -71,6 +71,9 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &stream;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "rtl_sdr_source";   // must match SDRPP_MOD_INFO's Name above
 
         strcpy(dbTxt, "--");
 
@@ -270,6 +273,106 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    // Writes the live per-device fields into this device's own stored config -- shared by
+    // applyConfig() below and mirrors exactly what each individual menuHandler control already
+    // writes piecemeal on its own change.
+    void persistDeviceSettings() {
+        if (selectedDevName.empty()) { return; }
+        config.acquire();
+        config.conf["devices"][selectedDevName]["sampleRate"] = sampleRate;
+        config.conf["devices"][selectedDevName]["directSampling"] = directSamplingMode;
+        config.conf["devices"][selectedDevName]["ppm"] = ppm;
+        config.conf["devices"][selectedDevName]["biasT"] = biasT;
+        config.conf["devices"][selectedDevName]["offsetTuning"] = offsetTuning;
+        config.conf["devices"][selectedDevName]["rtlAgc"] = rtlAgc;
+        config.conf["devices"][selectedDevName]["tunerAgc"] = tunerAgc;
+        config.conf["devices"][selectedDevName]["gain"] = gainId;
+        config.release(true);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- RECORDING_SCHEDULER_PLAN.md
+    // phase 6, last of the five radios (explicitly lowest priority per the user, but still worth
+    // doing). gainList is only populated once selectById() has actually opened the physical
+    // device at least once this session (a live hardware query) -- applyConfig() degrades
+    // gracefully (gain silently left unapplied) rather than crashing if a snapshot is applied
+    // before that's happened, same caveat as every other module in this phase.
+    static json captureConfig(void* ctx) {
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        json d;
+        d["sampleRate"] = sampleRates[_this->srId];
+        d["directSampling"] = _this->directSamplingMode;
+        d["ppm"] = _this->ppm;
+        d["biasT"] = _this->biasT;
+        d["offsetTuning"] = _this->offsetTuning;
+        d["rtlAgc"] = _this->rtlAgc;
+        d["tunerAgc"] = _this->tunerAgc;
+        if (!_this->gainList.empty()) { d["gain"] = _this->gainId; }
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        if (cfg.contains("sampleRate")) {
+            double sr = cfg["sampleRate"];
+            for (int i = 0; i < 11; i++) {
+                if (sampleRates[i] == sr) {
+                    _this->srId = i;
+                    _this->sampleRate = sr;
+                    break;
+                }
+            }
+        }
+        bool dsChanged = false;
+        if (cfg.contains("directSampling")) {
+            int ds = std::clamp<int>((int)cfg["directSampling"], 0, 2);
+            if (_this->directSamplingMode != ds) { dsChanged = true; }
+            _this->directSamplingMode = ds;
+        }
+        if (cfg.contains("ppm")) {
+            _this->ppm = std::clamp<int>((int)cfg["ppm"], -1000000, 1000000);
+        }
+        if (cfg.contains("biasT")) { _this->biasT = cfg["biasT"]; }
+        if (cfg.contains("offsetTuning")) { _this->offsetTuning = cfg["offsetTuning"]; }
+        if (cfg.contains("rtlAgc")) { _this->rtlAgc = cfg["rtlAgc"]; }
+        if (cfg.contains("tunerAgc")) { _this->tunerAgc = cfg["tunerAgc"]; }
+        if (cfg.contains("gain") && !_this->gainList.empty()) {
+            _this->gainId = std::clamp<int>((int)cfg["gain"], 0, (int)_this->gainList.size() - 1);
+            _this->updateGainTxt();
+        }
+
+        _this->persistDeviceSettings();
+
+        if (_this->running) {
+            rtlsdr_set_freq_correction(_this->openDev, _this->ppm);
+            rtlsdr_set_direct_sampling(_this->openDev, _this->directSamplingMode);
+            rtlsdr_set_bias_tee(_this->openDev, _this->biasT);
+            rtlsdr_set_offset_tuning(_this->openDev, _this->offsetTuning);
+            rtlsdr_set_agc_mode(_this->openDev, _this->rtlAgc);
+            if (_this->tunerAgc) {
+                rtlsdr_set_tuner_gain_mode(_this->openDev, 0);
+            }
+            else {
+                rtlsdr_set_tuner_gain_mode(_this->openDev, 1);
+                if (!_this->gainList.empty()) { rtlsdr_set_tuner_gain(_this->openDev, _this->gainList[_this->gainId]); }
+            }
+            // Direct sampling toggling off needs gain/AGC re-pushed -- a known librtlsdr quirk,
+            // already worked around the same way by the direct-sampling combo in menuHandler.
+            if (dsChanged && !_this->directSamplingMode) {
+                rtlsdr_set_agc_mode(_this->openDev, _this->rtlAgc);
+                if (_this->tunerAgc) {
+                    rtlsdr_set_tuner_gain_mode(_this->openDev, 0);
+                }
+                else {
+                    rtlsdr_set_tuner_gain_mode(_this->openDev, 1);
+                    if (!_this->gainList.empty()) { rtlsdr_set_tuner_gain(_this->openDev, _this->gainList[_this->gainId]); }
+                }
+            }
+        }
+        if (sigpath::sourceManager.getSelectedName() == "RTL-SDR") {
+            core::setInputSampleRate(_this->sampleRate);
+        }
     }
 
     static void menuSelected(void* ctx) {
