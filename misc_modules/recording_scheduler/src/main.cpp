@@ -52,11 +52,23 @@ ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
-// "YYYY-MM-DD HH:MM:SS" <-> unix seconds (local time). sscanf/mktime/localtime_r|s rather than
-// strptime -- strptime is POSIX-only and this codebase also builds under MSVC (no strptime in
-// its CRT), matching the portability constraint already established elsewhere in this tree
-// (e.g. the file_source Windows timer fix earlier this session).
-static int64_t parseDateTime(const std::string& s) {
+// gmtime_r|s/timegm|_mkgmtime for the utc=true path, localtime_r|s/mktime otherwise -- every
+// function below takes an explicit `utc` flag rather than assuming one or the other. Originally
+// these all silently used local time unconditionally; found wrong the same day by the user
+// scheduling a Daily entry against a UTC broadcast time (this hobby's universal convention) --
+// "00:19:00" typed expecting UTC was silently read as 00:19 *local*, ~4 hours off. There is no
+// way to get this right by guessing, so it's now Recurrence's own explicit field (timezone,
+// "local"|"utc", default "utc" -- matching the convention this hobby actually schedules in,
+// unlike Recorder's own filename-timestamp timezone default of local), not a silent assumption.
+//
+// sscanf/mktime|timegm/localtime|gmtime_r|s rather than strptime -- strptime is POSIX-only and
+// this codebase also builds under MSVC (no strptime in its CRT), matching the portability
+// constraint already established elsewhere in this tree (e.g. the file_source Windows timer fix
+// earlier this session). timegm() itself is a BSD/glibc extension, not in the MSVC CRT either --
+// _mkgmtime is its documented Windows equivalent.
+
+// "YYYY-MM-DD HH:MM:SS" -> unix seconds.
+static int64_t parseDateTime(const std::string& s, bool utc) {
     struct tm tmv = {};
     int y, mo, d, h, mi, se;
     if (sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) { return 0; }
@@ -66,18 +78,22 @@ static int64_t parseDateTime(const std::string& s) {
     tmv.tm_hour = h;
     tmv.tm_min = mi;
     tmv.tm_sec = se;
-    tmv.tm_isdst = -1;
-    return (int64_t)mktime(&tmv);
+    tmv.tm_isdst = utc ? 0 : -1;
+#ifdef _WIN32
+    return (int64_t)(utc ? _mkgmtime(&tmv) : mktime(&tmv));
+#else
+    return (int64_t)(utc ? timegm(&tmv) : mktime(&tmv));
+#endif
 }
 
-static std::string formatDateTime(int64_t epoch) {
+static std::string formatDateTime(int64_t epoch, bool utc) {
     if (epoch == 0) { return ""; }
     time_t t = (time_t)epoch;
     struct tm tmv;
 #ifdef _WIN32
-    localtime_s(&tmv, &t);
+    if (utc) { gmtime_s(&tmv, &t); } else { localtime_s(&tmv, &t); }
 #else
-    localtime_r(&t, &tmv);
+    if (utc) { gmtime_r(&t, &tmv); } else { localtime_r(&t, &tmv); }
 #endif
     char buf[32];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -89,52 +105,55 @@ static int64_t nowEpoch() {
     return (int64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// True if `a` and `b` fall on the same local calendar day. Used to tell whether a daily/weekly
-// entry has already run today, since lastRunEpoch (set when a run *stops*, not starts) is the
-// only record kept of the last completed run -- see Entry::lastRunEpoch.
-static bool sameLocalDay(int64_t a, int64_t b) {
+// True if `a` and `b` fall on the same calendar day (in the given zone). Used to tell whether a
+// daily/weekly entry has already run today, since lastRunEpoch (set when a run *stops*, not
+// starts) is the only record kept of the last completed run -- see Entry::lastRunEpoch.
+static bool sameCalendarDay(int64_t a, int64_t b, bool utc) {
     if (a == 0 || b == 0) { return false; }
     time_t ta = (time_t)a, tb = (time_t)b;
     struct tm tma, tmb;
 #ifdef _WIN32
-    localtime_s(&tma, &ta);
-    localtime_s(&tmb, &tb);
+    if (utc) { gmtime_s(&tma, &ta); gmtime_s(&tmb, &tb); } else { localtime_s(&tma, &ta); localtime_s(&tmb, &tb); }
 #else
-    localtime_r(&ta, &tma);
-    localtime_r(&tb, &tmb);
+    if (utc) { gmtime_r(&ta, &tma); gmtime_r(&tb, &tmb); } else { localtime_r(&ta, &tma); localtime_r(&tb, &tmb); }
 #endif
     return tma.tm_year == tmb.tm_year && tma.tm_yday == tmb.tm_yday;
 }
 
-// Which day of week `epoch` falls on locally -- 0=Sunday..6=Saturday, matching
+// Which day of week `epoch` falls on (in the given zone) -- 0=Sunday..6=Saturday, matching
 // Recurrence::daysOfWeek's own indexing.
-static int localWeekday(int64_t epoch) {
+static int weekdayOf(int64_t epoch, bool utc) {
     time_t t = (time_t)epoch;
     struct tm tmv;
 #ifdef _WIN32
-    localtime_s(&tmv, &t);
+    if (utc) { gmtime_s(&tmv, &t); } else { localtime_s(&tmv, &t); }
 #else
-    localtime_r(&t, &tmv);
+    if (utc) { gmtime_r(&t, &tmv); } else { localtime_r(&t, &tmv); }
 #endif
     return tmv.tm_wday;
 }
 
-// Absolute epoch for `timeOfDay` ("HH:MM:SS") on the same local calendar day as `now`.
-static int64_t todaysThresholdEpoch(int64_t now, const std::string& timeOfDay) {
+// Absolute epoch for `timeOfDay` ("HH:MM:SS") on the same calendar day as `now` (in the given
+// zone).
+static int64_t todaysThresholdEpoch(int64_t now, const std::string& timeOfDay, bool utc) {
     time_t t = (time_t)now;
     struct tm tmv;
 #ifdef _WIN32
-    localtime_s(&tmv, &t);
+    if (utc) { gmtime_s(&tmv, &t); } else { localtime_s(&tmv, &t); }
 #else
-    localtime_r(&t, &tmv);
+    if (utc) { gmtime_r(&t, &tmv); } else { localtime_r(&t, &tmv); }
 #endif
     int h = 0, mi = 0, se = 0;
     sscanf(timeOfDay.c_str(), "%d:%d:%d", &h, &mi, &se);
     tmv.tm_hour = h;
     tmv.tm_min = mi;
     tmv.tm_sec = se;
-    tmv.tm_isdst = -1;
-    return (int64_t)mktime(&tmv);
+    tmv.tm_isdst = utc ? 0 : -1;
+#ifdef _WIN32
+    return (int64_t)(utc ? _mkgmtime(&tmv) : mktime(&tmv));
+#else
+    return (int64_t)(utc ? timegm(&tmv) : mktime(&tmv));
+#endif
 }
 
 // Once/Daily/Weekly, matching RECORDING_SCHEDULER_PLAN.md section 3's schema exactly.
@@ -144,15 +163,26 @@ static int64_t todaysThresholdEpoch(int64_t now, const std::string& timeOfDay) {
 // yet (plan section 8, open decision 4) -- runs indefinitely until the entry is disabled.
 struct Recurrence {
     std::string type = "once";          // "once" | "daily" | "weekly"
+    // "local" | "utc" -- governs interpretation of startEpoch/stopEpoch's text-field input
+    // ("once") and startTimeOfDay ("daily"/"weekly") alike. Default "utc", not "local": this
+    // hobby's broadcast schedules are universally published in UTC, and a silent local-time
+    // assumption with no indicator in the UI is exactly what caused a Daily entry to sit
+    // ~4 hours off from what the user typed (2026-08-15) -- see the block comment above
+    // parseDateTime() for the full story. Deliberately per-entry, not a single app-wide
+    // setting: some things genuinely are scheduled in local time.
+    std::string timezone = "utc";
     int64_t startEpoch = 0;             // "once" only
     int64_t stopEpoch = 0;              // "once" only
     std::string startTimeOfDay = "00:00:00";   // "daily"/"weekly" only, "HH:MM:SS"
     int durationMin = 60;               // "daily"/"weekly" only, minutes
     bool daysOfWeek[7] = { false, false, false, false, false, false, false };   // Sun..Sat, "weekly" only
 
+    bool isUtc() const { return timezone == "utc"; }
+
     json toJson() const {
         json j;
         j["type"] = type;
+        j["timezone"] = timezone;
         j["startEpoch"] = startEpoch;
         j["stopEpoch"] = stopEpoch;
         j["startTimeOfDay"] = startTimeOfDay;
@@ -166,6 +196,14 @@ struct Recurrence {
     static Recurrence fromJson(const json& j) {
         Recurrence r;
         if (j.contains("type")) { r.type = j["type"]; }
+        // A config saved before 2026-08-15's timezone field existed predates this option
+        // entirely, which means its startEpoch/stopEpoch/startTimeOfDay were being parsed as
+        // local *only because that was the bug* -- not a deliberate choice worth preserving.
+        // Falls through to the same "utc" default as a fresh Recurrence, matching what this
+        // hobby's schedules are actually published in (and confirmed directly: the one entry
+        // that surfaced this whole issue was meant as UTC the entire time). Still a one-click
+        // fix in the UI if any specific entry genuinely needs "local" instead.
+        r.timezone = j.contains("timezone") ? j["timezone"].get<std::string>() : "utc";
         if (j.contains("startEpoch")) { r.startEpoch = j["startEpoch"]; }
         if (j.contains("stopEpoch")) { r.stopEpoch = j["stopEpoch"]; }
         if (j.contains("startTimeOfDay")) { r.startTimeOfDay = j["startTimeOfDay"]; }
@@ -507,10 +545,10 @@ private:
         // the early-outs below) so the window stays tight (~1s, this engine's own poll
         // interval) rather than going stale across disabled/off-day stretches.
         if (e.status != "scheduled" && e.status != "ran") { e.lastEngineCheckEpoch = now; return false; }
-        if (e.status == "ran" && sameLocalDay(e.lastRunEpoch, now)) { e.lastEngineCheckEpoch = now; return false; }
-        if (r.type == "weekly" && !r.daysOfWeek[localWeekday(now)]) { e.lastEngineCheckEpoch = now; return false; }
+        if (e.status == "ran" && sameCalendarDay(e.lastRunEpoch, now, r.isUtc())) { e.lastEngineCheckEpoch = now; return false; }
+        if (r.type == "weekly" && !r.daysOfWeek[weekdayOf(now, r.isUtc())]) { e.lastEngineCheckEpoch = now; return false; }
 
-        int64_t thresholdEpoch = todaysThresholdEpoch(now, r.startTimeOfDay);
+        int64_t thresholdEpoch = todaysThresholdEpoch(now, r.startTimeOfDay, r.isUtc());
         bool crossed = e.lastEngineCheckEpoch > 0 && e.lastEngineCheckEpoch < thresholdEpoch && now >= thresholdEpoch;
         e.lastEngineCheckEpoch = now;
         return crossed;
@@ -782,24 +820,40 @@ private:
                         recurDirty = true;
                     }
 
+                    // Distinct from the Recorder section's own "Timezone" field above (which
+                    // only affects recorded filename timestamps) -- this one governs when the
+                    // entry actually fires. Labeled explicitly as "Schedule timezone" so the
+                    // two are never mistaken for each other again (see 2026-08-15: a Daily
+                    // entry silently ran on local time despite the Recorder section already
+                    // being set to UTC, because there was no schedule-side timezone control at
+                    // all -- fixed by adding this one, not by reusing that one, since they
+                    // really are two different things that can legitimately differ).
+                    int tzId = rec.isUtc() ? 1 : 0;
+                    ImGui::LeftLabel("Schedule timezone");
+                    ImGui::FillWidth();
+                    if (ImGui::Combo(CONCAT("##recsched_rectz_", _this->name), &tzId, "Local\0UTC\0")) {
+                        rec.timezone = (tzId == 1) ? "utc" : "local";
+                        recurDirty = true;
+                    }
+
                     if (rec.type == "once") {
                         char startBuf[32];
-                        strncpy(startBuf, formatDateTime(rec.startEpoch).c_str(), sizeof(startBuf) - 1);
+                        strncpy(startBuf, formatDateTime(rec.startEpoch, rec.isUtc()).c_str(), sizeof(startBuf) - 1);
                         startBuf[sizeof(startBuf) - 1] = 0;
-                        ImGui::LeftLabel("Start (YYYY-MM-DD HH:MM:SS)");
+                        ImGui::LeftLabel(rec.isUtc() ? "Start (YYYY-MM-DD HH:MM:SS, UTC)" : "Start (YYYY-MM-DD HH:MM:SS, local)");
                         ImGui::FillWidth();
                         if (ImGui::InputText(CONCAT("##recsched_recstart_", _this->name), startBuf, sizeof(startBuf))) {
-                            rec.startEpoch = parseDateTime(startBuf);
+                            rec.startEpoch = parseDateTime(startBuf, rec.isUtc());
                             recurDirty = true;
                         }
 
                         char stopBuf[32];
-                        strncpy(stopBuf, formatDateTime(rec.stopEpoch).c_str(), sizeof(stopBuf) - 1);
+                        strncpy(stopBuf, formatDateTime(rec.stopEpoch, rec.isUtc()).c_str(), sizeof(stopBuf) - 1);
                         stopBuf[sizeof(stopBuf) - 1] = 0;
-                        ImGui::LeftLabel("Stop (YYYY-MM-DD HH:MM:SS)");
+                        ImGui::LeftLabel(rec.isUtc() ? "Stop (YYYY-MM-DD HH:MM:SS, UTC)" : "Stop (YYYY-MM-DD HH:MM:SS, local)");
                         ImGui::FillWidth();
                         if (ImGui::InputText(CONCAT("##recsched_recstop_", _this->name), stopBuf, sizeof(stopBuf))) {
-                            rec.stopEpoch = parseDateTime(stopBuf);
+                            rec.stopEpoch = parseDateTime(stopBuf, rec.isUtc());
                             recurDirty = true;
                         }
 
@@ -811,7 +865,7 @@ private:
                         char todBuf[16];
                         strncpy(todBuf, rec.startTimeOfDay.c_str(), sizeof(todBuf) - 1);
                         todBuf[sizeof(todBuf) - 1] = 0;
-                        ImGui::LeftLabel("Start time of day (HH:MM:SS)");
+                        ImGui::LeftLabel(rec.isUtc() ? "Start time of day (HH:MM:SS, UTC)" : "Start time of day (HH:MM:SS, local)");
                         ImGui::FillWidth();
                         if (ImGui::InputText(CONCAT("##recsched_rectod_", _this->name), todBuf, sizeof(todBuf))) {
                             rec.startTimeOfDay = std::string(todBuf);
