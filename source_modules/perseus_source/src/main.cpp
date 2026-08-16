@@ -39,6 +39,9 @@ public:
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
         handler.stream = &stream;
+        handler.captureConfigHandler = captureConfig;
+        handler.applyConfigHandler = applyConfig;
+        handler.moduleType = "perseus_source";   // must match SDRPP_MOD_INFO's Name above
 
         perseus_set_debug(9);
 
@@ -228,6 +231,67 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    // Writes the live per-device fields into this device's own stored config -- shared by
+    // applyConfig() below and mirrors exactly what each individual menuHandler control already
+    // writes piecemeal on its own change.
+    void persistDeviceSettings() {
+        if (selectedSerial.empty()) { return; }
+        config.acquire();
+        config.conf["devices"][selectedSerial]["samplerate"] = sampleRate;
+        config.conf["devices"][selectedSerial]["attenuation"] = atten;
+        config.conf["devices"][selectedSerial]["preamp"] = preamp;
+        config.conf["devices"][selectedSerial]["dithering"] = dithering;
+        config.conf["devices"][selectedSerial]["preselector"] = preselector;
+        config.release(true);
+    }
+
+    // SourceHandler::captureConfigHandler/applyConfigHandler (source.h) -- RECORDING_SCHEDULER_PLAN.md
+    // phase 6, fifth module. srList is only populated once select() has actually opened the
+    // physical device at least once this session (a live hardware query, requires a firmware
+    // upload each time) -- applyConfig() degrades gracefully (the sample rate is silently left
+    // unapplied) rather than crashing if a snapshot is applied before that's happened. The user
+    // keeps this radio connected to their main Windows PC, per RECORDING_SCHEDULER_PLAN.md's own
+    // phase 6 notes -- worth an extra close look at the Windows build once that's available to
+    // test against, since libperseus' firmware-download step is otherwise unverified here.
+    static json captureConfig(void* ctx) {
+        PerseusSourceModule* _this = (PerseusSourceModule*)ctx;
+        json d;
+        if (!_this->srList.empty()) { d["samplerate"] = _this->srList.key(_this->srId); }
+        d["attenuation"] = _this->atten;
+        d["preamp"] = _this->preamp;
+        d["dithering"] = _this->dithering;
+        d["preselector"] = _this->preselector;
+        return d;
+    }
+
+    static void applyConfig(const json& cfg, void* ctx) {
+        PerseusSourceModule* _this = (PerseusSourceModule*)ctx;
+        if (cfg.contains("samplerate") && !_this->srList.empty() && _this->srList.keyExists(cfg["samplerate"].get<int>())) {
+            _this->srId = _this->srList.keyId(cfg["samplerate"].get<int>());
+            _this->sampleRate = _this->srList[_this->srId];
+        }
+        if (cfg.contains("attenuation")) {
+            _this->atten = std::clamp<float>((float)cfg["attenuation"], 0.0f, 30.0f);
+        }
+        if (cfg.contains("preamp")) { _this->preamp = cfg["preamp"]; }
+        if (cfg.contains("dithering")) { _this->dithering = cfg["dithering"]; }
+        if (cfg.contains("preselector")) { _this->preselector = cfg["preselector"]; }
+
+        _this->persistDeviceSettings();
+
+        if (_this->running) {
+            perseus_set_attenuator_in_db(_this->openDev, _this->atten);
+            perseus_set_adc(_this->openDev, _this->dithering, _this->preamp);
+            perseus_set_ddc_center_freq(_this->openDev, _this->freq, _this->preselector);
+            // NOTE: samplerate itself is not changed here, matching the existing menuHandler
+            // combo's own behavior (perseus_set_sampling_rate is only ever called from start()) --
+            // changing it live while streaming isn't something this module supports today.
+        }
+        if (sigpath::sourceManager.getSelectedName() == "Perseus") {
+            core::setInputSampleRate(_this->sampleRate);
+        }
     }
 
     static void menuSelected(void* ctx) {
