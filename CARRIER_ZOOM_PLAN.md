@@ -214,3 +214,41 @@ graveyard frequency (this session's test tuned to a live medium-wave band genera
 specifically parked on a known multi-station graveyard channel) — the feature's actual real-world
 payoff, as opposed to its mechanics, needs Ralph's own ears/eyes against a frequency he knows has
 multiple stations on it.
+
+**2026-08-18: third heap-corruption bug found and fixed, in `dsp::buffer::Reshaper` usage, not
+`CarrierZoomView` itself.** Ralph hit this live, pushing the width slider down toward ~200Hz and
+resolution down toward ~0.3Hz/bin (rapidly, exploring whether the wide lines near the nominal
+frequency were actually multiple carriers) — same crash signature and same call site
+(`CarrierZoomView::allocateFFT()` ← `recomputeWindowAndHop()` ← `setWidth()`) as the two crashes
+`2d700441` already fixed, meaning that fix, while real and necessary, wasn't the last gap.
+
+Root cause: `setWidth()`/`setResolutionHz()`/`setUpdateIntervalSec()` bracket `fftSink.stop()`/
+`start()` around the whole mutation (per `2d700441`'s own fix), but never touched `reshape` at
+all — `reshape.setKeep()`/`setSkip()` were the only calls made against it, from inside
+`recomputeWindowAndHop()`. Read `core/src/dsp/buffer/reshaper.h` directly to check
+`Reshaper::setKeep()`/`setSkip()`'s own safety (both call `tempStop()`/`tempStart()`, and reading
+`core/src/dsp/block.h` confirmed those really do fully join-and-recreate `Reshaper`'s own two
+worker threads, not some lighter partial pause -- so `reshape`'s *own* internal state was never
+literally stale). The actual gap: `reshape`'s own worker thread (`Reshaper::run()`, reading from
+`dspVFO->out`) keeps running the entire time `dspVFO->setOutSamplerate()` executes earlier in
+`setWidth()`, unprotected by anything -- the same shape of race the `2d700441` fix closed one
+layer down (fftSink vs. reshape's own reconfiguration), just one layer further up the pipeline
+(reshape vs. the VFO's own reconfiguration), and missed because the earlier investigation focused
+on fftSink/FFT-buffer sizing specifically, not on auditing every block in the chain for the same
+class of gap.
+
+Fix: `reshape.stop()`/`reshape.start()` now bracket the entire mutation in all three setters too,
+matching `fftSink`'s own bracket, stopped downstream-to-upstream (`fftSink` then `reshape`) and
+started upstream-to-downstream (`reshape` then `fftSink`) -- the general safe pattern for
+reconfiguring a live pipeline. `reshape.setKeep()`/`setSkip()`'s own `tempStop()`/`tempStart()`
+calls become harmless no-ops once `reshape.stop()` has already set `running=false`, not a second
+stop of an already-stopped block (confirmed by reading `tempStop()`/`tempStart()`'s own guard
+logic in `block.h`).
+
+Verified live against the exact configuration that crashed (width ≈200Hz, resolution ≈0.3Hz/bin,
+Ralph's own recording (`baseband_1123428Hz_02-57-00_17-08-2026.wav`) at 1490kHz): 100+ rapid,
+unpaced slider interactions across width/resolution/update-interval, including sustained
+alternating min-to-max jumps on all three sliders simultaneously and settings matching/exceeding
+the crash trigger (down to 191Hz width, 0.29Hz/bin, 0.27s update interval) — all survived, app
+stayed alive and responsive throughout, quit cleanly by PID afterward. Full multi-target rebuild
+with Perseus support, bundled, final smoke test also clean.

@@ -161,17 +161,38 @@ public:
     // snapWidth() reasoning (see that class and RADIO_SPECTRUM_FILTER_PLAN.md's postmortem on
     // the 1.16-million-tap resampler bug this protects against).
     //
-    // The whole body (VFO rate change included) runs with fftSink stopped -- see this class's
-    // own header comment on why: a first version stopped fftSink only around the
-    // reshape-resize/FFT-realloc step, leaving dspVFO->setOutSamplerate() itself unprotected,
-    // and that gap was enough to produce a real, live heap corruption crash (a different
-    // allocation site each time, the classic symptom of a corruption detected long after the
-    // write that caused it -- see git history for the two live crash reports this came from).
+    // The whole body (VFO rate change included) runs with BOTH fftSink and reshape stopped. See
+    // this class's own header comment for the fftSink half of this history: a first version
+    // stopped fftSink only around the reshape-resize/FFT-realloc step, leaving
+    // dspVFO->setOutSamplerate() itself unprotected, and that gap was enough to produce a real,
+    // live heap corruption crash.
+    //
+    // The reshape half is a second, later-discovered gap in that same fix (Ralph, 2026-08-18,
+    // hit this live rapidly dragging the width/resolution sliders): reshape itself was never
+    // stopped here, only reconfigured via reshape.setKeep()/setSkip() inside
+    // recomputeWindowAndHop() -- and reshape's own worker thread (dsp::buffer::Reshaper::run(),
+    // reading from dspVFO->out) kept running the entire time dspVFO->setOutSamplerate() executed
+    // above it, unprotected by anything. setKeep()/setSkip() do fully stop-and-restart reshape's
+    // *own* two worker threads (via tempStop()/tempStart(), which -- confirmed by reading
+    // dsp/block.h -- really do call the same doStop()/doStart() a full stop()/start() would, not
+    // some lighter partial pause), so reshape's own internal state was never literally stale --
+    // but that stop/restart happens *after* the VFO has already been reconfigured, leaving the
+    // exact same kind of window the first fftSink fix closed, just one level up the pipeline.
+    // Stopping reshape here too (before the VFO ever changes, alongside fftSink) closes that
+    // gap directly; the calls setKeep()/setSkip() still make internally become harmless no-ops in
+    // that case (reshape.stop() already set running=false, so their own tempStop()/tempStart()
+    // have nothing live left to touch), not a second stop of an already-stopped block.
+    //
+    // Stop order is downstream-to-upstream (fftSink, the consumer, before reshape, the producer
+    // it reads from) and start is the mirror, upstream-to-downstream (reshape before fftSink) --
+    // the general safe pattern for reconfiguring a live pipeline: nothing downstream is ever left
+    // running while something it depends on is mid-reconfiguration.
     void setWidth(double desiredWidthHz) {
         if (!_init) { return; }
         double snapped = snapWidth(desiredWidthHz);
         if (snapped == _widthHz) { return; }
         fftSink.stop();
+        reshape.stop();
         _widthHz = snapped;
         dspVFO->setOutSamplerate(_widthHz, _widthHz);
         // Same fix RadioSpectrumPreview::setWidth() needed (RADIO_SPECTRUM_FILTER_PLAN.md round
@@ -180,6 +201,7 @@ public:
         // explicitly, every time, since this VFO has no passband concept of its own.
         dspVFO->setPassband(-_widthHz / 2.0, _widthHz / 2.0);
         recomputeWindowAndHop(false);
+        reshape.start();
         fftSink.start();
     }
     double getWidth() { return _widthHz; }
@@ -194,8 +216,10 @@ public:
         hz = std::clamp(hz, MIN_RESOLUTION_HZ, MAX_RESOLUTION_HZ);
         if (hz == _resolutionHz) { return; }
         fftSink.stop();
+        reshape.stop();
         _resolutionHz = hz;
         recomputeWindowAndHop(false);
+        reshape.start();
         fftSink.start();
     }
     double getResolutionHz() { return _resolutionHz; }
@@ -205,8 +229,10 @@ public:
         sec = std::clamp(sec, MIN_UPDATE_INTERVAL_SEC, MAX_UPDATE_INTERVAL_SEC);
         if (sec == _updateIntervalSec) { return; }
         fftSink.stop();
+        reshape.stop();
         _updateIntervalSec = sec;
         recomputeWindowAndHop(false);
+        reshape.start();
         fftSink.start();
     }
     double getUpdateIntervalSecRequested() { return _updateIntervalSec; }
@@ -274,11 +300,17 @@ private:
     // just restart cleanly" call MiniSpectrum::resetRange() already makes elsewhere in this
     // module's own UI.
     //
-    // Assumes fftSink is already stopped by the caller (setWidth()/setResolutionHz()/
-    // setUpdateIntervalSec(), or not yet started at all during init()'s first=true call) --
-    // this function itself never touches fftSink, deliberately, so every caller's own
-    // stop-mutate-start bracket covers the *entire* mutation (VFO rate change included, for
-    // setWidth()) rather than just the part that happens to live in here.
+    // Assumes fftSink AND reshape are already stopped by the caller (setWidth()/
+    // setResolutionHz()/setUpdateIntervalSec(), or neither yet started at all during init()'s
+    // first=true call) -- this function itself never touches either one's start/stop state,
+    // deliberately, so every caller's own stop-mutate-start bracket covers the *entire* mutation
+    // (VFO rate change included, for setWidth()) rather than just the part that happens to live
+    // in here. reshape.setKeep()/setSkip() below still get called either way (first=true skips
+    // them, matching init()'s own reshape.init() taking the already-correct values directly) --
+    // with reshape already stopped by the caller, their own internal tempStop()/tempStart() calls
+    // find nothing running and become harmless no-ops, not a second stop of an already-stopped
+    // block (see setWidth()'s own comment for why reshape being stopped here at all was a
+    // necessary fix, not just defensive).
     void recomputeWindowAndHop(bool first) {
         int newWindow = std::clamp((int)std::round(_widthHz / _resolutionHz), MIN_WINDOW_SIZE, MAX_WINDOW_SIZE);
         // Hop can never exceed the window (per CARRIER_ZOOM_PLAN.md: "the update-rate slider's
