@@ -181,6 +181,36 @@ open-or-retarget-to-this-instance, seeding the initial offset from the same
 
 ## Status
 
-2026-08-16: plan written. Same day, resolution/update-rate, history depth, persistence, default
-zoom width, and the single-window-only decision all resolved per Ralph's direction above. No
-implementation started yet.
+**2026-08-16: implemented**, commit `89e46b87`. `core/src/gui/widgets/carrier_zoom_plot.{h,cpp}`
+(the widget), `decoder_modules/radio/src/carrier_zoom.h` (the DSP feed),
+`decoder_modules/radio/src/carrier_zoom_window.h` (the single app-wide owner + floating window),
+wired into `radio_module.h`'s `menuHandler()`/`disable()`.
+
+One design refinement made during implementation, not called out explicitly above: the "default
+resolution/update-rate slider positions" open question resolved itself into concrete numbers
+while building `CarrierZoomView` — `DEFAULT_RESOLUTION_HZ = 2.0`, `DEFAULT_UPDATE_INTERVAL_SEC =
+1.0`, with a practical floor of `MIN_UPDATE_INTERVAL_SEC = 0.2` (seconds) that the update-rate
+slider can't go below — needed regardless of "free slider," since nothing else bounds how large
+the 60-second-capped history's row count (and therefore `CarrierZoomPlot`'s own per-frame texture
+rebuild cost) can get at the fast end. Documented on `CarrierZoomView` itself, not hidden.
+
+Verified live against a real, running session (the actual `root` config, RSR200 recording
+scheduler active, not a synthetic test): built clean end to end (the `radio` target alone, then a
+full multi-target rebuild — zero new errors, only this project's own pre-existing warning noise),
+bundled, and driven interactively via `cliclick` rather than just launched-and-not-crashed. The
+double-click trigger opened the window with sensible defaults (width snapped against the live
+source's actual rate, resolution 2.00Hz/bin, update interval clamped to 0.50s/row at that width);
+dragging the width and resolution sliders live re-rendered the plot correctly each time (wider
+width + finer resolution produced a visibly sharper waterfall, and the actual-update-interval
+readout tracked the hop-vs-window clamp correctly throughout); the rendered waterfall showed a
+real, stable carrier streak at center — the exact signal this feature exists to make visible, not
+staged. Closed cleanly via the window's own titlebar button. The app stayed alive and responsive
+throughout the whole interaction and for 15+ seconds afterward, then quit cleanly by PID. A
+second, independent SDR++ process the user had running separately (a different app bundle) was
+left completely untouched throughout.
+
+**Not yet verified**: real side-by-side separation of two actual co-channel stations at a real
+graveyard frequency (this session's test tuned to a live medium-wave band generally, not
+specifically parked on a known multi-station graveyard channel) — the feature's actual real-world
+payoff, as opposed to its mechanics, needs Ralph's own ears/eyes against a frequency he knows has
+multiple stations on it.
