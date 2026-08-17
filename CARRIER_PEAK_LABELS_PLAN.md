@@ -232,3 +232,70 @@ deliberately not a change to the shared `utils::formatFreq()` itself, which stay
 for the main readout and everywhere else that isn't this specifically-broadcast-band-focused
 widget. Rebuilt, bundled with Perseus support, verified live (labels now read e.g. "1399.665116
 kHz"), quit cleanly.
+
+**2026-08-18: detection redesigned around time-persistence, after Ralph reported real false
+positives.** Trying the feature against real recordings, Ralph found the detector was marking a
+lot of locations that were "just frequency peaks in station audio" -- these "tend to appear and
+disappear," unlike a real carrier, which "show[s] up as a straight (or straight-ish...) line."
+Root cause: peak-finding ran against a single instantaneous FFT row every hop. A loud, stable tone
+in a station's own program audio (a jingle note, a sustained vowel formant) can be the tallest bin
+in that one row exactly the same way a real carrier is -- nothing in the original design
+distinguished "tallest bin right now" from "reliably the tallest bin over time," which is the
+actual physical difference between a real carrier and modulation content.
+
+*First attempt (superseded)*: kept peak-finding on the raw instantaneous row, and instead gated
+*which already-detected peaks get shown* behind a several-second "seen enough times" counter
+(`CONFIRM_SECONDS`, `TrackedPeak::hits`). Live-tested against Ralph's own recording
+(`baseband_1123428Hz_02-57-00_17-08-2026.wav`, tuned to 1490kHz): found wanting. The confirmed
+peak count kept drifting over minutes of continued observation (3, then 2, then 4 confirmed peaks
+at successive checkpoints, with the underlying frequencies shifting by tens of Hz between them) --
+gating *after* detection doesn't stop a several-second-long audio passage from getting confirmed
+in the first place, it just delays when that happens.
+
+*Second attempt (kept)*: moved the persistence requirement to where it actually belongs --
+averages the spectrum itself (a per-bin exponential moving average in `fftHandler()`, time
+constant `AVERAGING_SECONDS = 5.0`) *before* any peak-finding ever runs against it, rather than
+peak-finding first and trying to filter results after the fact. A carrier that's always at the
+same bin reinforces there every frame; audio energy that's only at a given bin some of the time
+gets diluted across whatever other bins it moves to. This directly implements the same
+"accumulates as a stable streak over time" reasoning `CARRIER_ZOOM_PLAN.md`'s own waterfall design
+was already built on, rather than approximating it after the fact. `CONFIRM_SECONDS` stays as a
+much smaller secondary safety margin (1.5s) on top, no longer the primary mechanism.
+
+Live-verified against the same real recording, both known test frequencies, watched continuously
+over 40-60+ seconds per frequency (not just a single snapshot): substantially more stable than the
+first attempt -- reported frequencies drift by single-digit Hz between checkpoints rather than the
+tens-of-Hz jumps and 2x count swings seen before. **Two honest, unresolved observations from that
+verification, not yet fully explained:**
+- At 1490kHz (Ralph's own read: "probably two carriers"), the detector consistently found 3-4
+  peaks across every checkpoint: one clearly separate, very consistently-placed carrier around
+  1490.09-1490.11kHz, plus a tighter, noisier cluster of 1-3 sub-peaks within about 130Hz of each
+  other around 1489.87-1490.00kHz that varied between 1 and 3 resolved sub-peaks from checkpoint
+  to checkpoint. Whether that cluster is genuinely 2-3 distinct, very closely-spaced stations
+  (plausible -- two carriers a few tens of Hz apart would beat against each other in ways that
+  could make the cluster's own sub-structure hard to resolve consistently) or an
+  averaging-window artifact wasn't resolved from spectral shape alone.
+- At 1550kHz (Ralph's own read: "probably three carriers"), one checkpoint found exactly 5 peaks
+  (hitting `MAX_PEAKS`), suspiciously **evenly spaced** (~54-59Hz apart: 1549.887, 1549.946,
+  1549.999875, 1550.054, 1550.107kHz) and roughly symmetric around 1550.000kHz. Evenly-spaced
+  symmetric sidebands around a center frequency are the classic signature of AM modulation
+  sidebands from a single carrier being modulated by a strong periodic tone (e.g. 60Hz mains hum
+  or a harmonic-rich buzz) -- not independent stations. A later checkpoint at the same frequency
+  found only 4, with the weakest of the five (1550.054) gone and the others shifted several Hz.
+  **This is a real, unresolved limitation, not just an unverified guess**: time-averaging (this
+  fix's whole mechanism) filters out energy that *isn't* persistent, but it cannot distinguish
+  "multiple genuinely separate carriers" from "one carrier with a persistent, continuously-present
+  modulation artifact (like hum)" -- both present as stable multi-peak energy over time to a pure
+  spectral detector. Disambiguating those two cases likely needs either a much higher
+  `PEAK_PROMINENCE_DB` (accepting fewer, only-the-strongest peaks, at the cost of maybe missing a
+  real weak co-channel station) or a check this class doesn't have any version of yet (e.g.
+  flagging/downweighting suspiciously-even spacing) -- flagged here rather than guessed at, since
+  resolving it needs either Ralph's own ear against these exact frequencies or a decision about
+  which failure mode (miss a real weak station vs. show a hum sideband as a fake one) is more
+  acceptable to bias toward.
+
+Rebuilt, full multi-target, bundled with Perseus support, launched/quit cleanly. Committed as a
+real, verified improvement over the original per-frame detector (the specific complaint that
+prompted this -- peaks appearing and disappearing within single-digit seconds of noise -- is
+fixed), with the hum/sideband-vs-multiple-carriers ambiguity above left as an open, flagged
+question rather than something this commit claims to have resolved.

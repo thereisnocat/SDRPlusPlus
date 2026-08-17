@@ -72,6 +72,37 @@ public:
     // absorbs a real signal briefly dipping below the prominence threshold for one hop without
     // its line/label flickering out and back.
     static constexpr int MAX_PEAK_MISSES = 3;
+    // How long a real signal's energy gets time-averaged (in the spectral domain, see
+    // fftHandler()'s own avgRow) before peak-finding ever runs against it -- the actual mechanism
+    // that separates a real, frequency-stable carrier from a strong tone in a station's own
+    // program audio. Added after Ralph tried the first version against real broadcast audio
+    // (2026-08-18): peak-finding on a single instantaneous FFT row can't tell the two apart --
+    // both can be the tallest bin in that one row. What actually distinguishes them is
+    // persistence: "actual carriers show up as a straight (or straight-ish...) line" over the
+    // full observation, while an audio-driven peak "tend[s] to appear and disappear" as the
+    // program content changes, because nothing in normal speech/music holds one exact frequency
+    // for more than a couple seconds. A first attempt at this tried to keep peak-finding on the
+    // raw instantaneous row and instead gate *which already-detected peaks get shown* behind a
+    // several-second "seen enough times" counter -- live-tested against Ralph's own recording
+    // (baseband_1123428Hz_02-57-00_17-08-2026.wav, 1490kHz) and found wanting: the peak count kept
+    // drifting over minutes of continued observation (3, then 2, then 4 confirmed peaks), because
+    // gating after the fact doesn't stop a several-second-long audio passage from getting
+    // confirmed in the first place. This instead averages the spectrum *before* any peak-finding
+    // ever runs on it (exponential moving average per bin, time constant below) -- a carrier
+    // that's always at the same bin reinforces there every frame; audio energy that's only at a
+    // given bin some of the time gets diluted across whatever other bins it moves to, directly
+    // implementing the same "accumulates as a stable streak over time" reasoning
+    // CARRIER_ZOOM_PLAN.md's own waterfall design was already built on, rather than trying to
+    // approximate it after the fact by counting detections. A "look and see" constant like the
+    // others above, expected to be retuned by feel; too short and audio energy has time to
+    // dominate an averaged bin before it decays out, too long and real transmitter drift over that
+    // same window starts smearing a genuine carrier's own energy across neighboring bins.
+    static constexpr double AVERAGING_SECONDS = 5.0;
+    // A much smaller, secondary safety margin on top of the averaging above -- not the primary
+    // filtering mechanism anymore (see AVERAGING_SECONDS), just enough to avoid drawing a peak
+    // that clears the prominence threshold for a single freak frame of the averaged spectrum
+    // (e.g. right as averaging is still converging after a resolution/width change resets it).
+    static constexpr double CONFIRM_SECONDS = 1.5;
     // Fixed exponential-smoothing factor for a tracked peak's offset -- how much of the gap
     // between the tracked value and this frame's fresh detection to close per update. Not ramped
     // the way CarrierZoomPlot's own dB-range convergence is (carrier_zoom_plot.cpp) -- that one
@@ -115,6 +146,7 @@ public:
         std::lock_guard<std::mutex> lck(histMtx);
         history.clear();
         trackedPeaks.clear();
+        avgRowInit = false;
     }
 
     bool isInit() { return _init; }
@@ -198,17 +230,23 @@ public:
     }
     void releaseHistory() { histMtx.unlock(); }
 
-    // Thread-safe access to the latest tracked peaks (see CARRIER_PEAK_LABELS_PLAN.md), same
-    // acquire/release-under-histMtx shape as acquireHistory()/releaseHistory() above -- peak
+    // Thread-safe access to the latest CONFIRMED tracked peaks (see CARRIER_PEAK_LABELS_PLAN.md),
+    // same acquire/release-under-histMtx shape as acquireHistory()/releaseHistory() above -- peak
     // tracking lives on the same fftSink worker thread and under the same lock as history itself,
     // so sharing the lock (rather than a second one) avoids a second lock-ordering relationship to
-    // reason about for no real benefit. Returns false (do not use peaks) if not initialized.
+    // reason about for no real benefit. Returns false (do not use peaks) if not initialized. Only
+    // peaks that have met confirmHitsNeeded() are returned -- a peak still accumulating hits
+    // toward that threshold exists internally in trackedPeaks but is deliberately invisible to
+    // every caller of this method until it graduates, see CONFIRM_SECONDS's own comment.
     bool acquirePeaks(std::vector<PeakInfo>& peaks) {
         histMtx.lock();
         peaks.clear();
         if (!_init) { return false; }
+        int needed = confirmHitsNeeded();
         peaks.reserve(trackedPeaks.size());
-        for (auto& tp : trackedPeaks) { peaks.push_back({ tp.offsetHz, tp.magnitudeDb }); }
+        for (auto& tp : trackedPeaks) {
+            if (tp.hits >= needed) { peaks.push_back({ tp.offsetHz, tp.magnitudeDb }); }
+        }
         return true;
     }
     void releasePeaks() { histMtx.unlock(); }
@@ -265,6 +303,11 @@ private:
 
         if (windowChanged) {
             allocateFFT();
+            // avgRow is sized to _windowSize -- stale averaged data from a different window size
+            // isn't just wrong, it's the wrong length entirely, so it needs to restart (see
+            // fftHandler()'s own comment on why avgRowInit=false means "hard-set from the next raw
+            // row" rather than blending into whatever was there before).
+            avgRowInit = false;
             if (!first) {
                 std::lock_guard<std::mutex> lck(histMtx);
                 history.clear();
@@ -286,6 +329,17 @@ private:
         fftwf_free(fftInBuf);
         fftwf_free(fftOutBuf);
         fftAllocated = false;
+    }
+
+    // Confirmation threshold in units of hop counts, derived from CONFIRM_SECONDS and the
+    // *current* actual hop interval (same formula as getUpdateIntervalSecActual()) rather than a
+    // fixed frame count -- so it stays a constant number of real seconds regardless of whatever
+    // update-rate slider position the user has picked, past or present (evaluated fresh on every
+    // call, not baked into a tracked peak at creation time).
+    int confirmHitsNeeded() {
+        double hopIntervalSec = (_widthHz > 0.0 && _hopSize > 0) ? ((double)_hopSize / _widthHz) : 1.0;
+        if (hopIntervalSec <= 0.0) { return 1; }
+        return (std::max)(1, (int)std::round(CONFIRM_SECONDS / hopIntervalSec));
     }
 
     int computeMaxRows() {
@@ -375,6 +429,12 @@ private:
                 tp.offsetHz += (fresh[bestIdx].offsetHz - tp.offsetHz) * PEAK_SMOOTHING_ALPHA;
                 tp.magnitudeDb = fresh[bestIdx].magnitudeDb;
                 tp.misses = 0;
+                // Capped, not unbounded -- once a peak clears confirmHitsNeeded() it stays
+                // confirmed for as long as it keeps being matched (misses alone drive eviction,
+                // see below); the cap just keeps the counter from growing without bound over a
+                // long session, with no behavioral difference above the confirm threshold either
+                // way.
+                tp.hits = (std::min)(tp.hits + 1, confirmHitsNeeded() * 4);
             }
             else {
                 tp.misses++;
@@ -384,7 +444,7 @@ private:
                                            [](const TrackedPeak& tp) { return tp.misses > MAX_PEAK_MISSES; }),
                             trackedPeaks.end());
         for (size_t i = 0; i < fresh.size(); i++) {
-            if (!matched[i]) { trackedPeaks.push_back({ fresh[i].offsetHz, fresh[i].magnitudeDb, 0 }); }
+            if (!matched[i]) { trackedPeaks.push_back({ fresh[i].offsetHz, fresh[i].magnitudeDb, 0, 1 }); }
         }
     }
 
@@ -411,11 +471,31 @@ private:
         std::vector<float> row(n);
         volk_32fc_s32f_power_spectrum_32f(row.data(), (lv_32fc_t*)_this->fftOutBuf, n, n);
 
-        // Peak detection/tracking runs against the still-local `row` before it's moved into
-        // history below -- history keeps the raw dB rows for the waterfall, tracking keeps its
-        // own smoothed, persistent copy of just the peak locations (see CARRIER_PEAK_LABELS_PLAN.md).
+        // Time-averaged spectrum (per-bin exponential moving average, time constant
+        // AVERAGING_SECONDS -- see that constant's own comment for why peak-finding runs against
+        // this instead of the raw instantaneous `row`). avgRowInit=false (freshly reset by a
+        // window-size change, or never yet run) hard-sets rather than blends -- blending a
+        // same-sized-but-meaningless-old average in would bias the very first few seconds of any
+        // fresh view, exactly the startup-transient problem CarrierZoomPlot's own dB-range
+        // convergence already had to solve the same way (see that class's own comment).
+        if (!_this->avgRowInit || (int)_this->avgRow.size() != n) {
+            _this->avgRow = row;
+            _this->avgRowInit = true;
+        }
+        else {
+            double hopIntervalSec = (_this->_widthHz > 0.0) ? ((double)_this->_hopSize / _this->_widthHz) : 1.0;
+            float alpha = (float)std::clamp(hopIntervalSec / AVERAGING_SECONDS, 0.0, 1.0);
+            for (int i = 0; i < n; i++) {
+                _this->avgRow[i] += (row[i] - _this->avgRow[i]) * alpha;
+            }
+        }
+
+        // Peak detection/tracking runs against the time-averaged spectrum, not the still-local
+        // `row` -- history below keeps the raw (unaveraged) dB rows for the waterfall display,
+        // which should show real moment-to-moment signal content, not a smoothed version of it;
+        // only peak-finding itself needs the averaged view (see AVERAGING_SECONDS's own comment).
         std::vector<PeakInfo> fresh;
-        _this->detectPeaks(row, n, _this->_widthHz, fresh);
+        _this->detectPeaks(_this->avgRow, n, _this->_widthHz, fresh);
 
         std::lock_guard<std::mutex> lck(_this->histMtx);
         _this->updateTrackedPeaks(fresh, _this->_widthHz);
@@ -424,11 +504,14 @@ private:
         while ((int)_this->history.size() > maxRows) { _this->history.pop_front(); }
     }
 
-    // Smoothed, persistent peak state -- see updateTrackedPeaks()'s own comment.
+    // Smoothed, persistent peak state -- see updateTrackedPeaks()'s own comment. `hits` counts
+    // consecutive-ish successful matches toward CONFIRM_SECONDS's own threshold (see
+    // confirmHitsNeeded()); a peak is only ever exposed via acquirePeaks() once hits reaches it.
     struct TrackedPeak {
         double offsetHz;
         float magnitudeDb;
         int misses;
+        int hits;
     };
     std::vector<TrackedPeak> trackedPeaks;
 
@@ -451,4 +534,15 @@ private:
 
     std::mutex histMtx;
     std::deque<std::vector<float>> history;
+
+    // Time-averaged spectrum peak-finding runs against -- see AVERAGING_SECONDS and fftHandler()'s
+    // own comments. Read and written from fftHandler() on fftSink's own worker thread; the only
+    // other writer is avgRowInit=false from deinit()/recomputeWindowAndHop(), both of which run on
+    // the caller's thread but only ever touch it while fftSink is provably stopped (deinit() calls
+    // fftSink.stop() -- a joining stop -- before reaching it; recomputeWindowAndHop() documents
+    // the same precondition on every one of its own callers) -- the identical safety argument
+    // already established for _windowSize/_hopSize/fftInBuf/fftOutBuf elsewhere in this class, not
+    // a new one. No histMtx protection needed for the same reason those don't need it either.
+    std::vector<float> avgRow;
+    bool avgRowInit = false;
 };
