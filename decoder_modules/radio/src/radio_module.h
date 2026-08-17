@@ -19,8 +19,14 @@
 #include "radio_interface.h"
 #include "demod.h"
 #include "spectrum_preview.h"
+#include "carrier_zoom_window.h"
 
 ConfigManager config;
+
+// Single, app-wide owner of the carrier-zoom feature (see CARRIER_ZOOM_PLAN.md and this class's
+// own header) -- exactly one instance, shared by every RadioModule instance in this
+// single-translation-unit module, same convention `config` right above already relies on.
+CarrierZoomWindow gCarrierZoomWindow;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -172,6 +178,10 @@ public:
         if (selectedDemod) { selectedDemod->stop(); }
         afChain.stop();
         preview.deinit();
+        // This instance's own VFO is about to disappear -- if it currently owns the (single,
+        // app-wide) carrier zoom window, close it rather than leaving it pointed at a source
+        // that's going away out from under it.
+        if (gCarrierZoomWindow.isOpenFor(name)) { gCarrierZoomWindow.close(); }
         if (vfo) { sigpath::vfoManager.deleteVFO(vfo); }
         vfo = NULL;
     }
@@ -247,6 +257,16 @@ private:
                                                         -_this->maxBandwidth / 2.0, _this->maxBandwidth / 2.0, carrierOffsetHz);
         _this->preview.releaseFFT();
         if (passbandChanged) { _this->applyPassbandEdges(); }
+
+        // Carrier zoom trigger (see CARRIER_ZOOM_PLAN.md) -- IsItemHovered()/IsItemClicked()
+        // refer to the last-pushed ImGui item, which is specWidget.draw()'s own internal
+        // ImGui::Dummy(size) hit-test proxy (mini_spectrum.cpp); nothing drawn between there and
+        // here changes that. Seeds the initial offset from the same wtfVFO->centerOffset the
+        // preview itself is centered on (see the comment above this block).
+        if (ImGui::IsItemHovered() && (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right))) {
+            gCarrierZoomWindow.open(_this->name, _this->vfo ? _this->vfo->wtfVFO->centerOffset : 0.0);
+        }
+        gCarrierZoomWindow.draw(_this->name);
 
         ImGui::Columns(4, CONCAT("RadioModeColumns##_", _this->name), false);
         if (ImGui::RadioButton(CONCAT("NFM##_", _this->name), _this->selectedDemodID == 0) && _this->selectedDemodID != 0) {
