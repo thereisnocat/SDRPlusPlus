@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 namespace ImGui {
@@ -41,6 +43,27 @@ namespace ImGui {
         // GL_UNSIGNED_BYTE's in-memory byte order on a little-endian host, same packing
         // WaterFall::updatePallette() itself uses for the exact same texture format.
         return ((uint32_t)255 << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+    }
+
+    // Peak-frequency labels always in kHz, per Ralph (2026-08-17) -- deliberately NOT
+    // utils::formatFreq() (freq_formatting.h), the app's general-purpose MHz/KHz/Hz-auto-selecting
+    // convention used for the main tuned-frequency readout and everywhere else in the app: that
+    // function switches to MHz above 1,000,000Hz, but Carrier Zoom's whole use case is
+    // broadcast-band DXing, where a frequency is always quoted in kHz regardless of which side of
+    // the 1MHz mark it happens to fall on (e.g. "1400 kHz", never "1.4 MHz"). Shares
+    // formatFreq()'s own precision/trim algorithm (6 decimal places on the kHz value, trailing
+    // zeros and a bare trailing decimal point both trimmed) so a whole-kHz peak reads as plain
+    // "1400 kHz" while a fractional one still shows exactly as many decimals as it needs -- same
+    // behavior Ralph asked this to match, just with the unit pinned instead of auto-selected.
+    static std::string formatPeakFreqKHz(double hz) {
+        char str[32];
+        snprintf(str, sizeof(str), "%.06lf", hz / 1000.0);
+        int len = (int)strlen(str) - 1;
+        while ((str[len] == '0' || str[len] == '.') && len > 0) {
+            len--;
+            if (str[len] == '.') { len--; break; }
+        }
+        return std::string(str).substr(0, len + 1) + " kHz";
     }
 
     CarrierZoomPlot::~CarrierZoomPlot() {
@@ -182,9 +205,8 @@ namespace ImGui {
                 float x = bb.Min.x + std::clamp(frac, 0.0f, 1.0f) * size.x;
                 dl->AddLine(ImVec2(x, bb.Min.y), ImVec2(x, bb.Max.y), peakColor, style::uiScale);
 
-                char label[32];
-                snprintf(label, sizeof(label), "%.1f Hz", nominalFreqHz + offsetHz);
-                ImVec2 textSize = ImGui::CalcTextSize(label);
+                std::string label = formatPeakFreqKHz(nominalFreqHz + offsetHz);
+                ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
                 float labelX = std::clamp(x - textSize.x / 2.0f, bb.Min.x, bb.Max.x - textSize.x);
 
                 int preferred = idx % 2;
@@ -196,7 +218,7 @@ namespace ImGui {
                 if (row >= 0) {
                     float labelY = traceBB.Min.y + (float)row * textSize.y;
                     dl->AddRectFilled(ImVec2(labelX, labelY), ImVec2(labelX + textSize.x, labelY + textSize.y), peakLabelBg);
-                    dl->AddText(ImVec2(labelX, labelY), peakColor, label);
+                    dl->AddText(ImVec2(labelX, labelY), peakColor, label.c_str());
                     lastLabelRight[row] = labelX + textSize.x;
                 }
                 idx++;

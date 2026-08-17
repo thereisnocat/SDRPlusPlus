@@ -218,3 +218,17 @@ a live band generally, not a specific known graveyard channel) — same caveat
 `CARRIER_ZOOM_PLAN.md` itself already carries, now extended to the labels built on top of it.
 `PEAK_PROMINENCE_DB`/`MAX_PEAKS`/`MIN_PEAK_SEPARATION_BINS` are all still their first-guess
 defaults, expected to be retuned by feel per the "Resolved" section above.
+
+**2026-08-17, same day: label units switched to kHz.** Ralph's own follow-up after trying it:
+labels initially reused `utils::formatFreq()` (this codebase's shared MHz/KHz/Hz-auto-selecting
+convention, used for the main tuned-frequency readout and every other frequency label in the app)
+— correct in general, but wrong for this specific widget: broadcast-band DXing always describes a
+frequency in kHz regardless of which side of the 1MHz mark it falls on ("1400 kHz", never "1.4
+MHz"), so a medium-wave carrier just above 1MHz was showing as e.g. "1.399689MHz" instead. Fixed
+with a small local `formatPeakFreqKHz()` in `carrier_zoom_plot.cpp` that shares `formatFreq()`'s
+own precision/trim algorithm (6 decimal places on the kHz value, trailing zeros and a bare
+trailing decimal point both trimmed) but pins the unit to kHz rather than auto-selecting it —
+deliberately not a change to the shared `utils::formatFreq()` itself, which stays correct as-is
+for the main readout and everywhere else that isn't this specifically-broadcast-band-focused
+widget. Rebuilt, bundled with Perseus support, verified live (labels now read e.g. "1399.665116
+kHz"), quit cleanly.
