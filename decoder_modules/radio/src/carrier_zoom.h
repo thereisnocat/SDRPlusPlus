@@ -69,7 +69,7 @@ public:
         dspVFO = sigpath::iqFrontEnd.addVFO(_name, _widthHz, _widthHz, offset);
         if (!dspVFO) { return; }
 
-        applyWindowAndHop(true);
+        recomputeWindowAndHop(true);
 
         reshape.init(&dspVFO->out, _windowSize, _hopSize - _windowSize);
         fftSink.init(&reshape.out, fftHandler, this);
@@ -101,10 +101,18 @@ public:
     // power-of-two decimation of the source's live rate, exactly RadioSpectrumPreview's own
     // snapWidth() reasoning (see that class and RADIO_SPECTRUM_FILTER_PLAN.md's postmortem on
     // the 1.16-million-tap resampler bug this protects against).
+    //
+    // The whole body (VFO rate change included) runs with fftSink stopped -- see this class's
+    // own header comment on why: a first version stopped fftSink only around the
+    // reshape-resize/FFT-realloc step, leaving dspVFO->setOutSamplerate() itself unprotected,
+    // and that gap was enough to produce a real, live heap corruption crash (a different
+    // allocation site each time, the classic symptom of a corruption detected long after the
+    // write that caused it -- see git history for the two live crash reports this came from).
     void setWidth(double desiredWidthHz) {
         if (!_init) { return; }
         double snapped = snapWidth(desiredWidthHz);
         if (snapped == _widthHz) { return; }
+        fftSink.stop();
         _widthHz = snapped;
         dspVFO->setOutSamplerate(_widthHz, _widthHz);
         // Same fix RadioSpectrumPreview::setWidth() needed (RADIO_SPECTRUM_FILTER_PLAN.md round
@@ -112,7 +120,8 @@ public:
         // it never widens one back out for a larger one -- force the full unfiltered width back
         // explicitly, every time, since this VFO has no passband concept of its own.
         dspVFO->setPassband(-_widthHz / 2.0, _widthHz / 2.0);
-        applyWindowAndHop(false);
+        recomputeWindowAndHop(false);
+        fftSink.start();
     }
     double getWidth() { return _widthHz; }
 
@@ -125,8 +134,10 @@ public:
         if (!_init) { return; }
         hz = std::clamp(hz, MIN_RESOLUTION_HZ, MAX_RESOLUTION_HZ);
         if (hz == _resolutionHz) { return; }
+        fftSink.stop();
         _resolutionHz = hz;
-        applyWindowAndHop(false);
+        recomputeWindowAndHop(false);
+        fftSink.start();
     }
     double getResolutionHz() { return _resolutionHz; }
 
@@ -134,8 +145,10 @@ public:
         if (!_init) { return; }
         sec = std::clamp(sec, MIN_UPDATE_INTERVAL_SEC, MAX_UPDATE_INTERVAL_SEC);
         if (sec == _updateIntervalSec) { return; }
+        fftSink.stop();
         _updateIntervalSec = sec;
-        applyWindowAndHop(false);
+        recomputeWindowAndHop(false);
+        fftSink.start();
     }
     double getUpdateIntervalSecRequested() { return _updateIntervalSec; }
     // The interval actually being achieved, which can differ from the requested value once
@@ -180,7 +193,13 @@ private:
     // wrong width to keep once that happens, same "don't try to preserve incompatible state,
     // just restart cleanly" call MiniSpectrum::resetRange() already makes elsewhere in this
     // module's own UI.
-    void applyWindowAndHop(bool first) {
+    //
+    // Assumes fftSink is already stopped by the caller (setWidth()/setResolutionHz()/
+    // setUpdateIntervalSec(), or not yet started at all during init()'s first=true call) --
+    // this function itself never touches fftSink, deliberately, so every caller's own
+    // stop-mutate-start bracket covers the *entire* mutation (VFO rate change included, for
+    // setWidth()) rather than just the part that happens to live in here.
+    void recomputeWindowAndHop(bool first) {
         int newWindow = std::clamp((int)std::round(_widthHz / _resolutionHz), MIN_WINDOW_SIZE, MAX_WINDOW_SIZE);
         // Hop can never exceed the window (per CARRIER_ZOOM_PLAN.md: "the update-rate slider's
         // fastest setting is capped [by the sample rate], not at zero" -- the mirror statement
@@ -193,6 +212,7 @@ private:
         int newHop = std::clamp((int)std::round(_updateIntervalSec * _widthHz), minHop, newWindow);
 
         bool windowChanged = first || (newWindow != _windowSize);
+
         _windowSize = newWindow;
         _hopSize = newHop;
 
@@ -202,18 +222,8 @@ private:
         }
 
         if (windowChanged) {
-            if (!first) {
-                // fftSink's worker thread must not be running while fftInBuf/fftOutBuf/fftPlan
-                // are being freed and reallocated below -- stop()/start() (not tempStop(), a
-                // full stop) joins that thread, guaranteeing fftHandler() can't be mid-call
-                // during the swap. Reallocating a live FFT plan/buffers is the one thing this
-                // class does that RadioSpectrumPreview never needed to (its own FFT_SIZE is a
-                // fixed compile-time constant, never resized at runtime).
-                fftSink.stop();
-            }
             allocateFFT();
             if (!first) {
-                fftSink.start();
                 std::lock_guard<std::mutex> lck(histMtx);
                 history.clear();
             }
@@ -243,8 +253,10 @@ private:
     }
 
     // Runs on fftSink's own worker thread. Guaranteed not to run concurrently with
-    // allocateFFT()/freeFFT() -- see applyWindowAndHop()'s own comment on why the full
-    // fftSink.stop()/start() bracket around a window-size change is there.
+    // allocateFFT()/freeFFT() -- every caller that can change _widthHz/_resolutionHz/
+    // _updateIntervalSec (setWidth()/setResolutionHz()/setUpdateIntervalSec()) stops fftSink
+    // for its entire mutation, not just the recomputeWindowAndHop() part -- see those functions'
+    // own comments for why the wider bracket (VFO rate change included) turned out to matter.
     static void fftHandler(dsp::complex_t* data, int count, void* ctx) {
         CarrierZoomView* _this = (CarrierZoomView*)ctx;
         int n = _this->_windowSize;
