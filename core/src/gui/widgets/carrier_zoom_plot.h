@@ -26,7 +26,16 @@ namespace ImGui {
         // edge, matching RadioSpectrumPreview's own FFT convention). Unlike MiniSpectrum, there's
         // no separate carrier-vs-center-of-plot distinction here -- this view has no USB/LSB-style
         // asymmetric reference point, it's always centered directly on the tuned frequency itself.
-        void draw(const char* strId, ImVec2 size, const float* const* rows, int rowCount, int fftSize, double spanHz);
+        // nominalFreqHz: the absolute frequency the plot is centered on (spanHz/2 either side of
+        // it) -- used only to label peakOffsetsHz below with an absolute frequency; unused if
+        // peakCount == 0.
+        // peakOffsetsHz/peakCount: per-carrier measured offsets from nominalFreqHz (see
+        // CARRIER_PEAK_LABELS_PLAN.md), each drawn as a line distinct from the fixed
+        // nominal-frequency line plus an absolute-frequency label. Plain array, not a struct type,
+        // deliberately -- this widget stays pure rendering with no CarrierZoomView/DSP dependency,
+        // same "pass data in, draw it" convention `rows` above already follows.
+        void draw(const char* strId, ImVec2 size, const float* const* rows, int rowCount, int fftSize, double spanHz,
+                  double nominalFreqHz = 0.0, const double* peakOffsetsHz = nullptr, int peakCount = 0);
 
     private:
         void ensureTexture();

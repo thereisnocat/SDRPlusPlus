@@ -264,7 +264,13 @@ private:
         // here changes that. Seeds the initial offset from the same wtfVFO->centerOffset the
         // preview itself is centered on (see the comment above this block).
         if (ImGui::IsItemHovered() && (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right))) {
-            gCarrierZoomWindow.open(_this->name, _this->vfo ? _this->vfo->wtfVFO->centerOffset : 0.0);
+            // absoluteFreqHz: waterfall center + the same centerOffset passed as the VFO tap's
+            // own offset -- centerOffset, not generalOffset, per this function's own comment
+            // above on why those differ for USB/LSB (see CARRIER_PEAK_LABELS_PLAN.md's "Why this
+            // is feasible" section for the full reasoning on why this one, specifically, is the
+            // correct zero-point for a carrier-offset label).
+            double centerOffset = _this->vfo ? _this->vfo->wtfVFO->centerOffset : 0.0;
+            gCarrierZoomWindow.open(_this->name, centerOffset, gui::waterfall.getCenterFrequency() + centerOffset);
         }
         gCarrierZoomWindow.draw(_this->name);
 

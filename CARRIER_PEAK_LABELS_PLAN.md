@@ -177,6 +177,44 @@ For each peak, alongside the existing center-tick line (`carrier_zoom_plot.cpp:1
 
 ## Status
 
-**Resolved, ready to implement.** All four open questions above are settled; next step is the
-implementation itself (peak detection in `carrier_zoom.h`, the `absoluteFreqHz` plumbing through
-`carrier_zoom_window.h`, and the line/label/checkbox rendering in `carrier_zoom_plot.h/.cpp`).
+**2026-08-17: implemented.** Peak detection/tracking in `CarrierZoomView`
+(`decoder_modules/radio/src/carrier_zoom.h`: `detectPeaks()`, `updateTrackedPeaks()`,
+`acquirePeaks()`/`releasePeaks()`), `absoluteFreqHz` plumbed from `RadioModule` through
+`CarrierZoomWindow::open()`/`draw()`, and cyan peak lines + absolute-frequency labels +
+"Show carrier peaks" checkbox in `ImGui::CarrierZoomPlot` (`core/src/gui/widgets/
+carrier_zoom_plot.h/.cpp`).
+
+Two real bugs found and fixed during live verification, not caught by compiling/launching alone:
+
+- **Deadlock (beachball) on first open.** `CarrierZoomWindow::draw()` called
+  `view.acquirePeaks()` (locks `histMtx`) *while already holding* the lock `view.acquireHistory()`
+  took a few lines above — `std::mutex` isn't reentrant, so the GUI thread blocked on a lock it
+  already held, forever. Fixed by sequencing the two acquire/release pairs one after the other,
+  never nested.
+- **Garbled, overlapping peak labels** with more than two close peaks. The first label-collision
+  fix only compared each label to its immediately preceding neighbor, so every *other* label could
+  silently re-collide with the one two slots back on the same row. Fixed with a proper two-row
+  check (each label tries its preferred row, falls back to the other, checked against that row's
+  own last occupant) — and, since the floating window itself can render far narrower than a
+  label's own text width (a pre-existing sizing quirk of this window, unrelated to peak labels
+  specifically — confirmed with Ralph this isn't how he'd actually run it sized that narrow), a
+  label whose text won't fit on *either* row is skipped rather than drawn overlapping and
+  unreadable; its line is still always drawn.
+
+Verified live against the real, running session (root config, RSR200 recording scheduler active,
+tuned to a genuinely crowded medium-wave band, not synthetic test data): full multi-target rebuild
+with Perseus support clean (zero new errors/warnings beyond this project's own pre-existing
+noise), bundled, driven interactively via paced `cliclick`. Confirmed: the peak-labels checkbox
+toggled cleanly 6x rapidly with no hang; two real, close carriers (`1399715.1 Hz` / `1399759.7
+Hz`, ~45Hz apart) were detected, labeled legibly, and tracked smoothly frame to frame as their
+levels shifted; a combined stress pass (width/resolution/update-interval sliders plus repeated
+checkbox toggling, mirroring the earlier `CarrierZoomView` heap-corruption fix's own stress
+methodology) survived with peaks continuing to track correctly throughout; app stayed alive and
+responsive, quit cleanly by PID afterward.
+
+**Not yet verified**: real side-by-side identification of two co-channel stations at a known
+graveyard frequency by call sign/programming (this session's test found genuine close carriers on
+a live band generally, not a specific known graveyard channel) — same caveat
+`CARRIER_ZOOM_PLAN.md` itself already carries, now extended to the labels built on top of it.
+`PEAK_PROMINENCE_DB`/`MAX_PEAKS`/`MIN_PEAK_SEPARATION_BINS` are all still their first-guess
+defaults, expected to be retuned by feel per the "Resolved" section above.

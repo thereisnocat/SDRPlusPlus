@@ -20,7 +20,12 @@ public:
     // spectrum). ownerName: the triggering RadioModule's own `name` -- used only to distinguish
     // "the same instance re-triggering" (bring the window to front, keep its current state) from
     // "a different instance" (retarget and reset to defaults); never persisted or displayed.
-    void open(const std::string& ownerName, double offset) {
+    // absoluteFreqHz: the tuned frequency this offset is relative to (waterfall center + the same
+    // centerOffset passed as `offset`), captured once here rather than tracked live afterward --
+    // see CARRIER_PEAK_LABELS_PLAN.md's own note on why: this snapshots at open/retarget time,
+    // matching CarrierZoomView's own VFO tap, which is likewise only ever set here, never
+    // live-followed if the underlying receiver gets retuned again while this window stays open.
+    void open(const std::string& ownerName, double offset, double absoluteFreqHz) {
         if (show && _ownerName == ownerName) {
             focusRequested = true;
             return;
@@ -28,6 +33,7 @@ public:
         view.deinit();
         view.init(ownerName, offset);
         _ownerName = ownerName;
+        _absoluteFreqHz = absoluteFreqHz;
         show = true;
         focusRequested = true;
     }
@@ -87,12 +93,38 @@ public:
         // the slider itself back, so dragging it stays smooth even near that floor.
         ImGui::Text("Actual: %.2fs/row", view.getUpdateIntervalSecActual());
 
+        // Peak markers on/off (CARRIER_PEAK_LABELS_PLAN.md, resolved with Ralph 2026-08-17):
+        // detection/tracking itself always keeps running in CarrierZoomView regardless of this
+        // checkbox -- it only gates whether CarrierZoomPlot draws the lines/labels, so toggling
+        // it is instant, not a re-detect-on-toggle delay.
+        ImGui::Checkbox("Show carrier peaks", &showPeaks);
+
+        // CarrierZoomPlot takes a plain offset array, not CarrierZoomView::PeakInfo directly --
+        // it stays pure rendering with no DSP-header dependency (see its own header comment), so
+        // the magnitude half of each PeakInfo (not needed for drawing) is dropped here.
+        //
+        // Acquired and fully released *before* acquireHistory() below, never nested inside it --
+        // both accessors lock the same non-reentrant histMtx (see acquirePeaks()'s own comment on
+        // why it shares that lock rather than adding a second one), and locking a std::mutex a
+        // thread already holds is undefined behavior -- in practice, on the GUI thread, an
+        // instant permanent deadlock (the beachball this exact bug produced the one time it
+        // shipped, live-tested, before this comment existed).
+        std::vector<double> peakOffsetsHz;
+        if (showPeaks) {
+            std::vector<CarrierZoomView::PeakInfo> peaks;
+            view.acquirePeaks(peaks);
+            peakOffsetsHz.reserve(peaks.size());
+            for (auto& p : peaks) { peakOffsetsHz.push_back(p.offsetHz); }
+            view.releasePeaks();
+        }
+
         std::vector<const float*> rows;
         int fftSize = 0;
         double spanHz = 0.0;
         view.acquireHistory(rows, fftSize, spanHz);
         plot.draw("##carrier_zoom_plot", ImVec2(ImGui::GetContentRegionAvail().x, 300.0f * style::uiScale),
-                  rows.data(), (int)rows.size(), fftSize, spanHz);
+                  rows.data(), (int)rows.size(), fftSize, spanHz, _absoluteFreqHz,
+                  peakOffsetsHz.data(), (int)peakOffsetsHz.size());
         view.releaseHistory();
 
         ImGui::End();
@@ -106,4 +138,6 @@ private:
     bool show = false;
     bool focusRequested = false;
     std::string _ownerName;
+    double _absoluteFreqHz = 0.0;
+    bool showPeaks = true;
 };

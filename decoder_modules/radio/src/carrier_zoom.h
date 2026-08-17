@@ -58,6 +58,32 @@ public:
     static constexpr int MIN_WINDOW_SIZE = 32;
     static constexpr int MAX_WINDOW_SIZE = 65536;
 
+    // Per-carrier peak detection (see CARRIER_PEAK_LABELS_PLAN.md). All four resolved with Ralph
+    // 2026-08-17 as fixed "look and see" constants, not sliders -- expected to be retuned once
+    // this has run against a real graveyard channel, same treatment already given to
+    // DEFAULT_RESOLUTION_HZ/DEFAULT_UPDATE_INTERVAL_SEC above.
+    static constexpr float PEAK_PROMINENCE_DB = 6.0f;
+    static constexpr int MAX_PEAKS = 5;
+    // Roughly twice a 4-term Nuttall window's own mainlobe half-width, so two accepted peaks are
+    // almost certainly two distinct signals rather than one carrier's own mainlobe shoulder
+    // counted twice.
+    static constexpr int MIN_PEAK_SEPARATION_BINS = 8;
+    // A tracked peak survives this many consecutive detection misses before being dropped --
+    // absorbs a real signal briefly dipping below the prominence threshold for one hop without
+    // its line/label flickering out and back.
+    static constexpr int MAX_PEAK_MISSES = 3;
+    // Fixed exponential-smoothing factor for a tracked peak's offset -- how much of the gap
+    // between the tracked value and this frame's fresh detection to close per update. Not ramped
+    // the way CarrierZoomPlot's own dB-range convergence is (carrier_zoom_plot.cpp) -- that one
+    // needs to snap quickly right after a reset/retune; a tracked peak's identity is already
+    // fresh the moment it's created (see acceptPeak() below), so a single fixed factor is enough.
+    static constexpr float PEAK_SMOOTHING_ALPHA = 0.3f;
+
+    struct PeakInfo {
+        double offsetHz;
+        float magnitudeDb;
+    };
+
     void init(const std::string& name, double offset) {
         _name = name + "_carrier_zoom";
         _widthHz = snapWidth(DEFAULT_WIDTH_HZ);
@@ -88,6 +114,7 @@ public:
         freeFFT();
         std::lock_guard<std::mutex> lck(histMtx);
         history.clear();
+        trackedPeaks.clear();
     }
 
     bool isInit() { return _init; }
@@ -171,6 +198,21 @@ public:
     }
     void releaseHistory() { histMtx.unlock(); }
 
+    // Thread-safe access to the latest tracked peaks (see CARRIER_PEAK_LABELS_PLAN.md), same
+    // acquire/release-under-histMtx shape as acquireHistory()/releaseHistory() above -- peak
+    // tracking lives on the same fftSink worker thread and under the same lock as history itself,
+    // so sharing the lock (rather than a second one) avoids a second lock-ordering relationship to
+    // reason about for no real benefit. Returns false (do not use peaks) if not initialized.
+    bool acquirePeaks(std::vector<PeakInfo>& peaks) {
+        histMtx.lock();
+        peaks.clear();
+        if (!_init) { return false; }
+        peaks.reserve(trackedPeaks.size());
+        for (auto& tp : trackedPeaks) { peaks.push_back({ tp.offsetHz, tp.magnitudeDb }); }
+        return true;
+    }
+    void releasePeaks() { histMtx.unlock(); }
+
 private:
     // Copied from RadioSpectrumPreview::snapWidth() (spectrum_preview.h) rather than shared --
     // see that function's own extensive comment for the full reasoning (RationalResampler's
@@ -252,6 +294,100 @@ private:
         return (std::max)(1, (int)std::ceil(HISTORY_SECONDS / hopIntervalSec));
     }
 
+    // Finds up to MAX_PEAKS local maxima in one FFT row and refines each to sub-bin precision.
+    // See CARRIER_PEAK_LABELS_PLAN.md's "Design" section for the full reasoning behind each step.
+    // Runs on fftSink's own worker thread, called from fftHandler() below -- same thread history
+    // itself is built on, no separate synchronization needed here.
+    void detectPeaks(const std::vector<float>& row, int n, double widthHz, std::vector<PeakInfo>& out) {
+        out.clear();
+        if (n < 3) { return; }
+
+        // Noise floor: 20th-percentile value, via nth_element rather than a full sort -- O(n)
+        // average, cheap even at MAX_WINDOW_SIZE and the fastest allowed hop rate since it only
+        // runs once per FFT. A percentile rather than the mean: with at most a handful of real
+        // carriers against a narrow span of mostly-noise bins, a low percentile tracks the floor
+        // without a real carrier dragging a plain mean upward.
+        std::vector<float> sorted(row.begin(), row.begin() + n);
+        int floorIdx = (int)(0.2 * (n - 1));
+        std::nth_element(sorted.begin(), sorted.begin() + floorIdx, sorted.end());
+        float noiseFloor = sorted[floorIdx];
+        float threshold = noiseFloor + PEAK_PROMINENCE_DB;
+
+        // Candidate local maxima above the prominence threshold, strongest-first so the
+        // minimum-separation accept/reject pass below keeps the tallest peak in any cluster of
+        // bins that are all above threshold together (one real carrier's mainlobe is several bins
+        // wide at this resolution, not a single bin).
+        std::vector<int> candidates;
+        for (int i = 1; i < n - 1; i++) {
+            if (row[i] > row[i - 1] && row[i] > row[i + 1] && row[i] >= threshold) {
+                candidates.push_back(i);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) { return row[a] > row[b]; });
+
+        std::vector<int> accepted;
+        for (int cand : candidates) {
+            if ((int)accepted.size() >= MAX_PEAKS) { break; }
+            bool tooClose = false;
+            for (int acc : accepted) {
+                if (std::abs(cand - acc) < MIN_PEAK_SEPARATION_BINS) { tooClose = true; break; }
+            }
+            if (!tooClose) { accepted.push_back(cand); }
+        }
+
+        for (int bin : accepted) {
+            // Parabolic interpolation for sub-bin precision -- a proper local max keeps delta
+            // within [-0.5, 0.5] by construction; clamp defensively anyway since row[] is real
+            // measured data, not an ideal parabola.
+            float y0 = row[bin - 1], y1 = row[bin], y2 = row[bin + 1];
+            float denom = y0 - 2.0f * y1 + y2;
+            float delta = (denom != 0.0f) ? (0.5f * (y0 - y2) / denom) : 0.0f;
+            delta = std::clamp(delta, -0.5f, 0.5f);
+            double refinedBin = (double)bin + (double)delta;
+
+            // Bin -> Hz offset: same "bin 0 = low edge of the span" convention fftHandler()'s own
+            // pre-rotation comment documents.
+            double offsetHz = (refinedBin / (double)n) * widthHz - widthHz / 2.0;
+            out.push_back({ offsetHz, y1 });
+        }
+    }
+
+    // Matches this frame's freshly detected peaks against trackedPeaks (persisted across calls,
+    // under histMtx alongside history itself -- see acquirePeaks()'s own comment), smoothing
+    // matched offsets and aging out ones that stop being detected. See
+    // CARRIER_PEAK_LABELS_PLAN.md's "Cross-frame tracking" paragraph for the full reasoning.
+    void updateTrackedPeaks(const std::vector<PeakInfo>& fresh, double widthHz) {
+        // Matching tolerance: a few bins' worth of Hz, derived from the live resolution rather
+        // than a fixed Hz constant, so it scales with whatever resolution the user has dialed in.
+        double toleranceHz = (double)MIN_PEAK_SEPARATION_BINS * (widthHz / (double)(std::max)(_windowSize, 1));
+
+        std::vector<bool> matched(fresh.size(), false);
+        for (auto& tp : trackedPeaks) {
+            int bestIdx = -1;
+            double bestDist = toleranceHz;
+            for (size_t i = 0; i < fresh.size(); i++) {
+                if (matched[i]) { continue; }
+                double dist = std::abs(fresh[i].offsetHz - tp.offsetHz);
+                if (dist <= bestDist) { bestDist = dist; bestIdx = (int)i; }
+            }
+            if (bestIdx >= 0) {
+                matched[bestIdx] = true;
+                tp.offsetHz += (fresh[bestIdx].offsetHz - tp.offsetHz) * PEAK_SMOOTHING_ALPHA;
+                tp.magnitudeDb = fresh[bestIdx].magnitudeDb;
+                tp.misses = 0;
+            }
+            else {
+                tp.misses++;
+            }
+        }
+        trackedPeaks.erase(std::remove_if(trackedPeaks.begin(), trackedPeaks.end(),
+                                           [](const TrackedPeak& tp) { return tp.misses > MAX_PEAK_MISSES; }),
+                            trackedPeaks.end());
+        for (size_t i = 0; i < fresh.size(); i++) {
+            if (!matched[i]) { trackedPeaks.push_back({ fresh[i].offsetHz, fresh[i].magnitudeDb, 0 }); }
+        }
+    }
+
     // Runs on fftSink's own worker thread. Guaranteed not to run concurrently with
     // allocateFFT()/freeFFT() -- every caller that can change _widthHz/_resolutionHz/
     // _updateIntervalSec (setWidth()/setResolutionHz()/setUpdateIntervalSec()) stops fftSink
@@ -275,11 +411,26 @@ private:
         std::vector<float> row(n);
         volk_32fc_s32f_power_spectrum_32f(row.data(), (lv_32fc_t*)_this->fftOutBuf, n, n);
 
+        // Peak detection/tracking runs against the still-local `row` before it's moved into
+        // history below -- history keeps the raw dB rows for the waterfall, tracking keeps its
+        // own smoothed, persistent copy of just the peak locations (see CARRIER_PEAK_LABELS_PLAN.md).
+        std::vector<PeakInfo> fresh;
+        _this->detectPeaks(row, n, _this->_widthHz, fresh);
+
         std::lock_guard<std::mutex> lck(_this->histMtx);
+        _this->updateTrackedPeaks(fresh, _this->_widthHz);
         _this->history.push_back(std::move(row));
         int maxRows = _this->computeMaxRows();
         while ((int)_this->history.size() > maxRows) { _this->history.pop_front(); }
     }
+
+    // Smoothed, persistent peak state -- see updateTrackedPeaks()'s own comment.
+    struct TrackedPeak {
+        double offsetHz;
+        float magnitudeDb;
+        int misses;
+    };
+    std::vector<TrackedPeak> trackedPeaks;
 
     bool _init = false;
     std::string _name;

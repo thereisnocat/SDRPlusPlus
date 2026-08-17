@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 namespace ImGui {
@@ -46,7 +47,8 @@ namespace ImGui {
         if (texInit) { glDeleteTextures(1, &textureId); }
     }
 
-    void CarrierZoomPlot::draw(const char* strId, ImVec2 size, const float* const* rows, int rowCount, int fftSize, double spanHz) {
+    void CarrierZoomPlot::draw(const char* strId, ImVec2 size, const float* const* rows, int rowCount, int fftSize, double spanHz,
+                                double nominalFreqHz, const double* peakOffsetsHz, int peakCount) {
         ImGuiWindow* window = GetCurrentWindow();
         if (window->SkipItems) { return; }
 
@@ -60,6 +62,13 @@ namespace ImGui {
         ImU32 trace = GetColorU32(ImGuiCol_PlotLines);
         ImU32 shadow = GetColorU32(ImGuiCol_PlotLines, 0.2f);
         ImU32 centerColor = IM_COL32(255, 0, 0, 180);
+        // Distinct from the nominal-frequency line above -- cyan reads clearly against both the
+        // dark trace-pane background and the waterfall's own red/yellow/white hot colors near the
+        // top of the dB range (right where a strong carrier's own waterfall pixels already are),
+        // and matches the cyan/green-marker convention other SDR spectrum tools already use (see
+        // CARRIER_PEAK_LABELS_PLAN.md).
+        ImU32 peakColor = IM_COL32(0, 255, 255, 200);
+        ImU32 peakLabelBg = IM_COL32(0, 0, 0, 160);
 
         dl->AddRectFilled(bb.Min, bb.Max, bg);
 
@@ -141,6 +150,58 @@ namespace ImGui {
         // carrierOffsetHz parameter needed the way MiniSpectrum::draw() has one.
         float centerX = bb.Min.x + size.x / 2.0f;
         dl->AddLine(ImVec2(centerX, bb.Min.y), ImVec2(centerX, bb.Max.y), centerColor, style::uiScale);
+
+        // Per-carrier peak lines + absolute-frequency labels (CARRIER_PEAK_LABELS_PLAN.md,
+        // resolved with Ralph 2026-08-17: absolute frequency alone, one decimal, no separate
+        // offset shown). Sorted left-to-right by offset first -- peakOffsetsHz arrives in
+        // whatever order CarrierZoomView::trackedPeaks happens to hold internally (append order,
+        // not offset order), and a stable left-to-right order is what the collision-staggering
+        // below (alternating label row) depends on to only compare each label against its
+        // immediate on-screen neighbor.
+        if (peakCount > 0 && spanHz > 0.0) {
+            std::vector<double> sortedOffsets(peakOffsetsHz, peakOffsetsHz + peakCount);
+            std::sort(sortedOffsets.begin(), sortedOffsets.end());
+
+            // Collision mitigation: two label rows, each independently tracking its own
+            // last-placed label's right edge. Each label prefers to alternate rows from the
+            // previous one (index parity), falling back to the other row (checked against its
+            // own last occupant, not the preferred row's) when the preferred one would collide.
+            // If *neither* row is free -- verified live, this genuinely happens: this plot's own
+            // window renders far narrower than a typical label's own text width whenever it's
+            // freshly opened (a pre-existing sizing quirk of this floating window, unrelated to
+            // peak labels specifically), so with several close peaks two rows can both fill up --
+            // the label's own text is skipped entirely rather than drawn overlapping and
+            // unreadable; the line itself is still always drawn, so a real signal stays visible
+            // even when there's no room left to caption it. Still not a general label-layout
+            // solver (see CARRIER_PEAK_LABELS_PLAN.md) -- a deliberately simple two-row-or-nothing
+            // scheme, not a third row or dynamic font shrinking.
+            float lastLabelRight[2] = { -1.0e9f, -1.0e9f };
+            int idx = 0;
+            for (double offsetHz : sortedOffsets) {
+                float frac = (float)((offsetHz + spanHz / 2.0) / spanHz);
+                float x = bb.Min.x + std::clamp(frac, 0.0f, 1.0f) * size.x;
+                dl->AddLine(ImVec2(x, bb.Min.y), ImVec2(x, bb.Max.y), peakColor, style::uiScale);
+
+                char label[32];
+                snprintf(label, sizeof(label), "%.1f Hz", nominalFreqHz + offsetHz);
+                ImVec2 textSize = ImGui::CalcTextSize(label);
+                float labelX = std::clamp(x - textSize.x / 2.0f, bb.Min.x, bb.Max.x - textSize.x);
+
+                int preferred = idx % 2;
+                int other = 1 - preferred;
+                int row = -1;
+                if (labelX >= lastLabelRight[preferred]) { row = preferred; }
+                else if (labelX >= lastLabelRight[other]) { row = other; }
+
+                if (row >= 0) {
+                    float labelY = traceBB.Min.y + (float)row * textSize.y;
+                    dl->AddRectFilled(ImVec2(labelX, labelY), ImVec2(labelX + textSize.x, labelY + textSize.y), peakLabelBg);
+                    dl->AddText(ImVec2(labelX, labelY), peakColor, label);
+                    lastLabelRight[row] = labelX + textSize.x;
+                }
+                idx++;
+            }
+        }
 
         dl->AddRect(bb.Min, bb.Max, border);
     }
