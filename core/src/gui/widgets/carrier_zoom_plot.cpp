@@ -209,6 +209,20 @@ namespace ImGui {
                 ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
                 float labelX = std::clamp(x - textSize.x / 2.0f, bb.Min.x, bb.Max.x - textSize.x);
 
+                // Hover tooltip: hovering anywhere along this peak's own line (its full height, a
+                // few pixels of horizontal tolerance) shows its exact frequency in a normal-sized
+                // ImGui tooltip -- independent of whether the in-plot label above found room to
+                // draw itself at all (see the collision-mitigation comment below: a crowded plot
+                // can skip a label's text entirely while still drawing its line), so this is the
+                // one way to always read a given line's frequency, not just a supplement to a
+                // label that might not be there. Ralph, 2026-08-19: "the current display of
+                // frequencies on carriers is inadequate... display of frequency when hovering on a
+                // line representing a carrier."
+                float hitHalfWidth = 4.0f * style::uiScale;
+                if (ImGui::IsMouseHoveringRect(ImVec2(x - hitHalfWidth, bb.Min.y), ImVec2(x + hitHalfWidth, bb.Max.y))) {
+                    ImGui::SetTooltip("%s", label.c_str());
+                }
+
                 int preferred = idx % 2;
                 int other = 1 - preferred;
                 int row = -1;

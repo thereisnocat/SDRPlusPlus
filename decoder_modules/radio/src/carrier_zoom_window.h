@@ -57,15 +57,38 @@ public:
     void draw(const std::string& callerName) {
         if (!isOpenFor(callerName)) { return; }
 
-        gui::mainWindow.lockWaterfallControls = true;
-
         if (focusRequested) {
             ImGui::SetNextWindowFocus();
+            // A good, usable default size, forced on every (re)open/retarget -- not just the
+            // very first time this window is ever shown (ImGuiCond_FirstUseEver would skip this
+            // once anything is already saved in imgui.ini for this window title, which after a
+            // lot of prior testing at small, accidental sizes it very likely already is). Ralph,
+            // 2026-08-19: "the current default is unusable... it would help tremendously if the
+            // default window was open much wider." Matches this window's own existing "no
+            // persisted state across closes" design (CARRIER_ZOOM_PLAN.md) -- window size resets
+            // to this default on every open/retarget the same way the sliders already do, rather
+            // than being yet another thing this feature would otherwise need to remember.
+            ImGui::SetNextWindowSize(ImVec2(950.0f * style::uiScale, 620.0f * style::uiScale), ImGuiCond_Always);
             focusRequested = false;
         }
 
         bool stillOpen = true;
         ImGui::Begin("Carrier Zoom", &stillOpen);
+
+        // Only lock the main waterfall's own click-to-tune/drag handling while the mouse is
+        // actually over this window -- not for this window's entire open lifetime, which is what
+        // every other floating window in this codebase that sets this flag does (dialog boxes,
+        // frequency manager, the recording scheduler, ...), but which made the rest of the app
+        // unusable while this one stayed open (Ralph, 2026-08-19: "Is it possible to make the
+        // window work in a way where the rest of the interface is usable?" -- confirmed as the
+        // cause of an earlier, separate report that retuning required closing this window first).
+        // Those other windows are typically small, transient, and meant to be dealt with and
+        // dismissed; this one is meant to sit open for extended periods alongside normal use of
+        // the rest of the app, so tying the lock to hover (checked fresh every frame, covers a
+        // drag that starts and stays inside this window same as an unconditional lock would, but
+        // releases the instant the mouse leaves) is the right scope for it specifically, not a
+        // general fix applicable to those other windows too.
+        gui::mainWindow.lockWaterfallControls = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
         // Free sliders, per Ralph (2026-08-16) -- see CARRIER_ZOOM_PLAN.md. Logarithmic: each
         // covers roughly a 50-100x dynamic range, and the values users actually want (a couple

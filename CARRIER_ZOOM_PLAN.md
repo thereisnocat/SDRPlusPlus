@@ -252,3 +252,40 @@ alternating min-to-max jumps on all three sliders simultaneously and settings ma
 the crash trigger (down to 191Hz width, 0.29Hz/bin, 0.27s update interval) — all survived, app
 stayed alive and responsive throughout, quit cleanly by PID afterward. Full multi-target rebuild
 with Perseus support, bundled, final smoke test also clean.
+
+**2026-08-19: three UX fixes from actually using the feature day-to-day, not from a crash.**
+
+- **Defaults retuned** (`CarrierZoomView`): `DEFAULT_WIDTH_HZ` 500→250Hz, `DEFAULT_RESOLUTION_HZ`
+  2.0Hz/bin→0.33Hz/bin→**1.0Hz/bin** (two steps, both same day) -- the original 2Hz/bin default
+  was coarse enough to hide multiple close carriers inside one apparent wide line, the exact
+  failure mode this feature exists to fix. The first retune (0.33Hz/bin) overcorrected: fine
+  enough resolution widens a single real carrier's own mainlobe out across enough bins that
+  `MIN_PEAK_SEPARATION_BINS`'s fixed bin-count separation stops being a meaningfully wide Hz gap,
+  and the detector started reading one real carrier's own mainlobe shape/noise as several distinct
+  peaks (five, in Ralph's own test) -- caught immediately by him trying it live, not by any
+  automated check. 1.0Hz/bin is the settled value.
+- **Window default size**: `CarrierZoomWindow::draw()` now forces a 950×620 (scaled) size via
+  `ImGui::SetNextWindowSize(..., ImGuiCond_Always)` on every open/retarget, not just the very
+  first time the window is ever shown (`ImGuiCond_FirstUseEver` would have skipped this given how
+  much prior testing had already left a small size saved in imgui.ini for this window title).
+  Ralph: "the current default is unusable... it would help tremendously if the default window was
+  open much wider." Matches this window's own existing "no persisted state across closes" design
+  the sliders already followed -- size resets the same way on every open, rather than being one
+  more thing this feature would otherwise need to remember.
+- **`lockWaterfallControls` scoped to actual hover, not the window's whole open lifetime**: every
+  other floating window in this codebase that sets this flag (dialog boxes, frequency manager, the
+  recording scheduler, ...) does so unconditionally for as long as it's open, which is fine for
+  those -- small, transient, meant to be dealt with and dismissed. Carrier Zoom is meant to sit
+  open for extended periods alongside normal use of the rest of the app, and the unconditional lock
+  made the rest of the interface unusable while it stayed open (Ralph: "Is it possible to make the
+  window work in a way where the rest of the interface is usable?" -- this is also what an earlier,
+  separately-reported issue turned out to be: retuning required closing the window first). Changed
+  to `gui::mainWindow.lockWaterfallControls = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);`,
+  checked fresh every frame right after `Begin()` -- locks while the mouse is over this window
+  (covering a drag that starts and stays inside it, same as the unconditional lock did), releases
+  the instant the mouse leaves. Ralph confirmed live: the waterfall and main spectrum are fully
+  clickable/draggable (retune, pan, zoom) while Carrier Zoom stays open, as intended, as long as
+  the mouse isn't currently over Carrier Zoom's own controls.
+
+See `CARRIER_PEAK_LABELS_PLAN.md` for the same-day hover-tooltip addition on the peak lines
+themselves -- a `CarrierZoomPlot`-side change, not this class's.

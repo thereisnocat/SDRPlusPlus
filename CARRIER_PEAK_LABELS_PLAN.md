@@ -299,3 +299,15 @@ real, verified improvement over the original per-frame detector (the specific co
 prompted this -- peaks appearing and disappearing within single-digit seconds of noise -- is
 fixed), with the hum/sideband-vs-multiple-carriers ambiguity above left as an open, flagged
 question rather than something this commit claims to have resolved.
+
+**2026-08-19: hover tooltip added.** Ralph, after using the always-on in-plot labels for a while:
+"the current display of frequencies on carriers is inadequate... would it be possible to also
+produce a display of frequency when hovering on a line representing a carrier?" The in-plot labels
+(see the collision-mitigation logic above) can legitimately have no room to draw their text at all
+in a crowded/narrow view, and even when they do fit, small canvas text is a worse way to read an
+exact number than a normal-sized tooltip. Added in `CarrierZoomPlot::draw()`: hovering anywhere
+along a peak's own line (its full height, ~4px horizontal tolerance either side, scaled) calls
+`ImGui::SetTooltip()` with that peak's own absolute-frequency string -- checked independently of
+whether the in-plot label found room to draw itself, so hovering is the one way to always read a
+given line's frequency, not merely a supplement to a label that might not be there. Ralph confirmed
+live: works as intended.

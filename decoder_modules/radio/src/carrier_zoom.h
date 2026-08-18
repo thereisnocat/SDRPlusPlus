@@ -31,11 +31,19 @@ public:
     ~CarrierZoomView() { deinit(); }
 
     // "Look and see" starting points, not derived from anything -- see CARRIER_ZOOM_PLAN.md's
-    // open questions. Ralph resolved the width default explicitly (500Hz total, +/-250Hz);
-    // resolution/update-rate defaults are a first guess, adjustable by feel once this is
-    // actually running against a real graveyard channel.
-    static constexpr double DEFAULT_WIDTH_HZ = 500.0;
-    static constexpr double DEFAULT_RESOLUTION_HZ = 2.0;
+    // open questions. Retuned by Ralph, 2026-08-19, after actually using the feature: the
+    // original 2Hz/bin default was coarse enough to hide multiple close carriers inside one wide
+    // apparent line -- exactly the failure mode the whole feature exists to avoid. Width narrowed
+    // to 250Hz to match. An initial retune to 0.33Hz/bin (same day) turned out to overcorrect --
+    // that fine a resolution widens a single real carrier's own mainlobe out across enough bins
+    // that MIN_PEAK_SEPARATION_BINS's fixed bin-count separation stops being a meaningfully wide
+    // Hz gap, and the detector started resolving one real carrier's own mainlobe shape/noise as
+    // several distinct peaks (five, in Ralph's own test) -- excessive, per his own follow-up.
+    // 1.0Hz/bin is the settled middle ground: fine enough to actually separate real close
+    // carriers (the whole point), without being so fine that a single carrier's own mainlobe gets
+    // misread as multiple ones.
+    static constexpr double DEFAULT_WIDTH_HZ = 250.0;
+    static constexpr double DEFAULT_RESOLUTION_HZ = 1.0;
     static constexpr double DEFAULT_UPDATE_INTERVAL_SEC = 1.0;
 
     // Slider ranges. MIN_UPDATE_INTERVAL_SEC is also a practical floor on the fastest achievable
