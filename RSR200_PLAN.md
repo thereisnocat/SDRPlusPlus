@@ -2004,7 +2004,53 @@ released well before the hardware-diversity section (and its `stop()`/`start()` 
 No behavior change to what's displayed -- purely a scope fix.
 
 Verified: same full cycle as above (target rebuild clean, all 14 test suites pass, full
-multi-target rebuild, bundle, launch/alive-15s/quit-clean). Live re-verification -- Solve, then
-Apply to hardware with the confirmation dialog, confirm it no longer hangs and the app actually
-transitions into Diversity mode, then Back to Separate mode -- is Ralph's own next step, per his
-standing preference to drive live-hardware testing himself.
+multi-target rebuild, bundle, launch/alive-15s/quit-clean).
+
+### A third bug, also found live: applying no longer hangs, but the stream comes out garbled (2026-08-20, same day)
+
+Ralph re-tested with the deadlock fix above and confirmed Apply to hardware no longer freezes --
+but the spectrum came out frozen-looking with a strong, regular comb of vertical stripes evenly
+spaced across the *entire* band, on both the spectrum trace and the waterfall, varying somewhat
+between separate attempts rather than being one literal static frame. "Back to Separate mode"
+immediately restored normal reception.
+
+That specific signature -- an evenly-spaced comb across the whole band, not noise or silence --
+is the textbook symptom of a channel-deinterleaving mismatch: if the radio is actually delivering
+2-channel-interleaved samples but the receiving code unpacks them as 1-channel, every other
+sample belongs to the *other* physical channel, and treating that as one continuous I/Q stream
+produces exactly this kind of periodic artifact.
+
+`buildConfig()` had set `format.channels = 1` for hardware diversity, on the reasoning that since
+the radio combines the two channels internally, only one channel's worth of data needs to cross
+the wire. Re-reading `RSR200_OM_V225.pdf`'s own changelog turned up a direct contradiction: the
+vendor software's own "AntDiv" preset "**switches the RSR200B to 2-channel reception** for
+antenna diversity." The wire format stays 2-channel even while the DSP is combining -- only the
+DSP mode byte (already correctly `OP_DIVERSITY`) changes.
+
+Fixed: `format.channels` is now `dualChannel ? 2 : 1` unconditionally (hardware diversity no
+longer special-cased down to 1), matching Separate mode's wire format. That required two
+follow-on changes:
+- `start()`'s unity-gain-for-Sep-mode branch was keyed on `cfg.format.channels == 2`, which is
+  now also true for hardware diversity -- restructured so `hwDiversityMode` is checked *first*
+  within that branch (send the solved weight) with unity gain as the `else`, rather than as a
+  sibling `else if` that relied on diversity being single-channel.
+- `deliver()`'s `if (b.chB)` branch (write to `outA`/`outB`) would now also fire for hardware
+  diversity, but nothing reads `outA`/`outB` once the ChannelSet is unregistered for that mode --
+  writing there would block `deliver()` forever the first time `canSwap` never comes true, no
+  reader left to set it. Added a new branch ahead of it, gated on `hwDiversityMode`, that copies
+  channel A into the module's single `out` stream instead (per DP/OM's own "the data stream from
+  channel 2 is added to data stream 1" wording, and the OM's note that channel 2's own overload
+  detection keeps working independently in Diversity mode -- both read as channel A carrying the
+  combined result, channel B staying raw ADC2).
+
+**Not yet confirmed against real hardware which of the two received channels actually carries the
+combined result** -- channel A is a documented-but-unverified guess. If the spectrum still looks
+wrong after this fix, swapping to read `b.chB` instead in that same branch is a two-line change,
+not a redesign -- the harder problem (matching the radio's wire format at all) is what this entry
+fixes.
+
+Verified: `rsr200_source` builds clean, full test suite passes (14 suites, 0 failures), full
+multi-target rebuild clean, bundle launches and quits cleanly. Live re-verification -- Solve, then
+Apply to hardware, confirming the spectrum looks like a real, correctly-combined band scan rather
+than the comb artifact -- is Ralph's own next step, per his standing preference to drive
+live-hardware testing himself.

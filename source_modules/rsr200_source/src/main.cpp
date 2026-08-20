@@ -108,16 +108,28 @@ private:
         c.adcClockHz = (double)adcClockMHz * 1e6;
         c.gpsDiscipline = gpsDiscipline;
         c.decimationExp = decimExp;
-        c.format.channels = (dualChannel && !hwDiversityMode) ? 2 : 1;
+        // Found live 2026-08-20: hardware diversity still needs the *wire* format at 2
+        // channels, same as Separate mode -- only the DSP mode below (OP_DIVERSITY) changes.
+        // The first version of this code dropped to format.channels = 1 for hwDiversityMode,
+        // on the assumption that since the radio combines the channels internally, only one
+        // channel's worth of data needs to cross the wire. Wrong: RSR200_OM_V225.pdf's own
+        // changelog says the vendor software's "AntDiv" preset "switches the RSR200B to
+        // 2-channel reception for antenna diversity" -- and live testing confirmed it: with
+        // format.channels forced to 1, the app received something, but every other sample
+        // belonged to the *other* physical channel, producing a strong, regular comb of
+        // spurs across the entire band (an evenly-spaced-artifact signature of exactly this
+        // kind of deinterleaving mismatch) instead of a real spectrum. See deliver() below for
+        // which of the two received channels actually carries the combined result.
+        c.format.channels = dualChannel ? 2 : 1;
         c.format.bits = bits24 ? 24 : 16;
         c.tunedHz = tunedHz;
-        // Highest priority: hardware diversity (RSR200_PLAN.md phase 7) delivers one combined
-        // stream -- format.channels above already reflects that -- regardless of whether
-        // dualChannel is still checked. dualChannel means "I'm using both antennas together";
-        // hwDiversityMode is a layered sub-state reached only through the solve/apply workflow
-        // below, not a plain checkbox, saying *how* they're currently combined (radio vs.
-        // software). Leaving dualChannel itself checked while hwDiversityMode is on is
-        // deliberate -- "Back to Separate mode" needs to know to re-register two channels.
+        // Highest priority: hardware diversity (RSR200_PLAN.md phase 7) combines the channels
+        // on the radio -- format.channels above stays 2 (see the comment there), only opMode
+        // changes. dualChannel means "I'm using both antennas together"; hwDiversityMode is a
+        // layered sub-state reached only through the solve/apply workflow below, not a plain
+        // checkbox, saying *how* they're currently combined (radio vs. software). Leaving
+        // dualChannel itself checked while hwDiversityMode is on is deliberate -- "Back to
+        // Separate mode" needs to know to re-register two channels.
         if (hwDiversityMode) {
             c.opMode = OP_DIVERSITY;
         }
@@ -268,26 +280,33 @@ private:
         // to no data at all. Confirmed against real hardware in test/test_usb_dual_live.cpp
         // (RSR200_PLAN.md section 10) -- omitting this was the entire cause of the "ADC2 is
         // dead" misdiagnosis earlier in that section.
+        //
+        // format.channels == 2 now covers *both* Sep mode and hardware diversity (see
+        // buildConfig()'s comment -- found live 2026-08-20 that Diversity mode still needs the
+        // 2-channel wire format), so hwDiversityMode has to be checked first within this
+        // branch, not as a sibling `else if` the way it was before that fix -- that older
+        // shape relied on Diversity being format.channels == 1 and would otherwise send the
+        // solved weight followed immediately by unity, always ending on unity.
         if (cfg.format.channels == 2) {
-            if (!_this->device.setHardwareDiversity(1.0, 0.0, now)) {
-                _this->lastError = "failed to set channel 2 to unity gain";
-                _this->closeActiveTransport();
-                return;
+            if (_this->hwDiversityMode) {
+                // Hardware diversity mode (RSR200_PLAN.md phase 7): the weight was already
+                // solved and confirmed by the "Solve from current phasing"/"Apply to hardware"
+                // UI before this start() was triggered (see those handlers -- applying hardware
+                // diversity goes through a full stop()/start() cycle rather than a live
+                // reconfigure, deliberately, to reuse this already-tested startup sequence
+                // instead of writing a new one that changes Config while a worker thread might
+                // still be touching related state). cfg.opMode is already OP_DIVERSITY by the
+                // time buildConfig() built this Config, so applyConfig() above has already told
+                // the radio to combine the channels in hardware -- this is just handing it the
+                // actual weight to combine them *with*.
+                if (!_this->device.setHardwareDiversity(_this->hwDivMagnitude, _this->hwDivPhaseDeg, now)) {
+                    _this->lastError = "failed to set hardware diversity weight";
+                    _this->closeActiveTransport();
+                    return;
+                }
             }
-        }
-        // Hardware diversity mode (RSR200_PLAN.md phase 7): the weight was already solved and
-        // confirmed by the "Solve from current phasing"/"Apply to hardware" UI before this
-        // start() was triggered (see those handlers -- applying hardware diversity goes through
-        // a full stop()/start() cycle rather than a live reconfigure, deliberately, to reuse
-        // this already-tested startup sequence instead of writing a new one that changes Config
-        // while a worker thread might still be touching related state). cfg.opMode is already
-        // OP_DIVERSITY by the time buildConfig() built this Config, so applyConfig() above has
-        // already told the radio to combine the channels in hardware -- this is just handing it
-        // the actual weight to combine them *with*, the same way the unity-gain branch above
-        // hands it a (different) fixed weight for Sep mode.
-        else if (_this->hwDiversityMode) {
-            if (!_this->device.setHardwareDiversity(_this->hwDivMagnitude, _this->hwDivPhaseDeg, now)) {
-                _this->lastError = "failed to set hardware diversity weight";
+            else if (!_this->device.setHardwareDiversity(1.0, 0.0, now)) {
+                _this->lastError = "failed to set channel 2 to unity gain";
                 _this->closeActiveTransport();
                 return;
             }
@@ -420,7 +439,24 @@ private:
             if (b.sequenceGap) { gapCount++; }
         }
 
-        if (b.chB) {
+        if (b.chB && hwDiversityMode) {
+            // Hardware diversity (RSR200_PLAN.md phase 7): the wire is still 2-channel (see
+            // buildConfig()'s comment), but nothing reads outA/outB while this mode has the
+            // ChannelSet unregistered -- writing there would just block deliver() forever the
+            // first time canSwap never comes true, since no reader is left to drain it. The
+            // radio has already combined the two channels itself by this point; per DP/OM's own
+            // wording ("the data stream from channel 2 is added to data stream 1") and the OM's
+            // note that channel 2's own overload ("OV") detection keeps working independently
+            // in Diversity mode, channel 1 is the one carrying the combined result -- channel B
+            // here is raw ADC2, kept only for the radio's own internal use, not something this
+            // module has any reader for. Not yet confirmed against real hardware which channel
+            // actually holds the combined signal (RSR200_PLAN.md phase 7 dated section) -- if
+            // the spectrum still looks wrong after this fix, the two-line swap to read b.chB
+            // instead is the next thing to try, not a deeper redesign.
+            memcpy(out.writeBuf, b.chA, (size_t)b.frames * sizeof(dsp::complex_t));
+            if (!out.swap(b.frames)) { run = false; }
+        }
+        else if (b.chB) {
             memcpy(outA.writeBuf, b.chA, (size_t)b.frames * sizeof(dsp::complex_t));
             memcpy(outB.writeBuf, b.chB, (size_t)b.frames * sizeof(dsp::complex_t));
             if (!outA.swap(b.frames)) { run = false; }
