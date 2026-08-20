@@ -92,13 +92,37 @@ namespace rsr200 {
         StreamFormat format{ 1, 16 };
         OpMode opMode = OP_PARALLEL_ADD;
         bool swapChannels = false;
-        bool upperSideband = false;             // only meaningful in serial mode
+        // Only meaningful in OP_SERIAL. Should match the parity of tuneFor(tunedHz,
+        // adcClockHz).zone -- odd zone -> false (SerL), even zone -> true (SerU) -- per
+        // RSR200_OM_V225.pdf's own worked examples (a 70MHz signal landing in an odd zone wants
+        // SerL; the same frequency, retuned onto an even zone via a different ADC clock, wants
+        // SerU instead). Picking the wrong one doesn't just fail to reject the interferer --
+        // the ~30dB digital filter suppresses the *other* regular-width zone of the pair, so a
+        // mismatched bit attenuates the wanted signal by that much instead of the alias. A
+        // manual field regardless, per Ralph (2026-08-19): easy to notice and correct by ear
+        // while tuning, not worth removing the choice over -- main.cpp's menu hints at the
+        // zone-parity rule above without enforcing it, and applyConfig() below reconfigures
+        // whenever this changes (like any other OpMode-affecting field) regardless of whether
+        // the new value happens to match that rule.
+        bool upperSideband = false;
         double tunedHz = 10e6;
         uint16_t switchRegister = 0;
         int attenuator1 = 0;                    // 0..35
         int attenuator2 = 0;
         bool autoAttEnabled = false;
 
+        // OP_SERIAL (RSR200_PLAN.md §6/§7, "SerL"/"SerU"; see RSR200_OM_V225.pdf's own "Use of
+        // SerL and SerU" section, read directly rather than guessed at) samples the two ADCs
+        // offset in time, doubling the *raw* combined span the two constituent (regular-width)
+        // Nyquist zones share -- but a decimation filter stage inside the radio brings the
+        // delivered data back down to the same single-zone bandwidth normal (non-serial) mode
+        // already has ("must be set back to the original ADC clock"). So neither sampleRateHz()
+        // nor tuneFor()'s zone/LO arithmetic change for Serial mode -- both stay exactly as they
+        // are for every other mode, using the plain adcClockHz. What Serial mode actually buys
+        // is ~30dB of *digital* rejection of whichever regular zone is the OTHER half of that
+        // combined span, on top of (or instead of) whatever an external analog filter would
+        // otherwise need to provide -- see upperSideband's own comment for the one bit this
+        // does require getting right.
         double sampleRateHz() const { return rsr200::sampleRateHz(adcClockHz, decimationExp); }
     };
 

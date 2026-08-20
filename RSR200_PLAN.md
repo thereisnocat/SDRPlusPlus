@@ -514,7 +514,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
 | **6** | **Done and verified on Windows, and now proven live on macOS too (2026-08-09) — spectrum and signals received on the Mac over real USB.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout), **and a third, undocumented-until-now difference: the Linux/macOS `*_Ex`/`*_Async` read/write calls take a logical FIFO channel (0-3), not the raw USB endpoint address Windows and every other pipe call use** — see section 1's 2026-08-09 entries for the full diagnosis. All three abstracted behind small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic. CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. That Windows run needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4; on the Mac, the blocker turned out to be a driver version regression (fixed by downgrading to 1.1.6) plus the FIFO-channel bug above, not a power cycle. `main.cpp` wires it into a working single-channel SDR++ source module. Not yet measured on macOS: sustained packet-loss numbers over a long run, the way Windows has. | Yes |
-| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. | Yes |
+| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19, see the dated section below) — the rest of phase 7 (hardware diversity, antenna control, GPS correction display, Auto-ATT UI) still open. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully
 specified in the documents, so the parser and the command builders can be written and
@@ -1620,3 +1620,82 @@ Confirmed via a direct AskUserQuestion ("full refactor now") and implemented on 
 See `RECORDING_SCHEDULER_PLAN.md` section 2.2 for the full survey this came out of (and its own
 2026-08-15 correction: RTL-SDR does *not* actually reload settings on `SourceManager::selectSource()`
 either, contrary to that section's first draft — traced more carefully while doing this refactor).
+
+---
+
+## Phase 7, Serial modes (`SerL`/`SerU`) (2026-08-19)
+
+Ralph: "Time to look at phase 7 for the RSR200. I would like to see SerL and SerU modes
+implemented." The protocol layer already had everything needed for this at the wire level
+(`OpMode::OP_SERIAL`, `dspModeByte()`'s `upperSideband` bit, `test_protocol.cpp` already checking
+"bit 3 picks the upper sideband") — this phase is the device-config and UI wiring, plus the
+sampling-rate/zone reasoning to go with it.
+
+**First pass got the sampling-rate math wrong, caught by reading the actual manuals rather than
+trusting §6's own paraphrase.** The initial implementation doubled `adcClockHz` for both
+`sampleRateHz()` and `tuneFor()`'s zone/LO arithmetic whenever `OP_SERIAL` was active, reasoning
+from §6's "sample the two ADCs offset in time to double the effective rate and widen the zones."
+Ralph then pointed at the actual PDFs (`/Users/ralph/Downloads/Reuter RSR200 Documents/
+RSR200_DP_ENG_V52.pdf`, `RSR200_OM_V225.pdf`) rather than continuing from the paraphrase, and
+`pdftotext -layout` on both turned up the real mechanism, in the OM's own "Use of SerL and SerU"
+section: the ADCs *are* interleaved at double rate internally, but "the doubled data rate from
+the ADCs must be set back to the original ADC clock in a decimation stage" — the delivered
+sample rate and zone width are **unchanged** from normal (non-serial) mode. What Serial mode
+actually buys is a decimation-stage filter giving ~30dB of *digital* rejection of whichever
+regular-width Nyquist zone is the other half of the interleaved pair, instead of relying purely
+on external analog filtering to separate them — and the OM's own Example 4 confirms the zone
+math itself doesn't change: a 70MHz signal in an odd zone wants `SerL`, the same frequency
+retuned onto an even zone (via a different ADC clock) wants `SerU`, with the zone computed
+exactly as `tuneFor()` already does for every other mode. Reverted the doubling in both places
+once this was clear; `sampleRateHz()`/`tuneFor()` now use the plain `adcClockHz` for `OP_SERIAL`
+same as every other mode.
+
+**Two more corrections from reading the DP PDF directly, not caught by test_protocol.cpp because
+they're outside what that suite checks:**
+
+- `RSR200_DP_ENG_V52.pdf`'s own DSP-mode table is explicit: `"2 = ADC1 + ADC2 serial (CLK ADC2
+  must be inverted!)"` — a required precondition this implementation was initially missing
+  entirely. `VAR_SWITCH` bit 0 (`SW_ADC2_CLK_INVERTED`) is now set whenever `serialMode` is on,
+  alongside the existing bits for VHF/preamp/dual-channel. (This is the same bit `main.cpp`
+  already had a comment about leaving alone by default, from the HDSDR packet-capture
+  investigation into the VHF preamp — that finding stands for every *other* mode; Serial mode is
+  the one documented exception.)
+- The DP PDF also confirms `dspModeByte()`'s bit 3 (not a `VAR_SWITCH` bit — a separate bit
+  within the DSP mode byte itself, alongside the 2-bit operation mode) is literally labelled
+  "Side band" in the manual's own table — "0 = lower side band for serial, 1 = upper side band"
+  — matching the existing `upperSideband` field/naming exactly, so no change needed there beyond
+  documenting the source.
+
+**Design: manual sideband selection, not automatic, per Ralph's own explicit preference.** The
+first version of this UI computed `upperSideband` automatically from `tuneFor().zone`'s parity,
+on the reasoning that a mismatched bit doesn't just fail to reject the interferer — it
+attenuates the *wanted* signal by ~30dB instead, which seemed like something worth engineering
+away entirely. Ralph's own read, after trying the reasoning: "I would prefer to have the
+ability to select the sideband. The consequence of the 30db reduction of wanted signal is
+easily fixed when tuning by switching to the other sideband." Restored manual `SerL`/`SerU`
+radio buttons (`serialUpper`, persisted per-device like every other setting), with a hint line
+underneath naming which one the zone-parity rule suggests for the current tuning — informed
+default without removing the override.
+
+**Known, explicitly flagged limitation, not closed in this pass:** live retuning is deliberately
+the lightweight `Device::tune()` path (just the `0xB0` LO command — DP §4.6's own "no
+resynchronisation necessary" guarantee is what makes that safe to do without interrupting the
+stream). It never revisits `upperSideband` or the UI's hint text. Crossing a Nyquist zone
+boundary while Serial mode is running would need the DSP mode byte resent too, and the DP PDF is
+explicit that changing *that* (unlike tuning) stops streaming and requires an explicit restart —
+a real operational sequence, not a one-line fix, and not attempted here without the radio to
+verify it against. The UI says so directly: stop and restart the source after retuning across a
+zone boundary while Serial mode is on.
+
+**Files touched:** `rsr200_device.h` (`Config::upperSideband`'s comment, `sampleRateHz()`/
+`Device::tune()` reverted to plain `adcClockHz`), `main.cpp` (`serialMode`/`serialUpper` fields
+and their persistence, `buildConfig()`'s `OP_SERIAL`/switch-register wiring, the menu checkbox +
+radio buttons + hint text + the retune-limitation note).
+
+**Verification:** `core/test/run_tests.sh` (all suites, including `test_protocol`/`test_device`,
+neither of which needed changes since the wire-format layer was already correct) passes; full
+multi-target rebuild and macOS bundle clean; app launches, stays alive 15+ seconds, and quits
+cleanly by PID. **Not verified against the actual radio** — needs Ralph's own RSR200 to confirm
+Serial mode streams correctly with the `SW_ADC2_CLK_INVERTED` bit set and that the sideband
+selection behaves as the manual describes in practice, matching this document's own standing
+practice of flagging what still needs live hardware.

@@ -109,9 +109,27 @@ private:
         c.decimationExp = decimExp;
         c.format.channels = dualChannel ? 2 : 1;
         c.format.bits = bits24 ? 24 : 16;
-        c.opMode = dualChannel ? OP_INDEPENDENT : OP_PARALLEL_ADD;
-        c.swapChannels = swapChannels;
         c.tunedHz = tunedHz;
+        // Serial mode is single-channel only -- dualChannel wins if both are somehow set (the
+        // UI only shows the Serial control while !dualChannel, but this keeps buildConfig()
+        // itself correct regardless of how the fields got into that state).
+        if (dualChannel) {
+            c.opMode = OP_INDEPENDENT;
+        }
+        else if (serialMode) {
+            c.opMode = OP_SERIAL;
+            // A manual choice, per Ralph (2026-08-19): picking the wrong sideband costs ~30dB
+            // on the wanted signal instead of the interferer, but it's a quick, obvious, and
+            // easily-recoverable mistake while tuning -- just flip to the other one -- not
+            // something worth taking the choice away for. See Config::upperSideband's own
+            // comment in rsr200_device.h for the zone-parity rule the UI hints at (but doesn't
+            // enforce) to make the right first guess easy.
+            c.upperSideband = serialUpper;
+        }
+        else {
+            c.opMode = OP_PARALLEL_ADD;
+        }
+        c.swapChannels = swapChannels;
         // vhfPreamp sets the *remote power* bits (3+4), not SW_VHF_PREAMP (bit 7) --
         // confirmed 2026-08-11 from a USB packet capture of HDSDR's ExtIO module actually
         // engaging the radio's own front-panel preamp indicator. DP 3.3's own table labels
@@ -132,12 +150,17 @@ private:
         //
         // Bit 0 (SW_ADC2_CLK_INVERTED) is also always set in the capture's every command,
         // including before VHF/preamp are touched at all -- HDSDR's own idle default, not
-        // something tied to this control. Left alone here: it's a dual-channel ADC2 clock
-        // phase setting, unrelated to what this checkbox does, and changing our own default
-        // for it isn't supported by anything actually seen going wrong so far.
+        // something tied to this control. Left off by our own default here: it's a
+        // dual-channel ADC2 clock phase setting, unrelated to what this checkbox does, and
+        // changing our own default for it isn't supported by anything actually seen going
+        // wrong so far -- *except* Serial mode, where RSR200_DP_ENG_V52.pdf is explicit this
+        // bit is a required precondition ("2 = ADC1 + ADC2 serial (CLK ADC2 must be
+        // inverted!)"), so it's set whenever serialMode is on, regardless of what HDSDR's own
+        // idle-default behavior otherwise suggests about leaving it alone.
         c.switchRegister = (useVhf ? SW_ADC1_TO_VHF : 0) |
                             (vhfPreamp ? (SW_REMOTE_PWR_CH1 | SW_REMOTE_CTRL_CH1) : 0) |
-                            (dualChannel ? SW_ADC2_TO_HF2 : 0);
+                            (dualChannel ? SW_ADC2_TO_HF2 : 0) |
+                            (serialMode ? SW_ADC2_CLK_INVERTED : 0);
         c.attenuator1 = atten1;
         c.attenuator2 = atten2;
         c.autoAttEnabled = false;   // not yet exposed -- see RSR200_PLAN.md phase 7
@@ -481,6 +504,50 @@ private:
             SmGui::Text("HF1 -> channel A (ADC1), HF2 -> channel B (ADC2).");
         }
 
+        // Serial mode ("SerL"/"SerU", RSR200_PLAN.md phase 7, RSR200_OM_V225.pdf's own "Use of
+        // SerL and SerU" section) -- single-channel only, so only offered while dual channel is
+        // off. Time-interleaves the two ADCs onto one channel for ~30dB of digital rejection of
+        // whichever regular-width Nyquist zone neighbors the one actually being received, on
+        // top of (or instead of) external analog filtering -- it does not change the delivered
+        // sample rate or zone width (see Config::sampleRateHz()'s own comment in
+        // rsr200_device.h), so no core::setInputSampleRate() call is needed here, unlike every
+        // other control on this panel that affects the sampling rate.
+        //
+        // Lower/Upper is a manual choice, per Ralph (2026-08-19): picking the wrong one costs
+        // ~30dB on the wanted signal instead of the interferer, but it's a quick, obvious,
+        // easily-recoverable mistake while tuning -- flip to the other one -- not something
+        // worth taking the choice away for. The hint text names which one the manual's own
+        // zone-parity rule (odd zone -> SerL, even -> SerU, from tuneFor() -- the same pure
+        // zone/LO function Device::tune() itself uses) suggests for the *current* tuning, so
+        // the right first guess is easy without removing the override.
+        if (!_this->dualChannel) {
+            if (SmGui::Checkbox(CONCAT("Serial mode (SerL/SerU)##_rsr200_serial_", _this->name), &_this->serialMode)) {
+                dirty = true;
+            }
+            if (_this->serialMode) {
+                bool suggestUpper = (tuneFor(_this->tunedHz, (double)_this->adcClockMHz * 1e6).zone % 2 == 0);
+                if (SmGui::RadioButton(CONCAT("SerL (lower)##_rsr200_serl_", _this->name), !_this->serialUpper)) {
+                    _this->serialUpper = false;
+                    dirty = true;
+                }
+                SmGui::SameLine();
+                if (SmGui::RadioButton(CONCAT("SerU (upper)##_rsr200_seru_", _this->name), _this->serialUpper)) {
+                    _this->serialUpper = true;
+                    dirty = true;
+                }
+                SmGui::Text(suggestUpper ? "Current tuning suggests SerU" : "Current tuning suggests SerL");
+                // Known limitation, not yet closed: retuning is deliberately a lightweight
+                // Device::tune() call (just the LO command -- DP §4.6's own "no
+                // resynchronisation necessary" guarantee is what makes live retuning safe at
+                // all), which never revisits this bit or the hint above. Crossing a Nyquist
+                // zone boundary while running would need the DSP mode byte resent too, and
+                // RSR200_DP_ENG_V52.pdf is explicit that changing it (unlike tuning) stops
+                // streaming and requires an explicit restart -- a real operational sequence,
+                // not a one-line fix, and not yet implemented or verified against the radio.
+                SmGui::Text("Retuning across a zone boundary while running needs a stop/restart\nfor the hint (and SerL/SerU) to catch up.");
+            }
+        }
+
         if (SmGui::Checkbox(CONCAT("Swap channels##_rsr200_swap_", _this->name), &_this->swapChannels)) {
             dirty = true;
         }
@@ -629,6 +696,8 @@ private:
         d["decimExp"] = decimExp;
         d["bits24"] = bits24;
         d["dualChannel"] = dualChannel;
+        d["serialMode"] = serialMode;
+        d["serialUpper"] = serialUpper;
         d["swapChannels"] = swapChannels;
         d["useVhf"] = useVhf;
         d["vhfPreamp"] = vhfPreamp;
@@ -646,6 +715,8 @@ private:
         if (d.contains("decimExp")) { decimExp = d["decimExp"]; }
         if (d.contains("bits24")) { bits24 = d["bits24"]; }
         if (d.contains("dualChannel")) { dualChannel = d["dualChannel"]; }
+        if (d.contains("serialMode")) { serialMode = d["serialMode"]; }
+        if (d.contains("serialUpper")) { serialUpper = d["serialUpper"]; }
         if (d.contains("swapChannels")) { swapChannels = d["swapChannels"]; }
         if (d.contains("useVhf")) { useVhf = d["useVhf"]; }
         if (d.contains("vhfPreamp")) { vhfPreamp = d["vhfPreamp"]; }
@@ -774,6 +845,12 @@ private:
     int decimExp = 3;             // rate 16, matching rsr200::Config's own default
     bool bits24 = false;
     bool dualChannel = false;
+    // Serial mode ("SerL"/"SerU", RSR200_PLAN.md §6/§7, phase 7, RSR200_OM_V225.pdf's own "Use
+    // of SerL and SerU" section) -- OP_SERIAL, single-channel only (mutually exclusive with
+    // dualChannel; buildConfig() below gives dualChannel priority if somehow both are set).
+    // serialUpper is a manual choice, per Ralph (2026-08-19) -- see buildConfig()'s own comment.
+    bool serialMode = false;
+    bool serialUpper = false;
     bool swapChannels = false;
     bool useVhf = false;
     bool vhfPreamp = false;
