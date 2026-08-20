@@ -599,6 +599,20 @@ private:
                 snprintf(buf, sizeof(buf), "Temperature: %d C", _this->lastStatus.temperatureC);
                 SmGui::Text(buf);
             }
+            // RSR200_PLAN.md phase 7: "GPS Hz" in Reuter's own control panel -- the deviation of
+            // the ADC clock frequency the GPS receiver measures from the set value, whether or
+            // not GPS discipline is actually correcting for it (OM: disabling discipline still
+            // "displays the current deviation of the ADC clock" without applying it). Both
+            // freqCorrectionHz() and the resolution it picks by gpsDiscipline (0.5Hz/LSB
+            // disciplining, 0.1Hz/LSB measuring-only) already existed and are already covered by
+            // test_protocol.cpp -- this is only the display line, no new fields or commands.
+            if (_this->lastStatus.freqCorrectionValid) {
+                snprintf(buf, sizeof(buf), "GPS correction: %+.1f Hz", freqCorrectionHz(_this->lastStatus, _this->gpsDiscipline));
+            }
+            else {
+                snprintf(buf, sizeof(buf), "GPS correction: no valid measurement (GPS not received, or just retuned)");
+            }
+            SmGui::Text(buf);
             snprintf(buf, sizeof(buf), "Overload: CH1 %s  CH2 %s",
                      _this->lastStatus.overloadCh1 ? "YES" : "no",
                      _this->lastStatus.overloadCh2 ? "YES" : "no");

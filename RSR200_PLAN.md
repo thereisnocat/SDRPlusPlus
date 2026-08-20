@@ -514,7 +514,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
 | **6** | **Done and verified on Windows, and now proven live on macOS too (2026-08-09) — spectrum and signals received on the Mac over real USB.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout), **and a third, undocumented-until-now difference: the Linux/macOS `*_Ex`/`*_Async` read/write calls take a logical FIFO channel (0-3), not the raw USB endpoint address Windows and every other pipe call use** — see section 1's 2026-08-09 entries for the full diagnosis. All three abstracted behind small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic. CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. That Windows run needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4; on the Mac, the blocker turned out to be a driver version regression (fixed by downgrading to 1.1.6) plus the FIFO-channel bug above, not a power cycle. `main.cpp` wires it into a working single-channel SDR++ source module. Not yet measured on macOS: sustained packet-loss numbers over a long run, the way Windows has. | Yes |
-| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19, see the dated section below) — the rest of phase 7 (hardware diversity, antenna control, GPS correction display, Auto-ATT UI) still open. | Yes |
+| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19) and **GPS correction display done** (2026-08-20, see the dated sections below) — hardware diversity, antenna control, and Auto-ATT UI still open. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully
 specified in the documents, so the parser and the command builders can be written and
@@ -1718,7 +1718,14 @@ because the feature has never been reachable from the UI at all.
 
 ### GPS correction display
 
-**Already fully built.** `Status::freqCorrectionRaw`/`freqCorrectionValid` are parsed from every
+**Implemented 2026-08-20**, exactly as planned below — one display line, no new fields or
+commands. `core/test/run_tests.sh` passes in full (`test_protocol`/`test_device` untouched, since
+`parseStatus()`/`freqCorrectionHz()` didn't need to change), full multi-target rebuild and macOS
+bundle clean, launches/stays alive/quits cleanly. **Not verified against the actual radio** —
+needs Ralph's own RSR200 with a GPS antenna connected to confirm the displayed value tracks what
+Reuter's own control panel shows.
+
+**Already fully built** (this section's own original planning, kept for reference): `Status::freqCorrectionRaw`/`freqCorrectionValid` are parsed from every
 block's status header (`parseStatus()`), and `freqCorrectionHz(status, gpsDiscipline)` converts
 to Hz at the correct resolution (0.5Hz/LSB disciplining, 0.1Hz/LSB measuring-only) — both
 already covered by `test_protocol.cpp`. `_this->lastStatus` is already available in the same
