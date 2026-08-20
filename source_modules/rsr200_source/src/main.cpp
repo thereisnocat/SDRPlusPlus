@@ -611,45 +611,59 @@ private:
         // -- Status, updated from the worker thread --------------------------------
         SmGui::Text("Status");
         if (_this->running) {
-            std::lock_guard<std::mutex> lck(_this->statusMtx);
-            if (_this->haveVersion) {
-                snprintf(buf, sizeof(buf), "Serial %u, firmware %u", _this->verSerial, _this->verFirmware);
-            }
-            else {
-                snprintf(buf, sizeof(buf), "Serial/firmware: waiting for reply...");
-            }
-            SmGui::Text(buf);
+            // Scoped tightly around just the reads of statusMtx-protected fields below --
+            // found live 2026-08-20: this lock previously had no closing brace of its own,
+            // so it stayed held for the rest of the whole `if (_this->running)` block,
+            // including the hardware-diversity buttons further down that call stop(_this)
+            // (which joins workerThread). deliver() (running on workerThread) takes this
+            // same statusMtx to record each block's status -- so the GUI thread would hold
+            // statusMtx, block forever in join() waiting for workerThread, while
+            // workerThread blocked forever waiting for statusMtx the GUI thread was never
+            // going to release. A true self-deadlock, reported by Ralph as the app freezing
+            // with a spinning cursor the moment "Apply to hardware"'s confirmation dialog
+            // was accepted.
+            {
+                std::lock_guard<std::mutex> lck(_this->statusMtx);
+                if (_this->haveVersion) {
+                    snprintf(buf, sizeof(buf), "Serial %u, firmware %u", _this->verSerial, _this->verFirmware);
+                }
+                else {
+                    snprintf(buf, sizeof(buf), "Serial/firmware: waiting for reply...");
+                }
+                SmGui::Text(buf);
 
-            if (_this->lastStatus.autoAttActive) {
-                SmGui::Text("Temperature: Auto-ATT active");
-            }
-            else {
-                snprintf(buf, sizeof(buf), "Temperature: %d C", _this->lastStatus.temperatureC);
+                if (_this->lastStatus.autoAttActive) {
+                    SmGui::Text("Temperature: Auto-ATT active");
+                }
+                else {
+                    snprintf(buf, sizeof(buf), "Temperature: %d C", _this->lastStatus.temperatureC);
+                    SmGui::Text(buf);
+                }
+                // RSR200_PLAN.md phase 7: "GPS Hz" in Reuter's own control panel -- the deviation
+                // of the ADC clock frequency the GPS receiver measures from the set value,
+                // whether or not GPS discipline is actually correcting for it (OM: disabling
+                // discipline still "displays the current deviation of the ADC clock" without
+                // applying it). Both freqCorrectionHz() and the resolution it picks by
+                // gpsDiscipline (0.5Hz/LSB disciplining, 0.1Hz/LSB measuring-only) already
+                // existed and are already covered by test_protocol.cpp -- this is only the
+                // display line, no new fields or commands.
+                if (_this->lastStatus.freqCorrectionValid) {
+                    snprintf(buf, sizeof(buf), "GPS correction: %+.1f Hz", freqCorrectionHz(_this->lastStatus, _this->gpsDiscipline));
+                }
+                else {
+                    snprintf(buf, sizeof(buf), "GPS correction: no valid measurement (GPS not received, or just retuned)");
+                }
                 SmGui::Text(buf);
-            }
-            // RSR200_PLAN.md phase 7: "GPS Hz" in Reuter's own control panel -- the deviation of
-            // the ADC clock frequency the GPS receiver measures from the set value, whether or
-            // not GPS discipline is actually correcting for it (OM: disabling discipline still
-            // "displays the current deviation of the ADC clock" without applying it). Both
-            // freqCorrectionHz() and the resolution it picks by gpsDiscipline (0.5Hz/LSB
-            // disciplining, 0.1Hz/LSB measuring-only) already existed and are already covered by
-            // test_protocol.cpp -- this is only the display line, no new fields or commands.
-            if (_this->lastStatus.freqCorrectionValid) {
-                snprintf(buf, sizeof(buf), "GPS correction: %+.1f Hz", freqCorrectionHz(_this->lastStatus, _this->gpsDiscipline));
-            }
-            else {
-                snprintf(buf, sizeof(buf), "GPS correction: no valid measurement (GPS not received, or just retuned)");
-            }
-            SmGui::Text(buf);
-            snprintf(buf, sizeof(buf), "Overload: CH1 %s  CH2 %s",
-                     _this->lastStatus.overloadCh1 ? "YES" : "no",
-                     _this->lastStatus.overloadCh2 ? "YES" : "no");
-            SmGui::Text(buf);
-            snprintf(buf, sizeof(buf), "Sequence gaps seen: %llu", (unsigned long long)_this->gapCount);
-            SmGui::Text(buf);
-            if (!_this->lastError.empty()) {
-                snprintf(buf, sizeof(buf), "Error: %s", _this->lastError.c_str());
+                snprintf(buf, sizeof(buf), "Overload: CH1 %s  CH2 %s",
+                         _this->lastStatus.overloadCh1 ? "YES" : "no",
+                         _this->lastStatus.overloadCh2 ? "YES" : "no");
                 SmGui::Text(buf);
+                snprintf(buf, sizeof(buf), "Sequence gaps seen: %llu", (unsigned long long)_this->gapCount);
+                SmGui::Text(buf);
+                if (!_this->lastError.empty()) {
+                    snprintf(buf, sizeof(buf), "Error: %s", _this->lastError.c_str());
+                    SmGui::Text(buf);
+                }
             }
 
             // Hardware diversity (RSR200_PLAN.md phase 7, PHASING_PLAN.md §7.2's own "solve in

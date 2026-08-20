@@ -1976,7 +1976,35 @@ Verified: `rsr200_source` target rebuilds clean (only pre-existing, unrelated wa
 coverage of this UI branch specifically, since it's a live-`sigpath::phasing`-state read with no
 existing test harness for that), full multi-target rebuild clean, bundle via
 `make_macos_bundle.sh` succeeds, launched from the repo root and confirmed alive 15+ seconds,
-quit cleanly by PID. Per Ralph's own instruction earlier in this session ("rather than you
-driving the app, tell me what you need to see and I will drive the app"), re-verifying the actual
-fix against the live radio in Auto-null mode, and the rest of the apply/confirm/back-to-Separate
-workflow, is Ralph's own next step to run — not yet done as of this entry.
+quit cleanly by PID.
+
+### A second bug, also found live: "Apply to hardware" froze the app (2026-08-20, same day)
+
+Ralph re-tested with the fix above (Solve now reports correctly), then clicked Apply to hardware.
+Confirming the dialog froze the whole app with a spinning cursor -- not a slow reconnect, a true
+deadlock, found by tracing the lock scope rather than guessing at network timing.
+
+The status block just above the hardware-diversity UI reads several `statusMtx`-protected fields
+(`haveVersion`, `lastStatus`, `gapCount`, `lastError`) under `std::lock_guard<std::mutex>
+lck(_this->statusMtx);` -- declared with **no enclosing braces of its own**, so its scope ran to
+the end of the entire `if (_this->running) { ... }` block. That block is also where the
+hardware-diversity buttons live, including "Apply to hardware"'s confirmation handler, which calls
+`stop(_this); start(_this);`. `stop()` joins `workerThread`. But `deliver()` -- running on
+`workerThread` -- takes that same `statusMtx` to record every incoming block's status. So the
+sequence was: GUI thread takes `statusMtx` to draw the status text, keeps holding it (never
+scoped back out) all the way into the confirm-dialog handler, calls `stop()`, which blocks in
+`workerThread.join()` -- while `workerThread` sits blocked trying to acquire `statusMtx`, which
+the GUI thread will only release once `menuHandler()` returns, which can't happen until `join()`
+returns. A textbook self-deadlock via lock-then-join, invisible in any static read of either half
+in isolation -- found by tracing what the lock's *actual* C++ scope was (no braces = rest of the
+enclosing block), not by testing lock ordering in the abstract.
+
+Fixed by adding the missing braces, so `statusMtx` is held only around the status-text reads and
+released well before the hardware-diversity section (and its `stop()`/`start()` calls) begins.
+No behavior change to what's displayed -- purely a scope fix.
+
+Verified: same full cycle as above (target rebuild clean, all 14 test suites pass, full
+multi-target rebuild, bundle, launch/alive-15s/quit-clean). Live re-verification -- Solve, then
+Apply to hardware with the confirmation dialog, confirm it no longer hangs and the app actually
+transitions into Diversity mode, then Back to Separate mode -- is Ralph's own next step, per his
+standing preference to drive live-hardware testing himself.
