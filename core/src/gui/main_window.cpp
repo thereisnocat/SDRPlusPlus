@@ -1009,7 +1009,14 @@ void MainWindow::draw() {
     ImGui::SetCursorPosX((ImGui::GetWindowSize().x / 2.0) - (ImGui::CalcTextSize("Max").x / 2.0));
     ImGui::TextUnformatted("Max");
     ImGui::SetCursorPosX((ImGui::GetWindowSize().x / 2.0) - 10 * style::uiScale);
-    if (ImGui::VSliderFloat("##_8_", wfSliderSize, &fftMax, 0.0, -160.0f, "")) {
+    // Floor was -160dB -- found live 2026-08-20 (Ralph, RSR200 in Serial mode at 24-bit): a
+    // real high-dynamic-range digitizer can genuinely put its own noise floor below that,
+    // clipping the bottom of the trace off the visible plot with no way to drag further down.
+    // -240dB comfortably clears a 24-bit ADC's theoretical ~144dB dynamic range plus whatever
+    // processing gain a deep decimation setting adds on top, without materially changing this
+    // slider's usable resolution for every other, lower-dynamic-range source that never drags
+    // it that far.
+    if (ImGui::VSliderFloat("##_8_", wfSliderSize, &fftMax, 0.0, -240.0f, "")) {
         fftMax = std::max<float>(fftMax, fftMin + 10);
         core::configManager.acquire();
         core::configManager.conf["max"] = fftMax;
@@ -1022,7 +1029,7 @@ void MainWindow::draw() {
     ImGui::TextUnformatted("Min");
     ImGui::SetCursorPosX((ImGui::GetWindowSize().x / 2.0) - 10 * style::uiScale);
     ImGui::SetItemUsingMouseWheel();
-    if (ImGui::VSliderFloat("##_9_", wfSliderSize, &fftMin, 0.0, -160.0f, "")) {
+    if (ImGui::VSliderFloat("##_9_", wfSliderSize, &fftMin, 0.0, -240.0f, "")) {
         fftMin = std::min<float>(fftMax - 10, fftMin);
         core::configManager.acquire();
         core::configManager.conf["min"] = fftMin;
