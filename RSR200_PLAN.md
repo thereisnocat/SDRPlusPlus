@@ -2043,14 +2043,13 @@ follow-on changes:
   detection keeps working independently in Diversity mode -- both read as channel A carrying the
   combined result, channel B staying raw ADC2).
 
-**Not yet confirmed against real hardware which of the two received channels actually carries the
-combined result** -- channel A is a documented-but-unverified guess. If the spectrum still looks
-wrong after this fix, swapping to read `b.chB` instead in that same branch is a two-line change,
-not a redesign -- the harder problem (matching the radio's wire format at all) is what this entry
-fixes.
-
 Verified: `rsr200_source` builds clean, full test suite passes (14 suites, 0 failures), full
-multi-target rebuild clean, bundle launches and quits cleanly. Live re-verification -- Solve, then
-Apply to hardware, confirming the spectrum looks like a real, correctly-combined band scan rather
-than the comb artifact -- is Ralph's own next step, per his standing preference to drive
-live-hardware testing himself.
+multi-target rebuild clean, bundle launches and quits cleanly.
+
+**Confirmed live by Ralph, same day: channel A does carry the combined result.** Solve, Apply to
+hardware, and the live spectrum came out correct -- no more comb artifact, no hang -- with a
+"similarly behaving null on the selected station" compared to the software-phasing solve it was
+built from. Combined with the earlier live confirmation that "Back to Separate mode" cleanly
+restores independent dual-channel reception (from when the wire-format bug was first found),
+hardware diversity's full solve -> apply -> back-to-Separate workflow is now verified end to end
+against real hardware, not just against the test suite. **Hardware diversity is done.**
