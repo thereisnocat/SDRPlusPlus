@@ -18,6 +18,7 @@
 #include <module.h>
 #include <gui/gui.h>
 #include <gui/smgui.h>
+#include <gui/dialogs/dialog_box.h>
 #include <signal_path/signal_path.h>
 #include <core.h>
 #include <utils/flog.h>
@@ -107,13 +108,23 @@ private:
         c.adcClockHz = (double)adcClockMHz * 1e6;
         c.gpsDiscipline = gpsDiscipline;
         c.decimationExp = decimExp;
-        c.format.channels = dualChannel ? 2 : 1;
+        c.format.channels = (dualChannel && !hwDiversityMode) ? 2 : 1;
         c.format.bits = bits24 ? 24 : 16;
         c.tunedHz = tunedHz;
+        // Highest priority: hardware diversity (RSR200_PLAN.md phase 7) delivers one combined
+        // stream -- format.channels above already reflects that -- regardless of whether
+        // dualChannel is still checked. dualChannel means "I'm using both antennas together";
+        // hwDiversityMode is a layered sub-state reached only through the solve/apply workflow
+        // below, not a plain checkbox, saying *how* they're currently combined (radio vs.
+        // software). Leaving dualChannel itself checked while hwDiversityMode is on is
+        // deliberate -- "Back to Separate mode" needs to know to re-register two channels.
+        if (hwDiversityMode) {
+            c.opMode = OP_DIVERSITY;
+        }
         // Serial mode is single-channel only -- dualChannel wins if both are somehow set (the
         // UI only shows the Serial control while !dualChannel, but this keeps buildConfig()
         // itself correct regardless of how the fields got into that state).
-        if (dualChannel) {
+        else if (dualChannel) {
             c.opMode = OP_INDEPENDENT;
         }
         else if (serialMode) {
@@ -260,6 +271,23 @@ private:
         if (cfg.format.channels == 2) {
             if (!_this->device.setHardwareDiversity(1.0, 0.0, now)) {
                 _this->lastError = "failed to set channel 2 to unity gain";
+                _this->closeActiveTransport();
+                return;
+            }
+        }
+        // Hardware diversity mode (RSR200_PLAN.md phase 7): the weight was already solved and
+        // confirmed by the "Solve from current phasing"/"Apply to hardware" UI before this
+        // start() was triggered (see those handlers -- applying hardware diversity goes through
+        // a full stop()/start() cycle rather than a live reconfigure, deliberately, to reuse
+        // this already-tested startup sequence instead of writing a new one that changes Config
+        // while a worker thread might still be touching related state). cfg.opMode is already
+        // OP_DIVERSITY by the time buildConfig() built this Config, so applyConfig() above has
+        // already told the radio to combine the channels in hardware -- this is just handing it
+        // the actual weight to combine them *with*, the same way the unity-gain branch above
+        // hands it a (different) fixed weight for Sep mode.
+        else if (_this->hwDiversityMode) {
+            if (!_this->device.setHardwareDiversity(_this->hwDivMagnitude, _this->hwDivPhaseDeg, now)) {
+                _this->lastError = "failed to set hardware diversity weight";
                 _this->closeActiveTransport();
                 return;
             }
@@ -623,6 +651,127 @@ private:
                 snprintf(buf, sizeof(buf), "Error: %s", _this->lastError.c_str());
                 SmGui::Text(buf);
             }
+
+            // Hardware diversity (RSR200_PLAN.md phase 7, PHASING_PLAN.md §7.2's own "solve in
+            // software, hold in hardware" two-step). Deliberately placed outside the
+            // BeginDisabled()/EndDisabled() range above and gated on _this->running instead --
+            // every other control on this panel is a static setting only editable while
+            // stopped, but solving needs live phasing data and applying needs a live source to
+            // apply *to*. Only offered while dualChannel is on and hardware diversity isn't
+            // already active -- solving in Diversity mode is meaningless (the radio only
+            // returns the already-combined result by then, PHASING_PLAN.md §7.1).
+            if (_this->dualChannel && !_this->hwDiversityMode) {
+                SmGui::Text("Hardware diversity");
+                if (SmGui::Button(CONCAT("Solve from current phasing##_rsr200_hwdiv_solve_", _this->name))) {
+                    using Mode = dsp::combine::Phaser::Mode;
+                    Mode mode = sigpath::phasing.getMode();
+                    if (mode == Mode::MODE_A_ONLY || mode == Mode::MODE_B_ONLY) {
+                        // Bypass: channel B (or A) isn't in the signal path at all, nothing to
+                        // solve. Caught explicitly rather than falling through to
+                        // hardwareWeightFor() -- it would report the exact same "not
+                        // representable" a genuinely-near-zero ratio does, for a completely
+                        // different reason, and the two need different messages.
+                        _this->hwDivBypassed = true;
+                        _this->hwDivSolved = true;
+                    }
+                    else {
+                        _this->hwDivBypassed = false;
+                        std::complex<double> k0, k1;
+                        if (dsp::combine::Phaser::isDecorrelating(mode)) {
+                            // Additive form already -- decorrelation solves y = k0*A + k1*B
+                            // directly, and getCombineCoefficients() is only meaningful here
+                            // (see its own doc comment in core/src/dsp/combine/phaser.h).
+                            dsp::complex_t ck0, ck1;
+                            sigpath::phasing.getCombineCoefficients(ck0, ck1);
+                            k0 = std::complex<double>(ck0.re, ck0.im);
+                            k1 = std::complex<double>(ck1.re, ck1.im);
+                        }
+                        else {
+                            // MODE_MANUAL/MODE_AUTO ("Auto-null")/MODE_HOLD: a *subtractive*
+                            // weight w in Y = A - w*B (Phaser::run()'s own arithmetic --
+                            // outBuf = a - w*b). Found live 2026-08-20: calling
+                            // getCombineCoefficients() unconditionally here (the first version
+                            // of this code) silently read stale/default coefficients while
+                            // Auto-null held a real, active +10.5dB/54.1deg weight, because
+                            // that accessor is only ever updated by the decorrelation solver --
+                            // reported "not representable" for the wrong reason (an
+                            // uninitialized near-zero ratio, not the real one). Reconstruct w
+                            // from getWeight()'s gain/phase exactly the way Phaser::setWeight()
+                            // itself does (mag = 10^(dB/20), rad = deg*pi/180), then convert to
+                            // the same additive form the decorrelation path already produces,
+                            // per this file's/rsr200_protocol.h's own documented sign
+                            // convention: "a subtractive weight w would need g = -w".
+                            float gainDb, phaseDeg;
+                            sigpath::phasing.getWeight(gainDb, phaseDeg);
+                            double mag = std::pow(10.0, (double)gainDb / 20.0);
+                            double rad = (double)phaseDeg * PI / 180.0;
+                            std::complex<double> w(mag * std::cos(rad), mag * std::sin(rad));
+                            k0 = std::complex<double>(1.0, 0.0);
+                            k1 = -w;
+                        }
+                        HardwareWeight h = hardwareWeightFor(k0, k1);
+                        _this->hwDivMagnitude = h.magnitude;
+                        _this->hwDivPhaseDeg = h.phaseDegrees;
+                        _this->hwDivRepresentable = h.representable;
+                        _this->hwDivSuggestSwap = h.suggestSwap;
+                        _this->hwDivSolved = true;
+                    }
+                }
+                if (_this->hwDivSolved) {
+                    if (_this->hwDivBypassed) {
+                        SmGui::Text("Phasing is bypassed (A-only/B-only) -- nothing to combine yet.");
+                    }
+                    else if (_this->hwDivRepresentable) {
+                        snprintf(buf, sizeof(buf), "Solved: magnitude %.3f, phase %+.1f deg",
+                                 _this->hwDivMagnitude, _this->hwDivPhaseDeg);
+                        SmGui::Text(buf);
+                    }
+                    else if (_this->hwDivSuggestSwap) {
+                        SmGui::Text("Ratio needs channel swap -- toggle Swap channels and re-solve.");
+                    }
+                    else {
+                        SmGui::Text("Not representable in the radio's own range.");
+                    }
+                    bool canApply = _this->hwDivRepresentable && !_this->hwDivBypassed;
+                    if (!canApply) { SmGui::BeginDisabled(); }
+                    if (SmGui::Button(CONCAT("Apply to hardware##_rsr200_hwdiv_apply_", _this->name))) {
+                        _this->hwDivApplyConfirmOpen = true;
+                    }
+                    if (!canApply) { SmGui::EndDisabled(); }
+                }
+            }
+            if (_this->hwDiversityMode) {
+                snprintf(buf, sizeof(buf), "Hardware diversity active: magnitude %.3f, phase %+.1f deg",
+                         _this->hwDivMagnitude, _this->hwDivPhaseDeg);
+                SmGui::Text(buf);
+                if (SmGui::Button(CONCAT("Back to Separate mode##_rsr200_hwdiv_back_", _this->name))) {
+                    _this->hwDiversityMode = false;
+                    _this->hwDivSolved = false;
+                    if (_this->dualChannel) {
+                        sigpath::sourceManager.registerChannels("RSR200", &_this->channels);
+                    }
+                    stop(_this);
+                    start(_this);
+                }
+            }
+
+            // Confirmation, per Ralph (2026-08-20): applying interrupts independent dual-channel
+            // reception (halves the data rate, ends software phasing) even though it's
+            // reversible via "Back to Separate mode" above, so it shouldn't happen from a single
+            // accidental click. Drawn every frame regardless of hwDivApplyConfirmOpen --
+            // GenericDialog() itself no-ops when its own `open` flag is false (core/src/gui/
+            // dialogs/dialog_box.h), same pattern Frequency Manager's own delete confirmations use.
+            if (ImGui::GenericDialog(("rsr200_hwdiv_apply_confirm" + _this->name).c_str(), _this->hwDivApplyConfirmOpen,
+                                      GENERIC_DIALOG_BUTTONS_YES_NO, [_this]() {
+                    ImGui::Text("Switching to hardware diversity mode. This interrupts independent\n"
+                                "dual-channel reception (radio combines the channels itself; software\n"
+                                "phasing has nothing left to work with). Continue?");
+                }) == GENERIC_DIALOG_BUTTON_YES) {
+                _this->hwDiversityMode = true;
+                sigpath::sourceManager.unregisterChannels("RSR200");
+                stop(_this);
+                start(_this);
+            }
         }
         else {
             SmGui::Text("Not running.");
@@ -865,6 +1014,23 @@ private:
     // serialUpper is a manual choice, per Ralph (2026-08-19) -- see buildConfig()'s own comment.
     bool serialMode = false;
     bool serialUpper = false;
+
+    // Hardware diversity (RSR200_PLAN.md phase 7, resolved with Ralph 2026-08-20: applying
+    // requires confirmation, session-only, none of this persists). Session-only, deliberately --
+    // matches Carrier Zoom's own "no persisted state across closes" precedent for the same
+    // reason: a solved weight is only meaningful for whatever antenna/propagation conditions
+    // produced it, carrying it across a restart the way a plain setting persists would be
+    // actively misleading, not a convenience. None of these fields are written to
+    // writeDeviceSettingsJson()/readDeviceSettingsJson().
+    bool hwDiversityMode = false;      // true once actually switched to OP_DIVERSITY
+    bool hwDivSolved = false;          // a solve has been done since the last mode change
+    bool hwDivBypassed = false;        // Phasing was in MODE_A_ONLY/MODE_B_ONLY at solve time
+    double hwDivMagnitude = 1.0;
+    double hwDivPhaseDeg = 0.0;
+    bool hwDivRepresentable = false;
+    bool hwDivSuggestSwap = false;
+    bool hwDivApplyConfirmOpen = false;
+
     bool swapChannels = false;
     bool useVhf = false;
     bool vhfPreamp = false;

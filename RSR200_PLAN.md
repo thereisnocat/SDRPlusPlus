@@ -514,7 +514,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
 | **6** | **Done and verified on Windows, and now proven live on macOS too (2026-08-09) — spectrum and signals received on the Mac over real USB.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout), **and a third, undocumented-until-now difference: the Linux/macOS `*_Ex`/`*_Async` read/write calls take a logical FIFO channel (0-3), not the raw USB endpoint address Windows and every other pipe call use** — see section 1's 2026-08-09 entries for the full diagnosis. All three abstracted behind small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic. CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. That Windows run needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4; on the Mac, the blocker turned out to be a driver version regression (fixed by downgrading to 1.1.6) plus the FIFO-channel bug above, not a power cycle. `main.cpp` wires it into a working single-channel SDR++ source module. Not yet measured on macOS: sustained packet-loss numbers over a long run, the way Windows has. | Yes |
-| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19) and **GPS correction display done** (2026-08-20, see the dated sections below) — hardware diversity, antenna control, and Auto-ATT UI still open. | Yes |
+| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19), **GPS correction display done** (2026-08-20), and **hardware diversity done** (2026-08-20, see the dated sections below) — antenna control and Auto-ATT UI still open. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully
 specified in the documents, so the parser and the command builders can be written and
@@ -1921,3 +1921,62 @@ convention:
    path from `PHASING_PLAN.md` before ever touching the RSR200).
 
 Nothing here is implemented yet — this is the plan Ralph asked for, not a status update.
+
+## Hardware diversity: implemented, then a real bug found via live testing and fixed (2026-08-20)
+
+Ralph confirmed the two open questions from the plan above specifically for hardware diversity:
+require confirmation before switching into it, and no persistence across app restarts is fine.
+Built as designed: a fourth top-level mode (`hwDiversityMode`), layered on top of `dualChannel`
+rather than replacing it — `dualChannel` still means "using both antennas," `hwDiversityMode`
+means "and right now, combine them in hardware." `buildConfig()` checks `hwDiversityMode` first,
+forcing `OP_DIVERSITY` and single-channel format regardless of `dualChannel`'s own checked state,
+which is deliberately left checked so "Back to Separate mode" knows to re-register two channels.
+
+"Apply to hardware" and "Back to Separate mode" both go through a full `stop(_this); start(_this);`
+cycle rather than a live partial reconfigure while the worker thread runs — there's no existing,
+tested code path anywhere in this module for mutating shared config while the worker thread is
+mid-flight, and this session already has a documented history of heap corruption from exactly
+that class of mistake (the earlier Carrier Zoom work). The DP manual itself documents that
+changing the data-transmission mode "automatically stops streaming mode... Streaming mode must
+then be restarted," so the conservative choice also matches the radio's own documented behavior.
+Both transitions are gated behind a `GenericDialog` confirmation (`core/src/gui/dialogs/dialog_box.h`,
+same pattern as `frequency_manager`'s delete-confirmation), per Ralph's answer above.
+
+**Bug found via Ralph's own live testing, not caught by the test suite.** Ralph: "Clicking Solve
+from current phasing on 1010 kHz results in 'Not representable in the radio's own range'." He was
+in Phasing's Auto-null mode ("Gain 10.5 dB Phase 54.1 deg" per the panel). The first version of
+"Solve from current phasing" called `sigpath::phasing.getCombineCoefficients(k0, k1)`
+unconditionally — but that accessor's own doc comment in `core/src/dsp/combine/phaser.h` says
+plainly it's "only meaningful in the decorrelation modes." Auto-null (`MODE_AUTO`) is a
+*subtractive*-weight mode entirely separate from decorrelation; `getCombineCoefficients()` was
+silently returning stale/default values (effectively `k0=1, k1≈0`), so the solver saw a
+near-zero ratio and correctly (for the wrong input) reported it as unrepresentable — even though
+the real, active weight (+10.5dB/54.1°) was a perfectly ordinary, representable ratio.
+
+Confirmed the sign convention by reading `Phaser::run()`'s actual combining arithmetic rather
+than trusting the existing comments alone: `outBuf = a - w*b`, i.e. `Y = A - w·B`, matching
+`rsr200_protocol.h`'s own documented convention ("a subtractive weight w would need g = -w").
+`Phasing` has no complex-valued weight getter at the wrapper level — only `getWeight(gainDb,
+phaseDeg)` — so the fix reconstructs `w` the same way `Phaser::setWeight()` itself builds it
+(`mag = 10^(dB/20)`, `rad = deg·π/180`) before negating into the additive form the existing,
+unmodified `hardwareWeightFor()` expects.
+
+Fixed "Solve from current phasing" to branch on `sigpath::phasing.getMode()`:
+- `MODE_A_ONLY`/`MODE_B_ONLY` (bypassed): nothing to combine, skip `hardwareWeightFor()`
+  entirely, show "Phasing is bypassed (A-only/B-only) -- nothing to combine yet." A new
+  `hwDivBypassed` flag drives this and disables "Apply to hardware" the same as "not representable"
+  does.
+- `Phaser::isDecorrelating(mode)` (decorrelation modes): unchanged, still
+  `getCombineCoefficients()` directly — already the correct additive form there.
+- Everything else (`MANUAL`/`AUTO`/`HOLD`): `getWeight(gainDb, phaseDeg)` → reconstruct `w` →
+  `hardwareWeightFor(1, -w)`.
+
+Verified: `rsr200_source` target rebuilds clean (only pre-existing, unrelated warnings), full
+`core/test/run_tests.sh build_release` suite passes (all 14 suites, 0 failures — no automated
+coverage of this UI branch specifically, since it's a live-`sigpath::phasing`-state read with no
+existing test harness for that), full multi-target rebuild clean, bundle via
+`make_macos_bundle.sh` succeeds, launched from the repo root and confirmed alive 15+ seconds,
+quit cleanly by PID. Per Ralph's own instruction earlier in this session ("rather than you
+driving the app, tell me what you need to see and I will drive the app"), re-verifying the actual
+fix against the live radio in Auto-null mode, and the rest of the apply/confirm/back-to-Separate
+workflow, is Ralph's own next step to run — not yet done as of this entry.
