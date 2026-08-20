@@ -126,8 +126,12 @@ int main() {
         }
 
         const Status st = parseStatus(frame[USB_TEMP_OFFSET], frame[USB_GPS_OFFSET], frame[USB_GPS_OFFSET + 1]);
+        // This standalone live probe doesn't configure Auto-ATT at all, so autoAttActive is
+        // never true here -- kept as the simple single-condition form (unlike
+        // rsr200_device.h's own deliver(), which also has to account for the wider
+        // "threshold > 0" enabled-but-not-yet-engaged case, see RSR200_PLAN.md phase 7).
         const float gain = st.autoAttActive ? AUTO_ATT_GAIN : 1.0f;
-        unpack(frame.data() + USB_IQ_OFFSET, framesPerPacket, fmt, gain, bufA.data(), bufB.data());
+        unpack(frame.data() + USB_IQ_OFFSET, framesPerPacket, fmt, gain, gain, bufA.data(), bufB.data());
 
         // Per-packet (not cumulative) RMS, so a "B turns on after N packets" transition is
         // visible instead of averaged away.

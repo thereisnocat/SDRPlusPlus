@@ -393,6 +393,121 @@ int main() {
     }
 
     // -----------------------------------------------------------------
+    printf("\nAuto-ATT gain compensation\n");
+    {
+        // OM: "the entire level range is shifted by 2 bits... as soon as Auto ATT is turned
+        // on" -- a materially wider condition than the momentary autoAttActive status flag.
+        // Found while implementing this feature (RSR200_PLAN.md phase 7): the previous
+        // version of deliver() used autoAttActive alone, which was harmless only because
+        // autoAttThreshold could never actually be nonzero yet (nothing set it).
+        FakeTransport t;
+        Device d;
+        d.setTransport(&t);
+        Config c;
+        c.format = { 2, 16 };
+        c.autoAttThreshold = 3;               // enabled, not yet engaged
+        c.autoAttGainCh1 = 2.0f;
+        c.autoAttGainCh2 = 5.0f;
+        d.applyConfig(c, 0);
+        const BlockLayout l = d.layout();
+
+        SampleBlock got;
+        d.onSamples = [&](const SampleBlock& b) { got = b; };
+
+        auto pokeDual = [&](std::vector<uint8_t>& block, int16_t i1, int16_t q1, int16_t i2, int16_t q2) {
+            block[0] = (uint8_t)(i1 & 0xFF); block[1] = (uint8_t)((i1 >> 8) & 0xFF);
+            block[2] = (uint8_t)(q1 & 0xFF); block[3] = (uint8_t)((q1 >> 8) & 0xFF);
+            block[4] = (uint8_t)(i2 & 0xFF); block[5] = (uint8_t)((i2 >> 8) & 0xFF);
+            block[6] = (uint8_t)(q2 & 0xFF); block[7] = (uint8_t)((q2 >> 8) & 0xFF);
+        };
+
+        // Enabled but not (yet) engaged (an ordinary temperature byte, not 0x80): the
+        // constant 4x headroom shift applies to both channels, but neither channel's own
+        // calibration multiplier does -- that only applies once actually engaged.
+        std::vector<uint8_t> notEngaged = makeLanBlock(l, 1, 1, nullptr, 25);
+        pokeDual(notEngaged, 1000, 0, 1000, 0);
+        t.frames.push_back(notEngaged);
+        d.pump();
+        check(std::abs(got.chA[0] - (1000.0f * AUTO_ATT_GAIN / 32768.0f)) < 1e-5f,
+              "enabled-but-not-engaged: channel A gets the constant 4x shift only");
+        check(std::abs(got.chB[0] - (1000.0f * AUTO_ATT_GAIN / 32768.0f)) < 1e-5f,
+              "enabled-but-not-engaged: channel B gets the same constant shift, no calibration yet");
+
+        // Engaged (temperature byte 0x80, DP/OM's own Auto-ATT-active indicator): each
+        // channel's own calibration multiplier stacks on top of the constant shift, and the
+        // two channels' calibration must not cross.
+        std::vector<uint8_t> engaged = makeLanBlock(l, 2, 1, nullptr, 0x80);
+        pokeDual(engaged, 1000, 0, 1000, 0);
+        t.frames.push_back(engaged);
+        d.pump();
+        check(std::abs(got.chA[0] - (1000.0f * AUTO_ATT_GAIN * 2.0f / 32768.0f)) < 1e-5f,
+              "engaged: channel A additionally takes its own calibrated gain");
+        check(std::abs(got.chB[0] - (1000.0f * AUTO_ATT_GAIN * 5.0f / 32768.0f)) < 1e-5f,
+              "engaged: channel B takes its own, different calibrated gain");
+
+        // Off (threshold 0): no shift at all, even with the engaged status flag set -- the
+        // two conditions are independent, not one derived from the other.
+        Config c2 = c;
+        c2.autoAttThreshold = 0;
+        d.applyConfig(c2, 100);
+        std::vector<uint8_t> off = makeLanBlock(l, 3, 1, nullptr, 0x80);
+        pokeDual(off, 1000, 0, 1000, 0);
+        t.frames.push_back(off);
+        d.pump();
+        check(std::abs(got.chA[0] - (1000.0f / 32768.0f)) < 1e-5f,
+              "Auto-ATT off: no gain shift at all, regardless of the status flag");
+    }
+
+    // -----------------------------------------------------------------
+    printf("\nAuto-ATT command is sent and resent at the right times\n");
+    {
+        FakeTransport t;
+        Device d;
+        d.setTransport(&t);
+        Config c;
+        c.adcClockHz = 125e6;
+        c.autoAttThreshold = 3;
+        c.autoAttHoldTimeSec = 0.05;
+        c.autoAttGainCh1 = 2.0f;
+        c.autoAttGainCh2 = 3.0f;
+        d.applyConfig(c, 0);
+
+        const std::vector<uint8_t>* a = t.firstOf(instr::SET_AUTO_ATT);
+        check(a != nullptr, "Auto-ATT is sent as part of the first configuration");
+        check(a && (*a)[5] == 3, "with the configured threshold");
+        check(a && ((uint32_t)(*a)[6] | ((uint32_t)(*a)[7] << 8) | ((uint32_t)(*a)[8] << 16)) ==
+                       autoAttHoldTimeClocks(0.05, 125e6),
+              "and the hold time converted from the current ADC clock");
+
+        // Unrelated settings changing must not resend it.
+        t.sent.clear();
+        Config c2 = c;
+        c2.tunedHz = 20e6;
+        d.applyConfig(c2, 100);
+        check(t.indexOf(instr::SET_AUTO_ATT) == -1, "retuning alone does not resend Auto-ATT settings");
+
+        // Its own settings changing must resend it.
+        t.sent.clear();
+        Config c3 = c2;
+        c3.autoAttThreshold = 2;
+        d.applyConfig(c3, 200);
+        check(t.indexOf(instr::SET_AUTO_ATT) >= 0, "changing the threshold resends Auto-ATT settings");
+
+        // DP: hold time must be reloaded whenever the ADC clock changes, since it's expressed
+        // in raw clock cycles -- an ADC clock change alone (nothing about Auto-ATT itself)
+        // still has to resend it.
+        t.sent.clear();
+        Config c4 = c3;
+        c4.adcClockHz = 100e6;
+        d.applyConfig(c4, 300);
+        const std::vector<uint8_t>* resent = t.firstOf(instr::SET_AUTO_ATT);
+        check(resent != nullptr, "an ADC clock change alone still resends Auto-ATT settings");
+        check(resent && ((*resent)[6] | ((*resent)[7] << 8) | ((*resent)[8] << 16)) ==
+                            (int)autoAttHoldTimeClocks(0.05, 100e6),
+              "and the resend carries the hold time reconverted for the new clock");
+    }
+
+    // -----------------------------------------------------------------
     printf("\nUSB framing uses the same device\n");
     {
         FakeTransport t;

@@ -121,26 +121,33 @@ int main() {
         // 16 bit, single channel: full scale positive and negative.
         const uint8_t iq16[] = { 0x00, 0x40, 0x00, 0xC0 };      // +16384, -16384
         float a[4] = { 0 }, b[4] = { 0 };
-        unpack(iq16, 1, { 1, 16 }, 1.0f, a, b);
+        unpack(iq16, 1, { 1, 16 }, 1.0f, 1.0f, a, b);
         check(std::abs(a[0] - 0.5f) < 1e-6f && std::abs(a[1] + 0.5f) < 1e-6f,
               "16 bit scales to +/-1.0 at full scale");
 
         // 24 bit sign extension across the three-byte boundary.
         const uint8_t iq24[] = { 0x00, 0x00, 0x40, 0x00, 0x00, 0xC0 };
-        unpack(iq24, 1, { 1, 24 }, 1.0f, a, b);
+        unpack(iq24, 1, { 1, 24 }, 1.0f, 1.0f, a, b);
         check(std::abs(a[0] - 0.5f) < 1e-6f && std::abs(a[1] + 0.5f) < 1e-6f,
               "24 bit sign extends and scales correctly");
 
         // Dual channel interleave is I1 Q1 I2 Q2, and must not get crossed.
         const uint8_t dual16[] = { 0x00, 0x40, 0x00, 0x20, 0x00, 0xC0, 0x00, 0xE0 };
-        unpack(dual16, 1, { 2, 16 }, 1.0f, a, b);
+        unpack(dual16, 1, { 2, 16 }, 1.0f, 1.0f, a, b);
         check(std::abs(a[0] - 0.5f) < 1e-6f && std::abs(a[1] - 0.25f) < 1e-6f, "channel 1 lands in A");
         check(std::abs(b[0] + 0.5f) < 1e-6f && std::abs(b[1] + 0.25f) < 1e-6f, "channel 2 lands in B");
 
         // DP 4.7: enabling Auto-ATT scales the stream down 2 bits, so it has to be scaled
         // back up or every level downstream is 12 dB wrong.
-        unpack(iq16, 1, { 1, 16 }, AUTO_ATT_GAIN, a, b);
+        unpack(iq16, 1, { 1, 16 }, AUTO_ATT_GAIN, AUTO_ATT_GAIN, a, b);
         check(std::abs(a[0] - 2.0f) < 1e-5f, "Auto-ATT compensation is a factor of 4");
+
+        // Auto-ATT's per-channel calibration gain is genuinely different per channel (device
+        // tolerances, DP: "calibrate!") -- gainA and gainB must be applied independently, not
+        // averaged or cross-applied, or a channel's own calibration would leak into the other.
+        unpack(dual16, 1, { 2, 16 }, 2.0f, 3.0f, a, b);
+        check(std::abs(a[0] - 1.0f) < 1e-6f && std::abs(b[0] + 1.5f) < 1e-6f,
+              "channel A and channel B take their own, independent gain");
     }
 
     // -----------------------------------------------------------------
@@ -230,6 +237,48 @@ int main() {
         check((int16_t)(v >> 16) == 32767, "+180 degrees saturates at 0x7FFF");
         v = packMagnitudePhase(1.0, -180.0);
         check((int16_t)(v >> 16) == -32768, "-180 degrees is 0x8000");
+    }
+
+    // -----------------------------------------------------------------
+    printf("\nAuto-ATT command encoding and unit conversions\n");
+    {
+        // DP's own worked value: nominal 16dB attenuation = 6.3096x = raw set value 6461.
+        check(autoAttGainLsb(6.3096) == 6461, "6.3096x is the DP's own worked value, 6461 raw LSBs");
+        check(autoAttGainLsb(0.0) == 0, "zero multiplier is zero LSBs");
+        check(autoAttGainLsb(1000.0) == 65535, "clamps to the field's 16 bit range rather than wrapping");
+
+        // "0 ... 0xFFFFFF = 1 ... 2^24 ADC CLK" -- a plain seconds*Hz conversion, clamped to
+        // the field's 24 bits, and (per DP's own caution) meant to be re-derived from the
+        // *current* ADC clock every time either changes, not carried as a fixed raw count.
+        check(autoAttHoldTimeClocks(0.05, 125e6) == 6250000, "0.05s at 125 MHz is 6,250,000 clocks");
+        check(autoAttHoldTimeClocks(0.0, 125e6) == 0, "zero hold time is zero clocks");
+
+        // A real, easy-to-miss consequence of the field only being 24 bits: found while
+        // writing this test, not something already known when the UI's default was chosen.
+        // 0xFFFFFF clocks caps out at barely over 134ms at a 125 MHz ADC clock (2^24-1 /
+        // 125e6), and less still at higher clock rates -- so a "look and see" hold-time
+        // default in the low hundreds of milliseconds, which reads as perfectly reasonable
+        // next to the field's *seconds* framing, can silently be requesting more than the
+        // wire format can actually carry. main.cpp's UI has to show the *achieved* hold time
+        // (this same conversion, then back to seconds) rather than just echoing back whatever
+        // was typed in, or a clamp here becomes invisible to whoever set it.
+        check(autoAttHoldTimeClocks(1.0, 125e6) == 0xFFFFFF,
+              "a full second at 125 MHz overflows the 24 bit field and clamps rather than wraps");
+        check(autoAttHoldTimeClocks(0.2, 125e6) == 0xFFFFFF,
+              "even 200ms overflows the field at a 125 MHz clock -- see the comment above");
+
+        // Field layout, DP's own "Set automatic attenuator" table: threshold (byte 5), hold
+        // time (24 bit LE, bytes 6-8), channel 1 gain (16 bit LE, bytes 9-10), channel 2 gain
+        // (16 bit LE, bytes 11-12), repeat (byte 13).
+        auto c = cmdSetAutoAttenuator(1, false, 3, 0x123456, 6461, 500, 9);
+        check(c[5] == 3, "threshold occupies byte 5");
+        check(c[6] == 0x56 && c[7] == 0x34 && c[8] == 0x12,
+              "hold time is a 24 bit little endian value in ADC clock cycles");
+        check(c[9] == (uint8_t)(6461 & 0xFF) && c[10] == (uint8_t)(6461 >> 8),
+              "channel 1 gain is a 16 bit little endian value");
+        check(c[11] == (uint8_t)(500 & 0xFF) && c[12] == (uint8_t)(500 >> 8),
+              "channel 2 gain is its own, independent 16 bit little endian value");
+        check(c[13] == 9, "repeat counter occupies byte 13");
     }
 
     // -----------------------------------------------------------------

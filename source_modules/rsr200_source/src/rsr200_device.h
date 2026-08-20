@@ -107,9 +107,20 @@ namespace rsr200 {
         bool upperSideband = false;
         double tunedHz = 10e6;
         uint16_t switchRegister = 0;
-        int attenuator1 = 0;                    // 0..35
-        int attenuator2 = 0;
-        bool autoAttEnabled = false;
+        int attenuator1 = 0;                    // 0..35 normally, 0..19 whenever Auto-ATT is on
+        int attenuator2 = 0;                    // (the automatic +16dB step needs headroom above it)
+
+        // Auto-ATT (RSR200_PLAN.md phase 7). threshold: 0 = off, 1..5 = -6dB..-30dB in fixed
+        // 6dB steps -- a small enum, not a continuous control, per the DP's own command table.
+        // "Enabled" is threshold > 0; there is no separate on/off field, so the two can never
+        // disagree with each other.
+        int autoAttThreshold = 0;
+        double autoAttHoldTimeSec = 0.2;
+        // Per-channel calibration multipliers, nominal 6.3096x (DP's own worked value, = the
+        // attenuator's nominal 16dB). See autoAttGainLsb()'s own comment for the raw-LSB
+        // conversion this becomes on the wire.
+        float autoAttGainCh1 = 6.3096f;
+        float autoAttGainCh2 = 6.3096f;
 
         // OP_SERIAL (RSR200_PLAN.md §6/§7, "SerL"/"SerU"; see RSR200_OM_V225.pdf's own "Use of
         // SerL and SerU" section, read directly rather than guessed at) samples the two ADCs
@@ -216,6 +227,17 @@ namespace rsr200 {
                                     || next.upperSideband != cfg.upperSideband;
             const bool clockChanged = next.adcClockHz != cfg.adcClockHz
                                    || next.gpsDiscipline != cfg.gpsDiscipline;
+            // Auto-ATT's own command (0xB1), independent of the SET_DATA_TRANSMISSION one
+            // formatChanged tracks -- not itself a reason to stop and restart the stream (DP
+            // says nothing of the kind for this command, unlike the transmission-mode one).
+            // clockChanged is included too: hold time is expressed in raw ADC clock cycles, so
+            // DP's own caution ("must be reloaded each time the ADC clock frequency is
+            // changed") means a clock change alone has to resend this even if nothing about
+            // Auto-ATT's own settings changed.
+            const bool autoAttChanged = next.autoAttThreshold != cfg.autoAttThreshold
+                                     || next.autoAttHoldTimeSec != cfg.autoAttHoldTimeSec
+                                     || next.autoAttGainCh1 != cfg.autoAttGainCh1
+                                     || next.autoAttGainCh2 != cfg.autoAttGainCh2;
 
             if (streaming && (formatChanged || clockChanged)) {
                 if (!stopStream(nowMs)) { return false; }
@@ -247,6 +269,17 @@ namespace rsr200 {
                                      (uint16_t)std::clamp(cfg.attenuator1, 0, 35)), nowMs, true)) { return false; }
             if (!send(cmdSetVariable(nextNumber(), transport->isLan(), VAR_ATTENUATOR_ADC2,
                                      (uint16_t)std::clamp(cfg.attenuator2, 0, 35)), nowMs, true)) { return false; }
+
+            if (autoAttChanged || clockChanged || !configuredOnce) {
+                const uint32_t holdClocks = autoAttHoldTimeClocks(cfg.autoAttHoldTimeSec, cfg.adcClockHz);
+                const uint16_t g1 = autoAttGainLsb(cfg.autoAttGainCh1);
+                const uint16_t g2 = autoAttGainLsb(cfg.autoAttGainCh2);
+                if (!send(cmdSetAutoAttenuator(nextNumber(), transport->isLan(),
+                                               (uint8_t)std::clamp(cfg.autoAttThreshold, 0, 5),
+                                               holdClocks, g1, g2), nowMs, true)) {
+                    return false;
+                }
+            }
 
             // Tuning last, so it follows the synchronisation event rather than preceding it.
             if (!tune(cfg.tunedHz, nowMs)) { return false; }
@@ -426,12 +459,43 @@ namespace rsr200 {
         }
 
         void deliver(const uint8_t* iq, int frames) {
-            const float gain = lastBlock.status.autoAttActive ? AUTO_ATT_GAIN : 1.0f;
+            // Constant 2-bit (4x) headroom shift whenever Auto-ATT is enabled at all
+            // (threshold > 0), independent of whether it is *currently* engaged -- OM: "the
+            // entire level range is shifted by 2 bits... as soon as Auto ATT is turned on."
+            // That's a materially wider condition than autoAttActive (the momentary
+            // engaged-state status flag) -- found while reading the OM for this feature,
+            // RSR200_PLAN.md phase 7: the previous version of this line used autoAttActive
+            // alone, which was harmless only because autoAttThreshold could never actually be
+            // nonzero yet (nothing set it). Real Auto-ATT support means getting the wider
+            // condition right too, or levels come out quiet by 4x whenever it's enabled but
+            // not momentarily engaged.
+            float gainA = (cfg.autoAttThreshold > 0) ? AUTO_ATT_GAIN : 1.0f;
+            float gainB = gainA;
+            // Gated on autoAttThreshold too, not just the status flag alone -- DP's own
+            // caution that the -128C/"active" indicator persists "for up to approximately 0.5
+            // seconds" after the attenuator itself has actually released means autoAttActive
+            // is not a trustworthy sole signal right at a transition. cfg.autoAttThreshold is
+            // this module's own single source of truth for whether the feature is on at all;
+            // treating it as the master condition guarantees "Auto-ATT off" really means no
+            // gain shift at all, full stop, regardless of what a trailing status byte says.
+            if (cfg.autoAttThreshold > 0 && lastBlock.status.autoAttActive) {
+                // An additional, variable, *per-channel* correction for the attenuator's own
+                // ~16dB while actually engaged, using the calibrated gain multiplier from the
+                // last SET_AUTO_ATT command (DP: "the gain values can be used to compensate
+                // the attenuator's attenuation"). Not solved here: DP's own further caution
+                // that channel 2 needs yet another factor on top of this when hardware
+                // diversity's own "Magnitude" weight (channel set value 9) isn't unity --
+                // both features are now built, but that specific combination hasn't been
+                // derived or tested (RSR200_PLAN.md phase 7's Auto-ATT section).
+                gainA *= cfg.autoAttGainCh1;
+                gainB *= cfg.autoAttGainCh2;
+            }
+
             const size_t need = (size_t)frames * 2;
             if (bufA.size() < need) { bufA.resize(need); }
             if (cfg.format.channels == 2 && bufB.size() < need) { bufB.resize(need); }
 
-            unpack(iq, frames, cfg.format, gain, bufA.data(),
+            unpack(iq, frames, cfg.format, gainA, gainB, bufA.data(),
                    cfg.format.channels == 2 ? bufB.data() : nullptr);
 
             // tuneFor() already works out, per DP's own Nyquist-zone arithmetic, exactly

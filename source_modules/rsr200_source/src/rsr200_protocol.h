@@ -290,24 +290,30 @@ namespace rsr200 {
     // per-sample branch that never actually varies within a single call. See phase 15: this
     // runs at the full incoming sample rate, so a branch here is a branch ~20.5 million times
     // a second in the demanding case (24-bit), not a rounding error.
+    // gainA/gainB are separate (rather than one shared gain) because Auto-ATT's own
+    // engaged-state compensation is a *per-channel* calibration factor (DP: "the gain values
+    // can be used to compensate the attenuator's attenuation", one value per channel) --
+    // RSR200_PLAN.md phase 7. Both still cost nothing extra per sample: each is computed once
+    // into its own scale constant outside the loop, same as the single shared one used to.
     inline int unpack(const uint8_t* iq, int frames, const StreamFormat& fmt,
-                      float gain, float* outA, float* outB) {
-        const float scale = gain / fullScaleFor(fmt.bits);
+                      float gainA, float gainB, float* outA, float* outB) {
+        const float scaleA = gainA / fullScaleFor(fmt.bits);
+        const float scaleB = gainB / fullScaleFor(fmt.bits);
         const int step = (fmt.bits / 8) * 2;    // one complex sample of one channel
 
         if (fmt.channels == 1) {
             if (fmt.bits == 16) {
                 for (int i = 0; i < frames; i++) {
                     const uint8_t* p = iq + (size_t)i * step;
-                    outA[2 * i] = (float)read16(p) * scale;
-                    outA[2 * i + 1] = (float)read16(p + 2) * scale;
+                    outA[2 * i] = (float)read16(p) * scaleA;
+                    outA[2 * i + 1] = (float)read16(p + 2) * scaleA;
                 }
             }
             else {
                 for (int i = 0; i < frames; i++) {
                     const uint8_t* p = iq + (size_t)i * step;
-                    outA[2 * i] = (float)read24(p) * scale;
-                    outA[2 * i + 1] = (float)read24(p + 3) * scale;
+                    outA[2 * i] = (float)read24(p) * scaleA;
+                    outA[2 * i + 1] = (float)read24(p + 3) * scaleA;
                 }
             }
             return frames;
@@ -317,19 +323,19 @@ namespace rsr200 {
         if (fmt.bits == 16) {
             for (int i = 0; i < frames; i++) {
                 const uint8_t* p = iq + (size_t)i * step * 2;
-                outA[2 * i] = (float)read16(p) * scale;
-                outA[2 * i + 1] = (float)read16(p + 2) * scale;
-                outB[2 * i] = (float)read16(p + 4) * scale;
-                outB[2 * i + 1] = (float)read16(p + 6) * scale;
+                outA[2 * i] = (float)read16(p) * scaleA;
+                outA[2 * i + 1] = (float)read16(p + 2) * scaleA;
+                outB[2 * i] = (float)read16(p + 4) * scaleB;
+                outB[2 * i + 1] = (float)read16(p + 6) * scaleB;
             }
         }
         else {
             for (int i = 0; i < frames; i++) {
                 const uint8_t* p = iq + (size_t)i * step * 2;
-                outA[2 * i] = (float)read24(p) * scale;
-                outA[2 * i + 1] = (float)read24(p + 3) * scale;
-                outB[2 * i] = (float)read24(p + 6) * scale;
-                outB[2 * i + 1] = (float)read24(p + 9) * scale;
+                outA[2 * i] = (float)read24(p) * scaleA;
+                outA[2 * i + 1] = (float)read24(p + 3) * scaleA;
+                outB[2 * i] = (float)read24(p + 6) * scaleB;
+                outB[2 * i + 1] = (float)read24(p + 9) * scaleB;
             }
         }
         return frames;
@@ -558,6 +564,26 @@ namespace rsr200 {
                                                        uint8_t repeat = 0) {
         std::vector<uint8_t> p = { (uint8_t)iface, portMode, dspMode, repeat };
         return makeCommand(no, instr::SET_DATA_TRANSMISSION, p, 12, 9, lan);
+    }
+
+    // The command's own gain fields are raw 1/1024-LSB counts (DP's own worked value: nominal
+    // 16dB attenuation = 6.3096x = set value 6461), but that's not a number anyone would want
+    // to type in or reason about -- callers work in the plain multiplier instead (default
+    // 6.3096, matching the DP's own nominal figure) and this is the one place it becomes wire
+    // bytes. A device-to-device calibration knob (DP: "There are device tolerances that can be
+    // compensated for with appropriate values (calibrate!)"), not something with a fixed
+    // "correct" value -- so no assertion here on how far from 6.3096 it's allowed to drift,
+    // only the field's own 16-bit wire range.
+    inline uint16_t autoAttGainLsb(double multiplier) {
+        return (uint16_t)std::clamp(std::lround(multiplier * 1024.0), 0L, 65535L);
+    }
+
+    // Hold time is documented in raw ADC clock cycles (0..0xFFFFFF, 24 bits), not seconds --
+    // "the hold time must be reloaded each time the ADC clock frequency is changed." Seconds
+    // is what a person actually reasons about, so that's the unit everywhere except the wire
+    // itself; this is the one conversion point, mirroring autoAttGainLsb() just above.
+    inline uint32_t autoAttHoldTimeClocks(double seconds, double adcClockHz) {
+        return (uint32_t)std::clamp(std::llround(seconds * adcClockHz), 0LL, (long long)0xFFFFFF);
     }
 
     inline std::vector<uint8_t> cmdSetAutoAttenuator(uint32_t no, bool lan, uint8_t threshold,

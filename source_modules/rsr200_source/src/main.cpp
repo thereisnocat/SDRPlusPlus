@@ -186,7 +186,10 @@ private:
                             (serialMode ? SW_ADC2_CLK_INVERTED : 0);
         c.attenuator1 = atten1;
         c.attenuator2 = atten2;
-        c.autoAttEnabled = false;   // not yet exposed -- see RSR200_PLAN.md phase 7
+        c.autoAttThreshold = autoAttThreshold;
+        c.autoAttHoldTimeSec = autoAttHoldTimeSec;
+        c.autoAttGainCh1 = autoAttGainCh1;
+        c.autoAttGainCh2 = autoAttGainCh2;
         return c;
     }
 
@@ -624,16 +627,81 @@ private:
             dirty = true;
         }
 
+        // DP: "When activating the Auto-ATT function, limit the manual adjustment range to a
+        // maximum of step 19" -- the automatic +16dB step needs headroom above whatever the
+        // manual setting already used, so both sliders' own max bound becomes conditional
+        // while Auto-ATT is on, not just a separate clamp applied elsewhere.
+        const int attMax = (_this->autoAttThreshold > 0) ? 19 : 35;
         SmGui::LeftLabel("Attenuator 1 (0 = +7dB gain, 35 = -28dB)");
         SmGui::FillWidth();
-        if (SmGui::SliderInt(CONCAT("##_rsr200_att1_", _this->name), &_this->atten1, 0, 35)) {
+        if (SmGui::SliderInt(CONCAT("##_rsr200_att1_", _this->name), &_this->atten1, 0, attMax)) {
             dirty = true;
         }
         if (_this->dualChannel) {
             SmGui::LeftLabel("Attenuator 2");
             SmGui::FillWidth();
-            if (SmGui::SliderInt(CONCAT("##_rsr200_att2_", _this->name), &_this->atten2, 0, 35)) {
+            if (SmGui::SliderInt(CONCAT("##_rsr200_att2_", _this->name), &_this->atten2, 0, attMax)) {
                 dirty = true;
+            }
+        }
+
+        // Auto-ATT (RSR200_PLAN.md phase 7). The threshold combo doubles as the on/off
+        // control -- "Off" *is* threshold 0, so there's no separate checkbox that could ever
+        // disagree with it. Resolved with Ralph 2026-08-20: starts at Off until explicitly
+        // raised, and a manual attenuator above 19 is silently clamped down the moment the
+        // threshold leaves Off, matching how every other control here already auto-corrects
+        // without a prompt.
+        SmGui::LeftLabel("Auto-ATT threshold");
+        SmGui::FillWidth();
+        const int prevThreshold = _this->autoAttThreshold;
+        if (SmGui::Combo(CONCAT("##_rsr200_autoatt_thresh_", _this->name), &_this->autoAttThreshold,
+                          "Off\0-6 dB\0-12 dB\0-18 dB\0-24 dB\0-30 dB\0")) {
+            if (prevThreshold == 0 && _this->autoAttThreshold > 0) {
+                _this->atten1 = std::min(_this->atten1, 19);
+                _this->atten2 = std::min(_this->atten2, 19);
+            }
+            dirty = true;
+        }
+        if (_this->autoAttThreshold > 0) {
+            SmGui::LeftLabel("Hold time (s)");
+            SmGui::FillWidth();
+            if (SmGui::SliderFloat(CONCAT("##_rsr200_autoatt_hold_", _this->name),
+                                    &_this->autoAttHoldTimeSec, 0.0f, 2.0f)) {
+                dirty = true;
+            }
+            // Hold time is a 24 bit raw-clock-cycle field on the wire (DP), not seconds -- at
+            // typical ADC clock rates that field caps out well under a second (e.g. ~134ms at
+            // 125 MHz), so a value that reads as perfectly reasonable in this seconds-based
+            // slider can silently be more than the radio can actually hold. Shown here rather
+            // than just clamping the slider's own range, since the achievable ceiling moves
+            // with the ADC clock control above.
+            const double adcHz = (double)_this->adcClockMHz * 1e6;
+            const double actualHoldSec = (double)autoAttHoldTimeClocks(_this->autoAttHoldTimeSec, adcHz) / adcHz;
+            if (actualHoldSec + 1e-6 < _this->autoAttHoldTimeSec) {
+                char holdBuf[128];
+                snprintf(holdBuf, sizeof(holdBuf), "Clamped to %.3f s at the current ADC clock (24 bit field).", actualHoldSec);
+                SmGui::Text(holdBuf);
+            }
+
+            SmGui::LeftLabel("Gain calibration, channel 1");
+            SmGui::FillWidth();
+            if (SmGui::SliderFloat(CONCAT("##_rsr200_autoatt_gain1_", _this->name),
+                                    &_this->autoAttGainCh1, 0.5f, 20.0f)) {
+                dirty = true;
+            }
+            if (_this->dualChannel) {
+                SmGui::LeftLabel("Gain calibration, channel 2");
+                SmGui::FillWidth();
+                if (SmGui::SliderFloat(CONCAT("##_rsr200_autoatt_gain2_", _this->name),
+                                        &_this->autoAttGainCh2, 0.5f, 20.0f)) {
+                    dirty = true;
+                }
+            }
+            SmGui::Text("Compensates the attenuator's own ~16dB while engaged (nominal 6.3096x) --\n"
+                        "a device tolerance to calibrate, not usually something to change by feel.");
+            if (!_this->bits24) {
+                SmGui::Text("Warning: 16-bit's usable resolution drops to an effective 14 bits under\n"
+                            "Auto-ATT. 24-bit is recommended whenever Auto-ATT is on.");
             }
         }
 
@@ -916,6 +984,10 @@ private:
         d["vhfPreamp"] = vhfPreamp;
         d["atten1"] = atten1;
         d["atten2"] = atten2;
+        d["autoAttThreshold"] = autoAttThreshold;
+        d["autoAttHoldTimeSec"] = autoAttHoldTimeSec;
+        d["autoAttGainCh1"] = autoAttGainCh1;
+        d["autoAttGainCh2"] = autoAttGainCh2;
     }
 
     // Reads the live per-device fields out of `d` -- shared by loadDeviceSettings() (reading
@@ -935,6 +1007,10 @@ private:
         if (d.contains("vhfPreamp")) { vhfPreamp = d["vhfPreamp"]; }
         if (d.contains("atten1")) { atten1 = d["atten1"]; }
         if (d.contains("atten2")) { atten2 = d["atten2"]; }
+        if (d.contains("autoAttThreshold")) { autoAttThreshold = d["autoAttThreshold"]; }
+        if (d.contains("autoAttHoldTimeSec")) { autoAttHoldTimeSec = d["autoAttHoldTimeSec"]; }
+        if (d.contains("autoAttGainCh1")) { autoAttGainCh1 = d["autoAttGainCh1"]; }
+        if (d.contains("autoAttGainCh2")) { autoAttGainCh2 = d["autoAttGainCh2"]; }
     }
 
     // (Re)loads the per-device fields for whatever currentDeviceKey() is *right now* into the
@@ -1086,6 +1162,20 @@ private:
     bool vhfPreamp = false;
     int atten1 = 0;
     int atten2 = 0;
+
+    // Auto-ATT (RSR200_PLAN.md phase 7). Resolved with Ralph 2026-08-20: starts at 0 (off)
+    // until explicitly raised, rather than jumping to some working threshold the moment the
+    // feature is turned on; a 200ms hold time is the initial "look and see" default (own
+    // caveat: whether that's actually representable depends on the current ADC clock -- see
+    // the menu's own hint text, and autoAttHoldTimeClocks()'s test in test_protocol.cpp for
+    // the arithmetic); the manual attenuator is silently clamped to 19 the moment the
+    // threshold goes from 0 to nonzero, not warned about first, matching how every other
+    // control on this panel already auto-corrects without a prompt.
+    int autoAttThreshold = 0;          // 0 = off, 1..5 = -6..-30 dB in fixed 6dB steps
+    float autoAttHoldTimeSec = 0.2f;   // float, not double, to bind directly to SmGui::SliderFloat
+    float autoAttGainCh1 = 6.3096f;    // calibration multiplier, DP's own nominal value
+    float autoAttGainCh2 = 6.3096f;
+
     double tunedHz = 10e6;
 
     // Transport selection. 0 = USB, 1 = LAN (TCP) -- matches transportItems' order in

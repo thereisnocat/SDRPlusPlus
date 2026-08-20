@@ -514,7 +514,7 @@ and sits comfortably inside `STREAM_BUFFER_SIZE`.
 | **4** | **Done** — dual channel Separate mode + `registerChannels()`. `main.cpp`'s dual-channel checkbox sets port/DSP mode bytes and switch register, plus (the missing piece, see §10) sends channel 2's diversity weight to unity via `Device::setHardwareDiversity(1.0, 0.0, ...)` — without that, ADC2 reads as a clean zero regardless of everything else being correct. Confirmed live in the real app: both channels alive, phasing and decorrelation nulling local signals by more than 30 dB. | Yes |
 | **5** | UDP transport for higher rates; block reassembly and loss reporting. Its own transport, `KIND_LAN_UDP`, alongside the TCP one built in Phase 2 rather than replacing it — DP §4.2 has commands go over TCP even when the IQ stream itself is UDP. | Yes |
 | **6** | **Done and verified on Windows, and now proven live on macOS too (2026-08-09) — spectrum and signals received on the Mac over real USB.** `src/transport_usb.{h,cpp}` via D3XX: `FT_SetStreamPipe` plus a queue of chunked overlapped reads (several 4096-byte packets per call) kept perpetually in flight, as DP §2.1 recommends. Windows and Linux/macOS ship genuinely different D3XX SDKs — different async-read call name (`FT_ReadPipeEx` vs `FT_ReadPipeAsync`), different blocking-write signature (`LPOVERLAPPED` vs a millisecond timeout), **and a third, undocumented-until-now difference: the Linux/macOS `*_Ex`/`*_Async` read/write calls take a logical FIFO channel (0-3), not the raw USB endpoint address Windows and every other pipe call use** — see section 1's 2026-08-09 entries for the full diagnosis. All three abstracted behind small wrapper functions so `rsr200_device.h` and `main.cpp` stay platform-agnostic. CMake links `/usr/local/{include,lib}` on non-MSVC, matching FTDI's own install instructions. Windows path verified against real hardware: 0.00% packet loss sustained, `test/test_usb_live.cpp`. That Windows run needed a full radio power cycle to get a proper SuperSpeed link — see ENGINEERING_NOTES.md §4; on the Mac, the blocker turned out to be a driver version regression (fixed by downgrading to 1.1.6) plus the FIFO-channel bug above, not a power cycle. `main.cpp` wires it into a working single-channel SDR++ source module. Not yet measured on macOS: sustained packet-loss numbers over a long run, the way Windows has. | Yes |
-| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19), **GPS correction display done** (2026-08-20), and **hardware diversity done** (2026-08-20, see the dated sections below) — antenna control and Auto-ATT UI still open. | Yes |
+| **7** | Extras: hardware diversity mode, antenna control (RLA4/RFA2/RAP), GPS correction display, Auto-ATT UI, serial (`SerL`/`SerU`) modes. **Serial modes done** (2026-08-19), **GPS correction display done** (2026-08-20), **hardware diversity done** (2026-08-20), and **Auto-ATT done** (2026-08-20, see the dated sections below) — antenna control is the only item left open. | Yes |
 
 Phase 1 is worth doing properly and can start immediately: the byte layouts are fully
 specified in the documents, so the parser and the command builders can be written and
@@ -2053,3 +2053,68 @@ built from. Combined with the earlier live confirmation that "Back to Separate m
 restores independent dual-channel reception (from when the wire-format bug was first found),
 hardware diversity's full solve -> apply -> back-to-Separate workflow is now verified end to end
 against real hardware, not just against the test suite. **Hardware diversity is done.**
+
+## Auto-ATT implemented (2026-08-20, same day)
+
+Ralph's answers to the three open questions this plan's own Auto-ATT section had posed:
+threshold starts at Off (0) until explicitly raised, not some working level the moment the feature
+is turned on; hold time defaults to 200ms (a "look and see" starting value, per the plan's own
+suggestion); the manual attenuator is clamped down to 19 silently, not warned about first, matching
+how every other control on this panel already auto-corrects without a prompt.
+
+Built as designed in this document's own Auto-ATT section: `unpack()` now takes separate `gainA`/
+`gainB` (device tolerances mean the two channels' calibration factors genuinely differ, DP: "There
+are device tolerances that can be compensated for with appropriate values (calibrate!)"), two new
+protocol-layer conversions (`autoAttGainLsb()`: plain multiplier, default 6.3096x matching DP's own
+worked value, to the wire's raw 1/1024-LSB count; `autoAttHoldTimeClocks()`: seconds to raw ADC
+clock cycles), and `Device::applyConfig()` gained its own `autoAttChanged` detection (mirroring
+`formatChanged`) that resends `cmdSetAutoAttenuator()` whenever Auto-ATT's own settings change *or*
+the ADC clock does, per DP's own caution that hold time (expressed in raw clock cycles) "must be
+reloaded each time the ADC clock frequency is changed."
+
+`deliver()`'s gain-compensation bug flagged in this plan's own Auto-ATT section was fixed exactly
+as proposed: a constant 4x (2-bit) headroom shift whenever `autoAttThreshold > 0` at all (OM: "as
+soon as Auto ATT is turned on"), plus each channel's own calibrated multiplier stacked on top only
+while actually engaged. One refinement found while writing the device-layer test for this, not
+anticipated in the original plan: the engaged-multiplier branch is gated on
+`autoAttThreshold > 0` as well as the status flag, not the status flag alone -- DP documents that
+the -128C/"active" indicator persists "for up to approximately 0.5 seconds" *after* the attenuator
+has actually released, so trusting it in isolation right at a transition would occasionally apply a
+calibration multiplier the module itself believes Auto-ATT to be off. `autoAttThreshold` is this
+module's own single source of truth for whether the feature is on at all.
+
+**A second, unrelated correctness gap found while writing the tests, not present in the original
+plan**: `autoAttHoldTimeClocks()`'s 24-bit field (`0..0xFFFFFF`) caps out at barely over 134ms at a
+125 MHz ADC clock, and less still at higher clock rates -- so the plan's own suggested 200ms
+default, which reads as perfectly reasonable next to the field's *seconds* framing, actually
+overflows the wire format at typical clock rates and would have been silently clamped with no
+visible sign of it. Rather than pick a different, clock-rate-dependent default that could still
+overflow after a clock change, the UI now shows the *achieved* hold time (the same seconds-to-clocks
+conversion, then back) whenever it differs from what was requested, so a clamp is visible instead of
+invisible. The 200ms UI default itself is unchanged -- it's still what gets requested, it's just
+now honest about what's actually achieved when the field can't hold it.
+
+**UI** (`main.cpp`, gated inside the same `BeginDisabled()`/`EndDisabled()` block every other
+static setting on this panel already uses, since Auto-ATT is configuration sent as part of the
+normal `applyConfig()` sequence, not a live action the way hardware diversity's solve step is):
+a "Auto-ATT threshold" combo (Off/-6/-12/-18/-24/-30 dB) that doubles as the on/off control --
+there's no separate checkbox, so it can never disagree with the threshold; hold time and per-channel
+calibration-gain sliders, shown only while threshold > 0; the achieved-hold-time note described
+above; the manual attenuator sliders' own max bound becomes 19 instead of 35 while Auto-ATT is on;
+a warning when 16-bit is selected while Auto-ATT is on (OM: 16-bit's usable resolution drops to an
+effective 14 bits under Auto-ATT, "24-bit... should always be used"). All four new fields persist
+per-device, same as `atten1`/`atten2`/`bits24`.
+
+**Still flagged, not solved (carried over from this plan's own original Auto-ATT section)**: DP's
+further caution that channel 2 needs yet another gain factor on top of its own calibration value
+when hardware diversity's "Magnitude" weight isn't unity. Both features are now built, but that
+specific combination -- Auto-ATT engaged *and* hardware diversity active on channel 2 at the same
+time -- hasn't been derived or tested. Flagged in `deliver()`'s own comment, not guessed at.
+
+Verified: `rsr200_source` and core build clean, full test suite passes (14 suites, 0 failures,
+including new coverage for `unpack()`'s per-channel gain, `autoAttGainLsb()`/
+`autoAttHoldTimeClocks()`'s conversions and clamping, `cmdSetAutoAttenuator()`'s field layout,
+`applyConfig()`'s send/resend timing, and `deliver()`'s enabled-vs-engaged/off gain logic against
+real poked sample bytes), full multi-target rebuild clean, bundle launches and quits cleanly. Not
+yet tested against the real radio -- that's Ralph's own next step, per his standing preference to
+drive live-hardware testing himself.
