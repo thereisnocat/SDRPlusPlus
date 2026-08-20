@@ -1699,3 +1699,218 @@ cleanly by PID. **Not verified against the actual radio** — needs Ralph's own 
 Serial mode streams correctly with the `SW_ADC2_CLK_INVERTED` bit set and that the sideband
 selection behaves as the manual describes in practice, matching this document's own standing
 practice of flagging what still needs live hardware.
+
+---
+
+## Phase 7, continued: hardware diversity, GPS correction display, Auto-ATT — implementation plan (2026-08-20)
+
+Ralph: "Create a plan for implementing the hardware diversity, GPS correction display, and
+AutoATT features." Antenna control (RLA4/RFA2/RAP) — the fourth item phase 7's own table lists
+— isn't part of this request; still open, not planned here.
+
+Read `rsr200_protocol.h`/`rsr200_device.h` end to end first rather than assuming from the phase
+table what's missing. The three features turn out to be at very different stages: GPS correction
+is fully built underneath and needs only a display line; hardware diversity has its whole
+device-layer API already written and tested, just never wired to the UI; Auto-ATT has a wire
+command that was never even given a `Device`-layer sender, and (found while reading the DP PDF
+for this plan, not previously known) a real gain-compensation gap that's been dormant only
+because the feature has never been reachable from the UI at all.
+
+### GPS correction display
+
+**Already fully built.** `Status::freqCorrectionRaw`/`freqCorrectionValid` are parsed from every
+block's status header (`parseStatus()`), and `freqCorrectionHz(status, gpsDiscipline)` converts
+to Hz at the correct resolution (0.5Hz/LSB disciplining, 0.1Hz/LSB measuring-only) — both
+already covered by `test_protocol.cpp`. `_this->lastStatus` is already available in the same
+"-- Status, updated from the worker thread --" block (`main.cpp`, alongside temperature/overload/
+sequence-gaps) that already runs every frame while streaming.
+
+This is one new line in that block:
+
+```cpp
+if (_this->lastStatus.freqCorrectionValid) {
+    snprintf(buf, sizeof(buf), "GPS correction: %+.1f Hz", freqCorrectionHz(_this->lastStatus, _this->gpsDiscipline));
+} else {
+    snprintf(buf, sizeof(buf), "GPS correction: no valid measurement (GPS not received, or just retuned)");
+}
+SmGui::Text(buf);
+```
+
+Matches OM §"GPS Hz"'s own description ("Display of the deviation of the ADC clock frequency
+determined by the GPS receiver... from the set value") and its note that disabling GPS discipline
+still shows the live measured deviation without applying it ("the current deviation of the ADC
+clock is displayed. Without correction, no retuning artifacts are present in the signal") — this
+implementation already reads correctly for that case, since `freqCorrectionHz()` takes
+`gpsDiscipline` only to pick the LSB resolution, not to gate whether the value is shown at all.
+
+No open questions, no new `Config` fields, no new commands. Lowest-risk of the three — safe to
+build and ship independent of the other two.
+
+### Hardware diversity mode
+
+**Device/protocol layer fully built and tested, UI wiring is the entire gap.**
+`Device::setHardwareDiversity()`/`setHardwareDiversityFrom()`, `hardwareWeightFor()` (magnitude/
+phase from an additive `k0`/`k1` pair, `representable`/`suggestSwap` flags for out-of-range
+ratios), `packMagnitudePhase()`, and `OP_DIVERSITY` all already exist, and `hardwareWeightFor()`
+already has direct test coverage (`test_protocol.cpp`, including the swap-suggestion and
+channel-A-contributes-nothing edge cases). `sigpath::phasing.getCombineCoefficients(k0, k1)` is a
+plain public method on the core `Phasing` global (`core/src/signal_path/phasing.h`) — no
+`ModuleComManager` indirection needed, matching how `sigpath::sourceManager`/`sigpath::iqFrontEnd`
+are already used directly elsewhere in this module.
+
+**The real design work is the workflow, not the plumbing** — per `PHASING_PLAN.md` §7.2's own
+"solve in software, hold in hardware" two-step:
+
+1. Run in Separate mode (`OP_INDEPENDENT`, i.e. today's existing "Dual channel" checkbox) with
+   both channels live, so the phasing front end has something to solve against.
+2. Read the solved coefficients from `sigpath::phasing`, convert with `hardwareWeightFor()`, and
+   hand them to the radio via `setHardwareDiversityFrom()`.
+3. Switch the mode to `OP_DIVERSITY` (single-channel output, radio does the combining).
+
+Steps 1 and 3 are ordinary `Config`/`buildConfig()` changes, same shape as `OP_SERIAL` — a third
+radio-button-style mode alongside "Dual channel"/"Serial mode" (all three are mutually exclusive
+single-vs-dual/combining choices; `buildConfig()`'s existing if/else-if chain extends naturally).
+Step 2 is different in kind from everything else on this panel: every other control here is a
+static setting, edited while stopped, sent as part of `applyConfig()`. "Solve now" is a **live
+action while running and in dual-channel mode**, closer to a button press than a persisted field
+— clicking it reads whatever `sigpath::phasing` currently holds *at that moment* and sends one
+`0xB0`/`GEN_MAG_PHASE_CH2` command immediately, it doesn't go through the stop/reconfigure/
+restart machinery `applyConfig()` uses for `OpMode` changes at all (setting the weight is its own
+small command, not a "Set Data Transmission" interface-mode change — DP's caution about mode
+switches stopping streaming doesn't apply to it).
+
+Proposed UI, in the Serial-mode-style conditional block (shown only while `dualChannel` is on,
+since solving needs both channels live):
+
+- A **"Hardware diversity"** section, always-enabled (not inside the `BeginDisabled()` block the
+  rest of the settings panel uses while running) — because using it *requires* being started and
+  streaming in dual-channel mode.
+- **"Solve from current phasing"** button: calls `sigpath::phasing.getCombineCoefficients(k0, k1)`,
+  `hardwareWeightFor(k0, k1)`, and displays the result (magnitude, phase, or the swap suggestion/
+  not-representable message) — a preview, not yet sent to the radio.
+- **"Apply to hardware"** button, enabled only after a successful solve: calls
+  `setHardwareDiversityFrom()` to send the weight, then flips the mode to `OP_DIVERSITY` and
+  triggers the same reconfigure path `OpMode` changes already go through elsewhere. Two separate
+  buttons rather than one, deliberately — solving is cheap and safe to repeat/inspect, switching
+  to Diversity mode changes what's actually streaming (halves the data rate, ends independent
+  dual-channel reception) and shouldn't happen as a side effect of just checking the numbers.
+- If `hardwareWeightFor()` reports `suggestSwap`, show it plainly ("Ratio needs channel swap —
+  toggle Swap channels and re-solve") rather than silently flipping `swapChannels` — swapping
+  changes which physical antenna is "channel 1" for the *next* solve too, not just this one, so
+  it should be the user's own call, same reasoning as Serial mode's manual sideband choice.
+- A **"Back to Separate mode"** control to leave `OP_DIVERSITY` and return to independent
+  dual-channel — needed to solve again later (§7.1's own note that the weight can't be *found*
+  while already in Diversity mode, since the radio only returns the combined result then).
+
+**Open questions for Ralph:**
+- Should "Apply to hardware" require confirmation (it's reversible — "Back to Separate mode"
+  undoes it — but it does interrupt independent dual-channel reception)?
+- Worth persisting the last-solved/applied weight per device (so re-selecting the source shows
+  what's currently on the radio), or is session-only fine, matching Carrier Zoom's own "no
+  persisted state" precedent?
+
+### Auto-ATT
+
+**The least-built of the three.** `cmdSetAutoAttenuator()` (the wire command, `0xB1`) exists in
+`rsr200_protocol.h` and is well-documented there, but has no `Device`-layer sender and no test
+coverage at all — unlike Serial mode and hardware diversity, this one needs new protocol-adjacent
+work, not just UI wiring on top of an already-tested foundation. `Config::autoAttEnabled` exists
+as a field but is hardcoded `false` in `buildConfig()` today ("not yet exposed").
+
+**Read directly from the DP and OM PDFs for this plan** (not in the codebase anywhere yet):
+
+- **Threshold is a 6-value enum, not a continuous control**: `0` = off, `1..5` = **-6, -12, -18,
+  -24, -30 dB** in fixed 6dB steps ("Threshold ... 1: -6dB, 2: -12dB, …, 5: -30dB, >5: not
+  allowed" — DP's own command table). A dropdown/combo, not a slider.
+- **Hold time is in raw ADC clock cycles** (`0..0xFFFFFF`, i.e. 24 bits), not seconds — "must be
+  reloaded each time the ADC clock frequency is changed" per the DP's own caution. The UI should
+  take **seconds** (something a user actually reasons about) and convert:
+  `holdTimeClocks = clamp(round(holdTimeSec * adcClockHz), 0, 0xFFFFFF)`, resent whenever either
+  the hold time *or* the ADC clock changes — `Device::applyConfig()`'s existing `clockChanged`
+  detection already exists and just needs Auto-ATT's own resend hooked to the same condition, not
+  a new mechanism.
+- **Per-channel gain values are attenuator-compensation calibration factors**, 1 LSB = 1/1024,
+  nominal value **6461** (= 6.3096× = the attenuator's own nominal 16dB, DP's own worked value).
+  Best exposed as a plain multiplier (default 6.3096, matching the nominal dB spec) rather than
+  the raw LSB count — a calibration knob for device-to-device tolerance, per the DP's own "There
+  are device tolerances that can be compensated for with appropriate values (calibrate!)."
+- **The manual attenuator range must be limited to 0..19 (not the normal 0..35) whenever Auto-ATT
+  is enabled** — DP: "When activating the Auto-ATT function, limit the manual adjustment range to
+  a maximum of step 19," because the automatic +16dB step needs headroom above whatever the
+  manual setting already used. `atten1`'s (and, dual-channel, `atten2`'s) existing `SliderInt`
+  needs its max bound to become conditional on `autoAttEnabled`, and any already-stored value
+  above 19 should be clamped down when Auto-ATT is turned on, not just capped going forward.
+- **24-bit is strongly recommended with Auto-ATT** — OM: 16-bit's usable resolution drops to an
+  effective 14 bits under Auto-ATT ("noise and distortion increase accordingly"); 24-bit avoids
+  this entirely and "should always be used." Proposed: a visible warning text when Auto-ATT is on
+  and `bits24` is off, not a forced auto-switch — matching this module's existing pattern of
+  informing rather than overriding user choices (e.g. Serial mode's sideband hint).
+
+**A real, previously-dormant correctness gap, found while reading the DP for this plan, not
+something already flagged anywhere in this codebase:** `rsr200_device.h`'s `deliver()` currently
+does `const float gain = lastBlock.status.autoAttActive ? AUTO_ATT_GAIN : 1.0f;` (`AUTO_ATT_GAIN
+= 4.0f`) — gaining the sample data by 4× (2 bits) only while the attenuator is *actively engaged*
+(`autoAttActive`, the momentary clipping-protection state). But the OM is explicit that the 2-bit
+digital shift is applied **as soon as Auto-ATT is turned on** (threshold > 0), independent of
+whether the attenuator has actually engaged at any given instant: "the entire level range is
+shifted by 2 bits... **as soon as Auto ATT is turned on**." That's a different, wider condition
+than `autoAttActive` — the current code has been unreachable (and therefore harmless) only
+because `autoAttEnabled` has never been settable; implementing Auto-ATT for real means fixing
+this alongside it, or levels will be wrong (quiet by 4× whenever Auto-ATT is enabled but not
+currently engaged) the moment it's turned on. The correct shape, per the DP's own stacking of a
+constant enabled-shift plus a variable engaged-shift:
+
+```cpp
+// Constant 2-bit (4x) headroom shift whenever Auto-ATT is enabled at all (threshold > 0), per
+// OM's "as soon as Auto-ATT is turned on" -- independent of whether it's *currently* engaged.
+float gain = cfg.autoAttEnabled ? AUTO_ATT_GAIN : 1.0f;
+// An additional, variable correction for the attenuator's own ~16dB while actually engaged,
+// using the calibrated per-channel gain value from the last SET_AUTO_ATT command (DP: "the gain
+// values can be used to compensate the attenuator's attenuation").
+if (lastBlock.status.autoAttActive) { gain *= cfg.autoAttGainCh1 / 1024.0f; /* ch2 separately */ }
+```
+
+(Channel 2's own calibration value applies to `bufB`, and DP's own further caution — "For channel
+2, a different gain must additionally be taken into account if... 'Magnitude' from... channel set
+value no. 9 does not correspond to a gain factor of 1" — means this interacts with hardware
+diversity's own weight when *both* features are active on channel 2 at once; flagged here as a
+real combination case, not solved, since it needs both features built before it's even testable.)
+
+**New `Config` fields needed:** `int autoAttThreshold` (0..5), `double autoAttHoldTimeSec`,
+`float autoAttGainCh1`/`autoAttGainCh2` (defaulting to 6.3096). `autoAttEnabled` already exists
+but is presently synonymous with "not yet exposed" — becomes `autoAttThreshold > 0` once real.
+
+**New `Device` method needed**, matching the existing `setHardwareDiversity()`-style wrapper:
+```cpp
+bool setAutoAtt(uint8_t threshold, double holdTimeSec, double gainCh1, double gainCh2, uint64_t nowMs);
+```
+sent as part of the normal `applyConfig()` sequence (Auto-ATT settings are static configuration,
+not a live action the way hardware diversity's "solve" step is) — `formatChanged`'s existing
+detection needs `autoAttThreshold`/`autoAttHoldTimeSec`/gain fields added to its comparison, same
+shape as `upperSideband` already is.
+
+**Open questions for Ralph:**
+- Default threshold when first turned on — off (0) until explicitly raised, or a specific
+  starting level (e.g. -18dB, the middle of the range)?
+- Default hold time — no figure given in either manual; needs a "look and see" starting value
+  (a few hundred ms?) same as `CarrierZoomView`'s own defaults were, adjustable once tested live.
+- Clamp the manual attenuator down to 19 silently when Auto-ATT is turned on, or ask/warn first
+  if it's currently set above that?
+
+### Suggested build order
+
+Independently useful and independently testable, per this document's own established phasing
+convention:
+
+1. **GPS correction display** — one line, no new fields, ships alone immediately.
+2. **Hardware diversity** — self-contained UI/workflow addition on top of an already-tested
+   device-layer API; the two-button solve/apply design above is the main thing to confirm before
+   building.
+3. **Auto-ATT** — needs the new `Device::setAutoAtt()` + tests first (mirroring how Serial mode's
+   own wire-level pieces were already tested before this session's UI work), then the gain-
+   compensation fix, then the UI. Largest of the three, and the only one that can't be verified
+   even partially without the radio (GPS correction reads already-live data; hardware diversity's
+   solve step can at least be exercised against `sigpath::phasing`'s own synthetic-source test
+   path from `PHASING_PLAN.md` before ever touching the RSR200).
+
+Nothing here is implemented yet — this is the plan Ralph asked for, not a status update.
