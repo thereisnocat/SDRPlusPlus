@@ -657,8 +657,11 @@ private:
         if (SmGui::Combo(CONCAT("##_rsr200_autoatt_thresh_", _this->name), &_this->autoAttThreshold,
                           "Off\0-6 dB\0-12 dB\0-18 dB\0-24 dB\0-30 dB\0")) {
             if (prevThreshold == 0 && _this->autoAttThreshold > 0) {
-                _this->atten1 = std::min(_this->atten1, 19);
-                _this->atten2 = std::min(_this->atten2, 19);
+                // Parenthesized (std::min) -- windows.h's own min/max macros mangle a bare
+                // std::min(...) into invalid syntax on MSVC (error C2589), a known trap in
+                // this codebase (see PHASING_PLAN.md's own note on the same issue).
+                _this->atten1 = (std::min)(_this->atten1, 19);
+                _this->atten2 = (std::min)(_this->atten2, 19);
             }
             dirty = true;
         }
