@@ -32,6 +32,7 @@ cmake --build "$BUILD" --target sdrpp_core -j8 > "$OUT/build.log" 2>&1 || {
 LINKED="$REPO/core/test/test_phaser.cpp
 $REPO/core/test/test_phasing.cpp
 $REPO/core/test/test_tube_warmth.cpp
+$REPO/core/test/test_parametric_eq.cpp
 $REPO/core/test/test_wav_meta.cpp
 $REPO/core/test/test_wav_roundtrip.cpp
 $REPO/core/test/test_decorrelation.cpp

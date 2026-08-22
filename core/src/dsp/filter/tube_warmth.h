@@ -1,6 +1,7 @@
 #pragma once
 #include "../processor.h"
 #include "../math/constants.h"
+#include "biquad.h"
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -25,51 +26,6 @@
 // not exposed -- this is meant to sound like "an old radio", not to be a mixing tool.
 
 namespace dsp::filter {
-
-    // RBJ Audio EQ Cookbook peaking/low-pass biquad, Direct Form I. Nothing dynamic about the
-    // coefficients here (recomputed only on init/setSampleRate, never per-sample), so a plain
-    // struct is enough -- no need to pull in a general-purpose biquad framework for the one
-    // fixed peaking filter and one fixed low-pass this block needs.
-    struct TubeWarmthBiquad {
-        float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-        float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
-
-        inline float process(float x) {
-            float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-            x2 = x1; x1 = x;
-            y2 = y1; y1 = y;
-            return y;
-        }
-
-        void reset() { x1 = x2 = y1 = y2 = 0.0f; }
-
-        void setPeaking(double f0, double q, double gainDb, double sampleRate) {
-            const double A = std::pow(10.0, gainDb / 40.0);
-            const double w0 = 2.0 * DB_M_PI * f0 / sampleRate;
-            const double alpha = std::sin(w0) / (2.0 * q);
-            const double cosw0 = std::cos(w0);
-
-            const double a0 = 1.0 + alpha / A;
-            b0 = (float)((1.0 + alpha * A) / a0);
-            b1 = (float)((-2.0 * cosw0) / a0);
-            b2 = (float)((1.0 - alpha * A) / a0);
-            a1 = (float)((-2.0 * cosw0) / a0);
-            a2 = (float)((1.0 - alpha / A) / a0);
-        }
-
-        void setLowPass(double fc, double q, double sampleRate) {
-            const double w0 = 2.0 * DB_M_PI * fc / sampleRate;
-            const double alpha = std::sin(w0) / (2.0 * q);
-            const double cosw0 = std::cos(w0);
-
-            const double a0 = 1.0 + alpha;
-            b0 = (float)(((1.0 - cosw0) / 2.0) / a0);
-            b1 = (float)((1.0 - cosw0) / a0);
-            b2 = b0;
-            a1 = (float)((-2.0 * cosw0) / a0);
-            a2 = (float)((1.0 - alpha) / a0);
-        }
-    };
 
     // Small, fast, self-contained PRNG for the hiss generator -- deliberately not the
     // standard library's rand() (global state, not something a per-instance DSP block should
@@ -199,7 +155,7 @@ namespace dsp::filter {
         // tube stage barely colors a quiet signal but squashes hot ones.
         inline float shape(float x) const { return (tanhf(DRIVE * x + BIAS) - tanhBias) * driveNorm; }
 
-        inline float shapeChannel(float x, TubeWarmthBiquad& peak, TubeWarmthBiquad& lowpass, uint32_t& noiseState) const {
+        inline float shapeChannel(float x, Biquad& peak, Biquad& lowpass, uint32_t& noiseState) const {
             float wet = lowpass.process(shape(peak.process(x)));
             float y = x + _warmth * (wet - x);
             if (_noise > 0.0f) {
@@ -213,7 +169,7 @@ namespace dsp::filter {
         float _warmth = 0.0f;
         float _noise = 0.0f;
 
-        TubeWarmthBiquad peakL, lowpassL, peakR, lowpassR;
+        Biquad peakL, lowpassL, peakR, lowpassR;
         uint32_t noiseStateL = 0xC0FFEE01u, noiseStateR = 0xC0FFEE02u;   // any nonzero seeds
         float humPhase = 0.0f;
         float humPhaseStep = 0.0f;

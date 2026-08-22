@@ -13,14 +13,17 @@
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/filter/deephasis.h>
 #include <dsp/filter/tube_warmth.h>
+#include <dsp/filter/parametric_eq.h>
 #include <core.h>
 #include <stdint.h>
+#include <algorithm>
 #include <utils/optionlist.h>
 #include <gui/widgets/mini_spectrum.h>
 #include "radio_interface.h"
 #include "demod.h"
 #include "spectrum_preview.h"
 #include "carrier_zoom_window.h"
+#include "equalizer_window.h"
 
 ConfigManager config;
 
@@ -28,6 +31,11 @@ ConfigManager config;
 // own header) -- exactly one instance, shared by every RadioModule instance in this
 // single-translation-unit module, same convention `config` right above already relies on.
 CarrierZoomWindow gCarrierZoomWindow;
+
+// Same singleton-editor-window shape as gCarrierZoomWindow right above, for the equalizer's
+// own floating editor -- see equalizer_window.h/equalizer_host.h for why this one goes through
+// an interface rather than owning a self-contained view.
+EqualizerWindow gEqualizerWindow;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -44,7 +52,7 @@ std::map<IFNRPreset, double> ifnrTaps = {
     { IFNR_PRESET_BROADCAST, 32 }
 };
 
-class RadioModule : public ModuleManager::Instance {
+class RadioModule : public ModuleManager::Instance, public EqualizerHost {
 public:
     RadioModule(std::string name) {
         this->name = name;
@@ -121,6 +129,31 @@ public:
         tubeWarmth.setWarmth(tubeWarmthAmount);
         tubeWarmth.setNoise(tubeWarmthNoise);
 
+        // EQ: init to flat defaults first, then apply whatever was actually saved (flat, not
+        // per-demodulator -- see the eqEnabled/eq member fields' own comment for why this
+        // doesn't go through selectDemod()'s per-mode load/apply the way tubeWarmth/highPass
+        // do). Loaded here, at the same point eq.setBand() first becomes callable (it asserts
+        // _block_init), rather than earlier alongside the plain selectedDemodId load above and
+        // stashed in an intermediate array until this point -- eq itself is the only place
+        // this state actually needs to live.
+        eq.init(NULL, 48000.0);
+        config.acquire();
+        if (config.conf[name].contains("eq")) {
+            const json& eqJson = config.conf[name]["eq"];
+            if (eqJson.contains("enabled")) { eqEnabled = eqJson["enabled"]; }
+            if (eqJson.contains("bands") && eqJson["bands"].is_array()) {
+                const auto& bands = eqJson["bands"];
+                using EqT = dsp::filter::ParametricEQ<dsp::stereo_t>;
+                for (int i = 0; i < EqT::NUM_BANDS && i < (int)bands.size(); i++) {
+                    double f = bands[i].value("freq", EqT::defaultFreqHz(i));
+                    float g = bands[i].value("gain", 0.0f);
+                    double q = bands[i].value("q", 0.9);
+                    eq.setBand(i, f, g, q);
+                }
+            }
+        }
+        config.release(false);
+
         afChain.addBlock(&ctcss, false);
         afChain.addBlock(&resamp, true);
         afChain.addBlock(&hpf, false);
@@ -129,6 +162,14 @@ public:
         // emphasized, high-passed) audio, rather than something upstream stages then have to
         // demodulate/filter through.
         afChain.addBlock(&tubeWarmth, false);
+        // EQ sits after Tube Warmth: a general tone control belongs closest to the speaker,
+        // able to shape whatever Tube Warmth (if also enabled) already did, not something
+        // Tube Warmth's own fixed EQ+saturation then has to react to.
+        afChain.addBlock(&eq, false);
+        // Reflect whatever was actually loaded above -- addBlock(..., false) above always
+        // registers it disabled regardless, since a block has to already be part of the chain
+        // (blockExists()) before enableBlock()/setBlockEnabled() will accept it.
+        if (eqEnabled) { afChain.enableBlock(&eq, [](dsp::stream<dsp::stereo_t>*){}); }
 
         // Initialize the sink
         srChangeHandler.ctx = this;
@@ -190,6 +231,9 @@ public:
         // app-wide) carrier zoom window, close it rather than leaving it pointed at a source
         // that's going away out from under it.
         if (gCarrierZoomWindow.isOpenFor(name)) { gCarrierZoomWindow.close(); }
+        // Same reasoning as the carrier zoom window just above -- don't leave the equalizer
+        // editor pointed at an EqualizerHost that's about to be destroyed.
+        if (gEqualizerWindow.isOpenFor(name)) { gEqualizerWindow.close(); }
         if (vfo) { sigpath::vfoManager.deleteVFO(vfo); }
         vfo = NULL;
     }
@@ -431,6 +475,39 @@ private:
                 }
             }
         }
+
+        // Equalizer -- see equalizer_host.h/equalizer_window.h. Not gated on highPassAllowed
+        // the way Tube Warmth is: a plain tone control is reasonable for every mode including
+        // CW/RAW, unlike coloration/saturation which those two specifically want to avoid.
+        if (ImGui::Checkbox(("Equalizer##_radio_eq_" + _this->name).c_str(), &_this->eqEnabled)) {
+            _this->setEqEnabled(_this->eqEnabled);
+        }
+        {
+            // Recalling a saved profile from here -- without opening the separate editor
+            // window -- is the whole point of this combo (Ralph, 2026-08-20): "I should be
+            // able to call up a saved configuration without having to open up the separate
+            // window." Selecting any entry loads it immediately; it's a one-time "load"
+            // action, not a value this control keeps in sync with (see
+            // getLastLoadedEqProfile()'s own comment on why the preview can legitimately show
+            // "(custom)" once the loaded bands have since been hand-edited).
+            std::vector<std::string> eqProfileNames = _this->getEqProfileNames();
+            std::string current = _this->getLastLoadedEqProfile();
+            std::string comboPreview = current.empty() ? "(custom)" : current;
+            ImGui::LeftLabel("EQ Profile");
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70.0f * style::uiScale);
+            if (ImGui::BeginCombo(("##_radio_eq_profile_" + _this->name).c_str(), comboPreview.c_str())) {
+                if (eqProfileNames.empty()) { ImGui::TextDisabled("No saved profiles yet"); }
+                for (const std::string& n : eqProfileNames) {
+                    if (ImGui::Selectable(n.c_str(), n == current)) { _this->loadEqProfile(n); }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(("Edit...##_radio_eq_edit_" + _this->name).c_str())) {
+                gEqualizerWindow.open(_this->name, _this);
+            }
+        }
+        gEqualizerWindow.draw(_this->name);
 
         // Demodulator specific menu
         _this->selectedDemod->showMenu();
@@ -932,6 +1009,9 @@ private:
         // Configure Tube Warmth's own sample-rate-dependent filters
         tubeWarmth.setSampleRate(audioSampleRate);
 
+        // Configure the EQ's own sample-rate-dependent filters
+        eq.setSampleRate(audioSampleRate);
+
         afChain.start();
     }
 
@@ -975,6 +1055,109 @@ private:
         if (!selectedDemod) { return; }
         config.acquire();
         config.conf[name][selectedDemod->getName()]["tubeWarmthNoise"] = amount;
+        config.release(true);
+    }
+
+    // ---------------------------------------------------------------------
+    // EqualizerHost -- see equalizer_host.h for the contract each of these implements.
+    // Unlike every setter above, none of these gate on postProcEnabled/selectedDemod: the EQ
+    // is not per-demodulator state (see the eqEnabled/eq member fields' own comment), so it
+    // has nothing to do with whichever demodulator happens to be selected right now.
+    // ---------------------------------------------------------------------
+
+    bool isEqEnabled() override { return eqEnabled; }
+
+    void setEqEnabled(bool enabled) override {
+        eqEnabled = enabled;
+        afChain.setBlockEnabled(&eq, enabled, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
+        saveEqStateToConfig();
+    }
+
+    int getEqBandCount() override { return dsp::filter::ParametricEQ<dsp::stereo_t>::NUM_BANDS; }
+
+    void getEqBand(int index, double& freqHz, float& gainDb, double& q) override {
+        eq.getBand(index, freqHz, gainDb, q);
+    }
+
+    void setEqBand(int index, double freqHz, float gainDb, double q) override {
+        eq.setBand(index, freqHz, gainDb, q);
+        // A hand-edited band means the live state and whatever profile it may have come from
+        // have (probably) diverged -- see getLastLoadedEqProfile()'s own comment.
+        lastLoadedEqProfile.clear();
+        saveEqStateToConfig();
+    }
+
+    std::vector<std::string> getEqProfileNames() override {
+        std::vector<std::string> names;
+        config.acquire();
+        if (config.conf.contains("eqProfiles") && config.conf["eqProfiles"].is_object()) {
+            for (auto it = config.conf["eqProfiles"].begin(); it != config.conf["eqProfiles"].end(); ++it) {
+                names.push_back(it.key());
+            }
+        }
+        config.release(false);
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    void saveEqProfile(const std::string& profileName) override {
+        if (profileName.empty()) { return; }
+        config.acquire();
+        json& profile = config.conf["eqProfiles"][profileName];
+        profile = json::array();
+        using EqT = dsp::filter::ParametricEQ<dsp::stereo_t>;
+        for (int i = 0; i < EqT::NUM_BANDS; i++) {
+            double freqHz; float gainDb; double q;
+            eq.getBand(i, freqHz, gainDb, q);
+            profile.push_back({ { "freq", freqHz }, { "gain", gainDb }, { "q", q } });
+        }
+        config.release(true);
+        lastLoadedEqProfile = profileName;
+    }
+
+    void loadEqProfile(const std::string& profileName) override {
+        config.acquire();
+        bool exists = config.conf.contains("eqProfiles") && config.conf["eqProfiles"].contains(profileName);
+        json profile = exists ? config.conf["eqProfiles"][profileName] : json::array();
+        config.release(false);
+        if (!exists || !profile.is_array()) { return; }
+
+        using EqT = dsp::filter::ParametricEQ<dsp::stereo_t>;
+        for (int i = 0; i < EqT::NUM_BANDS && i < (int)profile.size(); i++) {
+            double f = profile[i].value("freq", EqT::defaultFreqHz(i));
+            float g = profile[i].value("gain", 0.0f);
+            double q = profile[i].value("q", 0.9);
+            eq.setBand(i, f, g, q);
+        }
+        lastLoadedEqProfile = profileName;
+        saveEqStateToConfig();
+    }
+
+    void deleteEqProfile(const std::string& profileName) override {
+        config.acquire();
+        if (config.conf.contains("eqProfiles")) { config.conf["eqProfiles"].erase(profileName); }
+        config.release(true);
+        if (lastLoadedEqProfile == profileName) { lastLoadedEqProfile.clear(); }
+    }
+
+    std::string getLastLoadedEqProfile() override { return lastLoadedEqProfile; }
+
+    // Persists the live (enabled + all bands) EQ state under config.conf[name]["eq"] -- called
+    // from every setter above that changes it, same "save on every change" convention every
+    // other slider/checkbox in this file already follows (see e.g. setTubeWarmthNoise() just
+    // above).
+    void saveEqStateToConfig() {
+        config.acquire();
+        json& eqJson = config.conf[name]["eq"];
+        eqJson["enabled"] = eqEnabled;
+        json bands = json::array();
+        using EqT = dsp::filter::ParametricEQ<dsp::stereo_t>;
+        for (int i = 0; i < EqT::NUM_BANDS; i++) {
+            double freqHz; float gainDb; double q;
+            eq.getBand(i, freqHz, gainDb, q);
+            bands.push_back({ { "freq", freqHz }, { "gain", gainDb }, { "q", q } });
+        }
+        eqJson["bands"] = bands;
         config.release(true);
     }
 
@@ -1249,6 +1432,7 @@ private:
     dsp::filter::FIR<dsp::stereo_t, float> hpf;
     dsp::filter::Deemphasis<dsp::stereo_t> deemp;
     dsp::filter::TubeWarmth<dsp::stereo_t> tubeWarmth;
+    dsp::filter::ParametricEQ<dsp::stereo_t> eq;
 
     SinkManager::Stream stream;
 
@@ -1287,6 +1471,18 @@ private:
     bool tubeWarmthEnabled = false;
     float tubeWarmthAmount = 0.5f;
     float tubeWarmthNoise = 0.15f;
+
+    // Parametric EQ (equalizer_host.h/equalizer_window.h have the UI/interface side). Unlike
+    // every other AF-chain control above, this is deliberately *not* per-demodulator state --
+    // it's a general listening tone control, loaded once at construction and persisted flat
+    // under config.conf[name]["eq"], so switching modes doesn't change or reset it. Saved
+    // profiles (getEqProfileNames() etc.) go a level further and live under the fixed
+    // top-level config.conf["eqProfiles"] key, shared across every RadioModule instance in the
+    // app, not just this one -- see equalizer_host.h's own comment on why.
+    bool eqEnabled = false;
+    // Empty means "no profile currently corresponds to the live band settings" -- see
+    // getLastLoadedEqProfile()'s own comment in equalizer_host.h.
+    std::string lastLoadedEqProfile;
 
     int deempId = 0;
     bool deempAllowed;

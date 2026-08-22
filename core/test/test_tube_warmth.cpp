@@ -88,11 +88,11 @@ int main() {
     }
 
     // -----------------------------------------------------------------
-    printf("\nPeaking filter (standalone TubeWarmthBiquad)\n");
+    printf("\nPeaking filter (standalone Biquad)\n");
     {
         // DC must pass a peaking filter untouched -- it only ever alters loudness of energy
         // near its own center frequency.
-        TubeWarmthBiquad peak;
+        Biquad peak;
         peak.setPeaking(350.0, 0.8, 5.0, 48000.0);
         std::vector<float> dc(2000, 0.4f), out(2000);
         for (int i = 0; i < 2000; i++) { out[i] = peak.process(dc[i]); }
@@ -100,7 +100,7 @@ int main() {
 
         // A sine at the filter's own center frequency should come out boosted by roughly the
         // configured +5dB (linear gain 10^(5/20) = 1.7783), once the transient has settled.
-        TubeWarmthBiquad peak2;
+        Biquad peak2;
         peak2.setPeaking(350.0, 0.8, 5.0, 48000.0);
         const int n = 8000;
         std::vector<float> sineIn(n), sineOut(n);
@@ -111,12 +111,12 @@ int main() {
     }
 
     // -----------------------------------------------------------------
-    printf("\nLow-pass filter (standalone TubeWarmthBiquad)\n");
+    printf("\nLow-pass filter (standalone Biquad)\n");
     {
         // Same filter, two test tones: one well below the 4200Hz cutoff (should pass close to
         // untouched), one well above it (should be attenuated hard). This is the "old radio's
         // rolled-off treble" the file's own top comment describes.
-        TubeWarmthBiquad lowLp, highLp;
+        Biquad lowLp, highLp;
         lowLp.setLowPass(4200.0, 0.707, 48000.0);
         highLp.setLowPass(4200.0, 0.707, 48000.0);
 
@@ -203,7 +203,7 @@ int main() {
     // -----------------------------------------------------------------
     printf("\nsetSampleRate() actually reconfigures the filters\n");
     {
-        TubeWarmthBiquad a, b;
+        Biquad a, b;
         a.setLowPass(4200.0, 0.707, 48000.0);
         b.setLowPass(4200.0, 0.707, 96000.0);
         check(a.b0 != b.b0 || a.a1 != b.a1,
