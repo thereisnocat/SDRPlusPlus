@@ -12,6 +12,7 @@
 #include <dsp/noise_reduction/ctcss_squelch.h>
 #include <dsp/multirate/rational_resampler.h>
 #include <dsp/filter/deephasis.h>
+#include <dsp/filter/tube_warmth.h>
 #include <core.h>
 #include <stdint.h>
 #include <utils/optionlist.h>
@@ -116,11 +117,18 @@ public:
         hpTaps = dsp::taps::highPass(300.0, 100.0, 48000.0);
         hpf.init(NULL, hpTaps);
         deemp.init(NULL, 50e-6, 48000.0);
+        tubeWarmth.init(NULL, 48000.0);
+        tubeWarmth.setWarmth(tubeWarmthAmount);
+        tubeWarmth.setNoise(tubeWarmthNoise);
 
         afChain.addBlock(&ctcss, false);
         afChain.addBlock(&resamp, true);
         afChain.addBlock(&hpf, false);
         afChain.addBlock(&deemp, false);
+        // Last in the chain, deliberately -- it colors the final, already-correct (de-
+        // emphasized, high-passed) audio, rather than something upstream stages then have to
+        // demodulate/filter through.
+        afChain.addBlock(&tubeWarmth, false);
 
         // Initialize the sink
         srChangeHandler.ctx = this;
@@ -405,6 +413,25 @@ private:
             }
         }
 
+        // Tube Warmth
+        if (_this->highPassAllowed) {
+            if (ImGui::Checkbox(("Tube Warmth##_radio_tubewarmth_" + _this->name).c_str(), &_this->tubeWarmthEnabled)) {
+                _this->setTubeWarmth(_this->tubeWarmthEnabled);
+            }
+            if (_this->tubeWarmthEnabled) {
+                ImGui::LeftLabel("Warmth");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_tubewarmth_amt_" + _this->name).c_str(), &_this->tubeWarmthAmount, 0.0f, 1.0f)) {
+                    _this->setTubeWarmthAmount(_this->tubeWarmthAmount);
+                }
+                ImGui::LeftLabel("Noise");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_tubewarmth_noise_" + _this->name).c_str(), &_this->tubeWarmthNoise, 0.0f, 1.0f)) {
+                    _this->setTubeWarmthNoise(_this->tubeWarmthNoise);
+                }
+            }
+        }
+
         // Demodulator specific menu
         _this->selectedDemod->showMenu();
 
@@ -533,6 +560,9 @@ private:
         squelchLevel = MIN_SQUELCH;
         ctcssToneId = ctcssTones.valueId(dsp::noise_reduction::CTCSS_TONE_67Hz);
         highPass = false;
+        tubeWarmthEnabled = false;
+        tubeWarmthAmount = 0.5f;
+        tubeWarmthNoise = 0.15f;
 
         postProcEnabled = selectedDemod->getPostProcEnabled();
         FMIFNRAllowed = selectedDemod->getFMIFNRAllowed();
@@ -595,6 +625,15 @@ private:
         }
         if (config.conf[name][selectedDemod->getName()].contains("highPass")) {
             highPass = config.conf[name][selectedDemod->getName()]["highPass"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("tubeWarmthEnabled")) {
+            tubeWarmthEnabled = config.conf[name][selectedDemod->getName()]["tubeWarmthEnabled"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("tubeWarmthAmount")) {
+            tubeWarmthAmount = config.conf[name][selectedDemod->getName()]["tubeWarmthAmount"];
+        }
+        if (config.conf[name][selectedDemod->getName()].contains("tubeWarmthNoise")) {
+            tubeWarmthNoise = config.conf[name][selectedDemod->getName()]["tubeWarmthNoise"];
         }
         if (config.conf[name][selectedDemod->getName()].contains("deempMode")) {
             if (!config.conf[name][selectedDemod->getName()]["deempMode"].is_string()) {
@@ -740,6 +779,12 @@ private:
 
             // Configure deemphasis
             setDeemphasisMode(deempModes[deempId]);
+
+            // Configure Tube Warmth (see setTubeWarmth()'s own comment on reusing
+            // highPassAllowed rather than a dedicated flag)
+            tubeWarmth.setWarmth(tubeWarmthAmount);
+            tubeWarmth.setNoise(tubeWarmthNoise);
+            setTubeWarmth(tubeWarmthEnabled && highPassAllowed);
         }
         else {
             // Disable everything if post processing is disabled
@@ -884,6 +929,9 @@ private:
         // Configure deemphasis sample rate
         deemp.setSamplerate(audioSampleRate);
 
+        // Configure Tube Warmth's own sample-rate-dependent filters
+        tubeWarmth.setSampleRate(audioSampleRate);
+
         afChain.start();
     }
 
@@ -900,6 +948,33 @@ private:
         // Save config
         config.acquire();
         config.conf[name][selectedDemod->getName()]["highPass"] = enabled;
+        config.release(true);
+    }
+
+    void setTubeWarmth(bool enabled) {
+        tubeWarmthEnabled = enabled;
+        if (!postProcEnabled || !selectedDemod) { return; }
+        afChain.setBlockEnabled(&tubeWarmth, enabled, [=](dsp::stream<dsp::stereo_t>* out){ stream.setInput(out); });
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["tubeWarmthEnabled"] = enabled;
+        config.release(true);
+    }
+
+    void setTubeWarmthAmount(float amount) {
+        tubeWarmthAmount = amount;
+        tubeWarmth.setWarmth(amount);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["tubeWarmthAmount"] = amount;
+        config.release(true);
+    }
+
+    void setTubeWarmthNoise(float amount) {
+        tubeWarmthNoise = amount;
+        tubeWarmth.setNoise(amount);
+        if (!selectedDemod) { return; }
+        config.acquire();
+        config.conf[name][selectedDemod->getName()]["tubeWarmthNoise"] = amount;
         config.release(true);
     }
 
@@ -1173,6 +1248,7 @@ private:
     dsp::tap<float> hpTaps;
     dsp::filter::FIR<dsp::stereo_t, float> hpf;
     dsp::filter::Deemphasis<dsp::stereo_t> deemp;
+    dsp::filter::TubeWarmth<dsp::stereo_t> tubeWarmth;
 
     SinkManager::Stream stream;
 
@@ -1199,6 +1275,18 @@ private:
 
     bool highPass = false;
     bool highPassAllowed = false;
+
+    // Tube Warmth: simulates the sound of an old tube radio (core/src/dsp/filter/tube_warmth.h
+    // has the actual DSP and the design reasoning). Deliberately reuses highPassAllowed rather
+    // than adding a near-identical getTubeWarmthAllowed() virtual to every demodulator file --
+    // the two features share the same real boundary (CW/RAW want clean, undistorted audio;
+    // everything else can take coloration), so a second, always-in-lockstep flag would just be
+    // one more thing to keep synchronised for no behavioral difference. tubeWarmthAmount/Noise
+    // default to modest-but-audible values (not 0) so turning the feature on actually does
+    // something immediately, rather than requiring the two sliders to also be raised by hand.
+    bool tubeWarmthEnabled = false;
+    float tubeWarmthAmount = 0.5f;
+    float tubeWarmthNoise = 0.15f;
 
     int deempId = 0;
     bool deempAllowed;
