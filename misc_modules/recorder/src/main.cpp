@@ -468,6 +468,14 @@ private:
             config.conf[_this->name]["nameTemplate"] = _this->nameTemplate;
             config.release(true);
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "$t = recording type (audio/baseband)      $f = frequency (Hz)\n"
+                "$r = demodulator mode (Radio module only)  $R = source/receiver name (e.g. RSR200)\n"
+                "$h = hour   $m = minute   $s = second   (all zero-padded, 24h)\n"
+                "$d = day    $M = month    $y = year      (all zero-padded)"
+            );
+        }
 
         ImGui::LeftLabel("Time zone");
         ImGui::FillWidth();
@@ -759,6 +767,16 @@ private:
             if (mode >= 0) { modeStr = radioModeToString[mode]; };
         }
 
+        // Currently selected source's own name, e.g. "RSR200"/"FobosSDR" -- whatever's shown
+        // in the Source dropdown (sourceManager's own registered name, not a module *type*, so
+        // this also picks up a renamed instance correctly). Sanitized against '/'/'\\'
+        // specifically: every other token here is built from a fixed, known-safe value (a
+        // lookup table entry, a zero-padded number, ...) that can never contain a path
+        // separator, but a source name is free text a user can set to almost anything via the
+        // module manager -- without this, an instance renamed to include a "/" would silently
+        // turn into an unintended subdirectory component instead of a filename character.
+        std::string srcName = std::regex_replace(sigpath::sourceManager.getSelectedName(), std::regex("[/\\\\]"), "-");
+
         // Replace in template
         templ = std::regex_replace(templ, std::regex("\\$t"), type);
         templ = std::regex_replace(templ, std::regex("\\$f"), freqStr);
@@ -769,6 +787,7 @@ private:
         templ = std::regex_replace(templ, std::regex("\\$M"), monStr);
         templ = std::regex_replace(templ, std::regex("\\$y"), yearStr);
         templ = std::regex_replace(templ, std::regex("\\$r"), modeStr);
+        templ = std::regex_replace(templ, std::regex("\\$R"), srcName);
         return templ;
     }
 
