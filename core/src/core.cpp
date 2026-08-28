@@ -199,6 +199,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["RFNM Source"]["enabled"] = true;
     defConfig["moduleInstances"]["RFspace Source"]["module"] = "rfspace_source";
     defConfig["moduleInstances"]["RFspace Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["RSR200 Source"]["module"] = "rsr200_source";
+    defConfig["moduleInstances"]["RSR200 Source"]["enabled"] = true;
     defConfig["moduleInstances"]["RTL-SDR Source"]["module"] = "rtl_sdr_source";
     defConfig["moduleInstances"]["RTL-SDR Source"]["enabled"] = true;
     defConfig["moduleInstances"]["RTL-TCP Source"]["module"] = "rtl_tcp_source";
