@@ -7,6 +7,13 @@ BUNDLE=$2
 
 source macos/bundle_utils.sh
 
+# The single source of truth for the version string, so this can't drift out of sync with
+# what the binary itself reports (core.cpp logs "SDR++ v" VERSION_STR at startup) the way a
+# separate hardcoded literal here did -- Info.plist's CFBundleVersion sat at 1.2.1 through a
+# 1.3.0 release, which is what a crash report picks up and reports as the build version,
+# confusing after-the-fact diagnosis of which actual binary crashed.
+SDRPP_VERSION=$(sed -n 's/.*VERSION_STR "\(.*\)".*/\1/p' core/src/version.h)
+
 # ========================= Prepare dotapp structure =========================
 
 # Clear .app
@@ -22,7 +29,7 @@ cp -R root/res/* $BUNDLE/Contents/Resources/
 bundle_create_icns root/res/icons/sdrpp.macos.png $BUNDLE/Contents/Resources/sdrpp
 
 # Create the property list
-bundle_create_plist sdrpp SDR++ org.sdrpp.sdrpp 1.2.1 sdrp sdrpp sdrpp $BUNDLE/Contents/Info.plist
+bundle_create_plist sdrpp SDR++ org.sdrpp.sdrpp $SDRPP_VERSION sdrp sdrpp sdrpp $BUNDLE/Contents/Info.plist
 
 # ========================= Install binaries =========================
 
