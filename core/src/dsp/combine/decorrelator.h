@@ -154,6 +154,19 @@ namespace dsp::combine {
     // The eigenvector u selects a combination of the *whitened* channels, y = u^H W x.
     // Since u^H W x = (W^H u)^H x, the whitening folds into the coefficients and never has
     // to touch a sample.
+    //
+    // Un-whitened, (k0, k1) is exactly u itself (conjugated) -- unit norm, since u is, so the
+    // combined output stays within the same rough scale as the input regardless of what the
+    // covariance solve found. Whitened, that guarantee is gone: W's own diagonal is 1/sqrt(lambda)
+    // in noise-only eigencoordinates, and a real receiver's actual noise floor is normally a small
+    // fraction of full scale -- routinely two to three orders of magnitude, i.e. 40-60+ dB, once
+    // folded into (k0, k1) unrescaled. Reproduced live: "Measure noise" on an empty channel, then
+    // "Use it" with Decorrelate/null-strongest selected, turned a -130 dBm noise floor into -30 dBm
+    // and a reported "null" of -95 dB -- 95 dB of *gain*, not cancellation. Only the *direction* of
+    // (k0, k1) -- their ratio and relative phase -- carries the decorrelation decision; a common
+    // scale on both contributes nothing to it, so rescaling to unit norm here restores the same
+    // bounded output the un-whitened path already has, for both null-strongest and peak-strongest
+    // alike, without changing which combination gets picked.
     inline void combineCoefficients(const std::complex<double> u[2], const Matrix2& w,
                                     bool whitened, std::complex<double>& k0,
                                     std::complex<double>& k1) {
@@ -165,7 +178,14 @@ namespace dsp::combine {
         // c = W^H u, then k = conj(c).
         const std::complex<double> c0 = std::conj(w.m[0][0]) * u[0] + std::conj(w.m[1][0]) * u[1];
         const std::complex<double> c1 = std::conj(w.m[0][1]) * u[0] + std::conj(w.m[1][1]) * u[1];
-        k0 = std::conj(c0);
-        k1 = std::conj(c1);
+        const double norm = std::sqrt(std::norm(c0) + std::norm(c1));
+        if (norm > 1e-300) {
+            k0 = std::conj(c0) / norm;
+            k1 = std::conj(c1) / norm;
+        }
+        else {
+            k0 = { 1.0, 0.0 };
+            k1 = { 0.0, 0.0 };
+        }
     }
 }

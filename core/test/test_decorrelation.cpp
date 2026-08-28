@@ -175,6 +175,51 @@ int main() {
     }
 
     // -----------------------------------------------------------------
+    // Live bug: "Measure noise" on an empty channel, then "Use it" with Decorrelate --
+    // null-strongest selected, turned a -130 dBm noise floor into -30 dBm and reported a
+    // "null" of -95 dB (95 dB of *gain*, not cancellation). W's own diagonal is
+    // 1/sqrt(lambda) in noise-only eigencoordinates, and any real receiver's actual noise
+    // floor is a small fraction of full scale -- unlike the synthetic noise.rbb = 16.0 case
+    // above, chosen for a clean 4x/12dB whitening ratio, not to be realistically quiet.
+    printf("\nA realistic noise floor does not blow up the whitened output\n");
+    {
+        // What "Measure noise" on an empty channel actually captures: quiet, independent,
+        // and small relative to full scale -- 1/1000 the amplitude of the signal case above,
+        // not the previous section's deliberately mismatched-but-comfortable 1.0/16.0.
+        Covariance noise;
+        noise.raa = 1e-6;
+        noise.rbb = 1e-6;
+        noise.rab = { 0.0, 0.0 };
+        const Matrix2 w = inverseSqrt(noise);
+
+        // A real signal block afterward -- the same dominant-arrival scene as the first
+        // section, at its normal (not artificially quiet) scale.
+        Scene sc;
+        const int N = 200000;
+        std::vector<dsp::complex_t> a(N), b(N);
+        sc.fill(a.data(), b.data(), N);
+        Covariance cov;
+        std::complex<double> rab(0, 0);
+        double rbb = 0, raa = 0;
+        RefBand::accumulateWideband(a.data(), b.data(), N, rab, rbb, &raa);
+        cov.raa = raa / N; cov.rbb = rbb / N; cov.rab = rab / (double)N;
+
+        const Covariance working = transform(cov, w);
+        const Eigen2 e = solveEigen2(working);
+
+        std::complex<double> k0, k1;
+        combineCoefficients(e.uMin, w, true, k0, k1);
+        double gain = std::sqrt(std::norm(k0) + std::norm(k1));
+        printf("        null-strongest whitened gain: %.4f (%.1f dB)\n", gain, 20.0 * std::log10(gain));
+        check(std::abs(gain - 1.0) < 1e-6, "null-strongest stays at unit gain despite a realistic noise floor");
+
+        combineCoefficients(e.uMax, w, true, k0, k1);
+        gain = std::sqrt(std::norm(k0) + std::norm(k1));
+        printf("        peak-strongest whitened gain: %.4f (%.1f dB)\n", gain, 20.0 * std::log10(gain));
+        check(std::abs(gain - 1.0) < 1e-6, "peak-strongest stays at unit gain too");
+    }
+
+    // -----------------------------------------------------------------
     printf("\nThrough the Phaser, end to end\n");
     {
         auto run = [](Phaser::Mode mode, double* localOut, double* dxOut) {
