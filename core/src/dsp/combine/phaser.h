@@ -299,7 +299,16 @@ namespace dsp::combine {
             std::lock_guard<std::mutex> lck(paramMtx);
             _noiseCapture = Covariance();
             _noiseCaptureTerms = 0.0;
-            _noiseCaptureWanted = (std::max)(1.0, seconds * _sampleRate);
+            // updateCovariance() below feeds this from whichever of RefBand::accumulate
+            // (one term per decimation() raw samples -- its own doc calls out "far fewer
+            // terms than samples fed in") or ::accumulateWideband (one term per sample)
+            // ends up in use, chosen by _refEnabled at the time each block actually runs.
+            // The target here has to match that same rate, not assume the whole-span one
+            // regardless: with a reference band on, sizing this for one-term-per-sample
+            // turned a labelled "1 s" capture into two-plus minutes on real air (a
+            // decimation of ~150), correct on the label but not on the clock.
+            const double termsPerSample = _refEnabled ? (1.0 / (double)(std::max)(refBand.decimation(), 1)) : 1.0;
+            _noiseCaptureWanted = (std::max)(1.0, seconds * _sampleRate * termsPerSample);
             _capturingNoise = true;
         }
 

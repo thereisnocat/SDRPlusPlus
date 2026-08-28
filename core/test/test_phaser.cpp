@@ -22,6 +22,7 @@
 #include <cmath>
 #include <string>
 #include <complex>
+#include <random>
 
 static int failures = 0;
 
@@ -508,6 +509,72 @@ int main() {
         printf("        3.7 samples: scalar %.2f dB, 64 taps %.2f dB\n", scalarSkew, tapsSkew);
         check(scalarSkew > scalarFlat + 6.0, "a skew defeats the scalar weight");
         check(tapsSkew < scalarSkew - 6.0, "the multi-tap weight recovers what the scalar loses");
+    }
+
+    // -----------------------------------------------------------------
+    // Live bug: "Measuring noise..." with a reference band on took over two minutes for a
+    // capture the button labels "1 s". captureNoise()'s target was sized for one term per
+    // raw sample (RefBand::accumulateWideband's own rate), but with a reference band on,
+    // updateCovariance() actually draws from RefBand::accumulate() instead -- one term per
+    // decimation() raw samples, per that function's own doc ("far fewer terms than samples
+    // fed in"). The label said 1 s; the clock said decimation() seconds.
+    printf("\ncaptureNoise() finishes in the time it says, even with a reference band on\n");
+    {
+        using namespace dsp::combine;
+        dsp::stream<dsp::complex_t> a, b;
+        Phaser ph;
+        ph.init(&a, &b);
+        ph.setSampleRate(200000.0);
+        // Width chosen for a decimation in the tens, the same order of magnitude behind
+        // the live report -- big enough that the pre-fix target (decimation() times too
+        // large) blows straight through the sample budget below, small enough to keep
+        // this test quick either way.
+        ph.setReferenceBand(true, 0.0, 4000.0);
+        ph.setMode(Phaser::MODE_DECORR_MIN);
+        ph.reset();
+        ph.start();
+
+        std::thread rd([&] {
+            while (true) {
+                int c = ph.out.read();
+                if (c < 0) { break; }
+                ph.out.flush();
+            }
+        });
+
+        std::mt19937 rng{ 11 };
+        std::normal_distribution<double> g{ 0.0, 1.0 };
+        auto fillNoise = [&](dsp::complex_t* buf, int n) {
+            for (int i = 0; i < n; i++) { buf[i] = { (float)(g(rng) * 0.01), (float)(g(rng) * 0.01) }; }
+        };
+        const int N = 2000;
+
+        // One block first, so setReferenceBand's own lazy reconfigure has actually run and
+        // refBand.decimation() reflects the real width before captureNoise() reads it --
+        // otherwise the very first call would size itself off the pre-configure default.
+        fillNoise(a.writeBuf, N); a.swap(N);
+        fillNoise(b.writeBuf, N); b.swap(N);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        ph.captureNoise(0.1); // labelled 0.1 s at 200 kHz -> 20000 samples, if sized right
+
+        long fed = 0;
+        const long budget = 60000; // 3x the correct target; the pre-fix bug needed far more
+        while (ph.isCapturingNoise() && fed < budget) {
+            fillNoise(a.writeBuf, N); a.swap(N);
+            fillNoise(b.writeBuf, N); b.swap(N);
+            fed += N;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        const bool finished = !ph.isCapturingNoise();
+
+        ph.stop();
+        ph.out.stopReader();
+        rd.join();
+        ph.out.clearReadStop();
+
+        printf("        finished after %ld samples fed (budget %ld, correct target ~20000)\n", fed, budget);
+        check(finished, "a labelled-0.1s capture completes within 3x that, reference band on");
     }
 
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
