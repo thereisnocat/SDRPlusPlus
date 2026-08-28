@@ -146,6 +146,33 @@ jobs:
           # version bumps the same way clicking "Download" on their own site does.
           run: wget -O SDRplayAPI-macos-installer-universal.pkg "https://sdrplay.com/download/hardware-api-macos/?wpdmdl=1907" && sudo installer -pkg SDRplayAPI-macos-installer-universal.pkg -target /
 
+        - name: Install FTDI D3XX SDK (for rsr200_source)
+          # FTDI ships no package for this -- a bare tarball, installed by hand-copying
+          # ftd3xx.h/Types.h to /usr/local/include and libftd3xx*.dylib to /usr/local/lib
+          # (see source_modules/rsr200_source/CMakeLists.txt's own comment on that
+          # convention, and this repo's D3XX/ReadMe-Mac.txt). Pinned to 1.1.6 deliberately,
+          # not "whatever's current": 1.1.8 does not work with the RSR200 on real hardware
+          # (confirmed directly against the radio), 1.1.6 does.
+          #
+          # ftdichip.com sits behind a Cloudflare challenge that blocks wget/curl outright
+          # (a 403 with no amount of User-Agent/Referer spoofing gets through, confirmed
+          # directly) and that an automated browser gets stuck on indefinitely too --
+          # fingerprint-based bot detection, not a header check. This URL is known-good
+          # from Ralph's own browser; if the vendor's own bot-blocking starts catching
+          # GitHub's runner IPs too, this step is where it'll show up as a failure, and
+          # there is no side channel to route around it other than vendoring the SDK.
+          run: |
+            curl -fL -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" \
+                 -e "https://ftdichip.com/drivers/d3xx-drivers/" \
+                 -o d3xx-osx.tgz "https://ftdichip.com/wp-content/uploads/2026/04/d3xx-osx.1.1.6.tgz"
+            mkdir -p d3xx-extracted && tar -xzf d3xx-osx.tgz -C d3xx-extracted
+            sudo cp "$(find d3xx-extracted -name ftd3xx.h)" /usr/local/include/
+            sudo cp "$(find d3xx-extracted -name Types.h)" /usr/local/include/
+            sudo cp "$(find d3xx-extracted -name 'libftd3xx.1.1.6.dylib')" /usr/local/lib/
+            sudo cp "$(find d3xx-extracted -name 'libftd3xx.dylib' -not -path '*static*')" /usr/local/lib/
+            sudo install_name_tool -id /usr/local/lib/libftd3xx.dylib /usr/local/lib/libftd3xx.dylib
+            sudo codesign -s - -f /usr/local/lib/libftd3xx.dylib
+
         - name: Install libiio
           run: wget https://github.com/analogdevicesinc/libiio/archive/refs/tags/v0.25.zip && 7z x v0.25.zip && cd libiio-0.25 && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
 
@@ -214,6 +241,33 @@ jobs:
           # link for whatever the current file actually is -- so this survives future
           # version bumps the same way clicking "Download" on their own site does.
           run: wget -O SDRplayAPI-macos-installer-universal.pkg "https://sdrplay.com/download/hardware-api-macos/?wpdmdl=1907" && sudo installer -pkg SDRplayAPI-macos-installer-universal.pkg -target /
+
+        - name: Install FTDI D3XX SDK (for rsr200_source)
+          # FTDI ships no package for this -- a bare tarball, installed by hand-copying
+          # ftd3xx.h/Types.h to /usr/local/include and libftd3xx*.dylib to /usr/local/lib
+          # (see source_modules/rsr200_source/CMakeLists.txt's own comment on that
+          # convention, and this repo's D3XX/ReadMe-Mac.txt). Pinned to 1.1.6 deliberately,
+          # not "whatever's current": 1.1.8 does not work with the RSR200 on real hardware
+          # (confirmed directly against the radio), 1.1.6 does.
+          #
+          # ftdichip.com sits behind a Cloudflare challenge that blocks wget/curl outright
+          # (a 403 with no amount of User-Agent/Referer spoofing gets through, confirmed
+          # directly) and that an automated browser gets stuck on indefinitely too --
+          # fingerprint-based bot detection, not a header check. This URL is known-good
+          # from Ralph's own browser; if the vendor's own bot-blocking starts catching
+          # GitHub's runner IPs too, this step is where it'll show up as a failure, and
+          # there is no side channel to route around it other than vendoring the SDK.
+          run: |
+            curl -fL -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" \
+                 -e "https://ftdichip.com/drivers/d3xx-drivers/" \
+                 -o d3xx-osx.tgz "https://ftdichip.com/wp-content/uploads/2026/04/d3xx-osx.1.1.6.tgz"
+            mkdir -p d3xx-extracted && tar -xzf d3xx-osx.tgz -C d3xx-extracted
+            sudo cp "$(find d3xx-extracted -name ftd3xx.h)" /usr/local/include/
+            sudo cp "$(find d3xx-extracted -name Types.h)" /usr/local/include/
+            sudo cp "$(find d3xx-extracted -name 'libftd3xx.1.1.6.dylib')" /usr/local/lib/
+            sudo cp "$(find d3xx-extracted -name 'libftd3xx.dylib' -not -path '*static*')" /usr/local/lib/
+            sudo install_name_tool -id /usr/local/lib/libftd3xx.dylib /usr/local/lib/libftd3xx.dylib
+            sudo codesign -s - -f /usr/local/lib/libftd3xx.dylib
 
         - name: Install libiio
           run: wget https://github.com/analogdevicesinc/libiio/archive/refs/tags/v0.25.zip && 7z x v0.25.zip && cd libiio-0.25 && mkdir build && cd build && cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DCMAKE_BUILD_TYPE=Release .. && make -j3 && sudo make install && cd ../../
