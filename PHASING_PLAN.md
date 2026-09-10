@@ -728,6 +728,36 @@ Each numbered step compiles and runs on its own (step 1 with nothing calling
 `setSecondInput` is inert; step 2's composite with `MODE_A_ONLY` is bit-identical to
 today). Build order 1 → 2 → 3 → 4 → 5, hardware A/B between 3 and 5.
 
+*Progress:*
+
+- **Step 1 done** (`9626f239`): `IQFrontEnd` second-channel path — `inBuf2` / `preproc2`
+  (`decim2` / `dcBlock2` / `conjugate2`, mirrored block-for-block; `_dcBlocking` /
+  `_invertIQ` tracked as members since `dsp::chain` has no `getBlockEnabled`) / `split2`,
+  idle until `setSecondInput()`. `addVFO(..., secondChannel)` binds to `split2`;
+  `vfoOnCh2` map tracks which splitter each VFO is on for `removeVFO`. All fan-out /
+  start / stop paths cover the mirror while `_hasCh2`. Inert.
+- **Step 2 done** (`d33fe751`): `VFOManager::VFO` gains a permanent `dsp::routing::Splitter`
+  relay (`relayOut`) — `output` points at it for the VFO's whole life, so retargeting the
+  real source (channel-A channelizer ↔ per-VFO `Phaser` output) needs no
+  consumer-side re-read. `attach/detachSecondChannel()` build/tear a channel-B `RxVFO`
+  (name `"<vfo>$b"`, bound to `split2`) plus a `dsp::combine::Phaser`
+  (`init(&dspVFO->out, &dspVFOb->out)`, `MODE_A_ONLY` default). Relay retarget ordering
+  respects single-reader streams (phaser started only after the relay is off channel A;
+  stopped before the relay goes back). `VFOManager::refreshSecondChannels()` runs
+  attach/detach across every VFO. Offset / bandwidth / passband / samplerate setters and
+  `updateFromWaterfall` fan to the channel-B channelizer. `phaser.h` forward-declared in
+  `vfo_manager.h`; included in the `.cpp`. Still inert — nothing calls `setSecondInput`.
+- **Steps 3–5 remain.** Step 3: `source.cpp::updateInput()` feeds the two coherent
+  channels (via `Phasing`'s per-channel splitters, so the recorder tap of §4.1 still
+  works) to `iqFrontEnd.setInput` / `setSecondInput`, then calls
+  `vfoManager.refreshSecondChannels()`; the server path needs the same. Step 4: `Phasing`
+  drops the global `Phaser` (its splitters stay for the recorder + now feed the front
+  end); the misc `phasing` module's combiner controls (weight / mode / decorrelate /
+  whitening / ref-band) leave it. Step 5: those controls reappear in the Radio module as
+  a per-VFO "Decorrelate" section driving `VFOManager::VFO::decorrelator()`, ref band
+  defaulting to the VFO's own passband. Between 4 and 5 the global combiner is gone and
+  per-VFO has no UI yet, so keep 4 and 5 close together (or fold them).
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
