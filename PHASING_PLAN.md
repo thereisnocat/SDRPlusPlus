@@ -573,6 +573,84 @@ declaring the question closed — but the specific instability that made single-
 untrustworthy has a real, understood, tested cause, not merely a workaround that happens to
 help.
 
+### 2.6d Cross-check against a from-scratch offline implementation (carrierhound)
+
+`carrierhound` is a separate GPLv3 project — an offline IQ-capture browser/player — whose
+decorrelation was rebuilt from scratch and, on a real RSR200 dual capture, produces a
+visibly deeper and steadier null than this fork does live (auto-null and eigen-null both).
+Its eigen code is a direct port of `core/src/dsp/combine/decorrelator.h`: same closed-form
+2×2 Hermitian solve, same unit-norm rescale of the coefficients, same degenerate-case
+guards. So the delta is **not the math**. It is two things this plan already half-anticipates,
+plus one smaller one.
+
+**1. It runs the scalar solve per channel, *after* channelisation — the §2.5 "alternative
+not taken".** carrierhound's decorrelator only ever sees samples a per-click DDC has already
+narrowed to ~±12 kHz around the tuned carrier. One complex weight there is not an
+approximation but the correct model: across a channel that narrow the two antenna+feedline
+responses genuinely do differ by a frequency-flat ratio (§2.5's own precondition), so the
+minor eigenvector nulls essentially to the noise floor. This fork applies its scalar
+`(k0, k1)` to the whole pre-VFO span (`signal_path/phasing.cpp`:
+`phaser.setSampleRate(iqFrontEnd.getSampleRate())`, output → `IQFrontEnd`); a reference band
+narrows the *measurement* but the *applied* weight still has to hold across the MHz the
+frontend is decimated to, which §2.5 correctly says it cannot. The multi-tap weight
+(Phase 5) is this fork's answer for wideband cancellation; per-VFO combining is the answer
+for *null depth at the VFO*, and carrierhound is a working existence proof that it delivers
+where scalar-on-wideband structurally can't. Cost is exactly what §2.5 states — two-input
+channelisation, both antenna streams carried to the VFO layer — and it stays "revisit only
+if the multi-tap weight proves inadequate", but the revisit bar should now also include "or
+if per-VFO null depth matters more than we assumed."
+
+**2. It accumulates to a stationary estimate and settles, rather than tracking with an
+EWMA.** `updateCovariance` here runs a single-pole EWMA at `λ = adaptRate` (default 0.05),
+and `adaptRate` is overloaded as *both* the covariance forgetting factor and the Wiener
+weight step. carrierhound accumulates `raa`/`rbb`/`rab` as equal-weight running sums over a
+fixed ~1.5 s window, converges once, then lets the estimate asymptotically freeze as the sum
+grows; re-tuning explicitly restarts it. The result is a far lower-variance covariance → a
+precise eigenvector → a null that does not wander. Three transferable changes, none large:
+
+- decouple the covariance forgetting factor from the weight-adaptation rate (two controls,
+  or derive one from the other);
+- add a converge-and-hold mode to the *decorrelation* eigen path — fill a window, freeze,
+  re-solve only on request or on a measured coherence drop. `MODE_HOLD` already does this
+  for the phasing weight; the decorrelation path has no equivalent and always runs live;
+- lengthen the default effective window. At ~200-sample blocks, `λ = 0.05` is a covariance
+  time constant on the order of tens of ms; carrierhound's 1.5 s is 50–75× longer, and for
+  a mostly-stationary MW pest that is what you want.
+
+Worth doing regardless of #1 — it addresses the jitter that shows up even when the antenna
+geometry cooperates.
+
+**3. Smaller: reference-band selectivity.** carrierhound's reference band is a windowed-sinc
+FIR; `ref_band.h` here is two boxcar decimators (~−26 dB sidelobes, and its own comment
+concedes nearby carriers still pull on the estimate). That bias feeds straight into the
+covariance and pulls the eigenvector. If #1 lands there is nothing out-of-band left to leak
+in and this is moot; if it doesn't, a designed filter on the reference path is a cheap
+improvement.
+
+**Where this fork is already even or ahead — and where carrierhound just has the easier
+problem**, so the comparison stays honest:
+
+- same eigen math; this fork additionally has the full `R^(-1/2)` whitening (carrierhound's
+  `Calibration` is gain-only so far) and the per-bin `WidebandDecorrelator` (which
+  carrierhound ported but does not wire into its single-VFO player);
+- `ChannelSync` here handles two live async streams with mismatched block sizes — a real
+  problem carrierhound does not have, since it reads one file and both channels are
+  inherently sample-aligned;
+- carrierhound's signal is offline, stationary and seekable, and it decorrelates one clicked
+  channel at a time. It can afford a 1.5 s equal-weight accumulation and a re-tune-to-restart
+  model precisely because it never has to track a changing scene across several simultaneous
+  VFOs. Some of its advantage is a narrower problem, not better engineering.
+
+**Ranked, for this fork:**
+
+1. per-VFO scalar decorrelation, post-channelisation (§2.5's parked alternative) — closes
+   most of the depth gap;
+2. converge-and-hold option for the decorrelation eigen path, plus decoupled averaging/step
+   constants and a longer default window — cheap, fixes the jitter;
+3. persist the whitening transform per device serial and stop re-arming "measure noise" per
+   tune (workflow, matches how the Perseus22's own Noise function is used — see §2.6);
+4. a designed filter on the reference-band path, only if #1 is not done.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
@@ -590,7 +668,10 @@ Two answers, and the plan should ship the cheap one first:
   "removes a neighbour's switching supply across the whole band."
 - **Alternative not taken: per-VFO narrowband combining.** Deeper nulls per VFO, but it
   requires two complete channelization frontends and a much larger architectural change.
-  Revisit only if the multi-tap wideband weight proves inadequate in practice.
+  Revisit only if the multi-tap wideband weight proves inadequate in practice — or, per
+  §2.6d, if per-VFO null depth matters more than assumed: a from-scratch offline
+  implementation (carrierhound) takes exactly this route and gets a visibly deeper, steadier
+  null on a real dual capture.
 
 Say this plainly in the UI too — a null-depth meter that reads 45 dB at the VFO while the
 rest of the band barely moves will otherwise read as a bug.
