@@ -1,11 +1,22 @@
 #include <signal_path/vfo_manager.h>
 #include <signal_path/signal_path.h>
+#include <dsp/combine/phaser.h>
 #include <gui/gui.h>
 
 VFOManager::VFO::VFO(std::string name, int reference, double offset, double bandwidth, double sampleRate, double minBandwidth, double maxBandwidth, bool bandwidthLocked) {
     this->name = name;
     _bandwidth = bandwidth;
+    _sampleRate = sampleRate;
+    _offset = offset;
     dspVFO = sigpath::iqFrontEnd.addVFO(name, sampleRate, bandwidth, offset);
+
+    // Stable output: consumers read relayOut for the life of the VFO. relay's input is
+    // channel A now, retargeted to the phaser's output if a second channel attaches.
+    relay.init(&dspVFO->out);
+    relay.bindStream(&relayOut);
+    relay.start();
+    output = &relayOut;
+
     wtfVFO = new ImGui::WaterfallVFO;
     wtfVFO->setReference(reference);
     wtfVFO->setBandwidth(bandwidth);
@@ -13,11 +24,14 @@ VFOManager::VFO::VFO(std::string name, int reference, double offset, double band
     wtfVFO->minBandwidth = minBandwidth;
     wtfVFO->maxBandwidth = maxBandwidth;
     wtfVFO->bandwidthLocked = bandwidthLocked;
-    output = &dspVFO->out;
     gui::waterfall.vfos[name] = wtfVFO;
+
+    if (sigpath::iqFrontEnd.hasSecondChannel()) { attachSecondChannel(); }
 }
 
 VFOManager::VFO::~VFO() {
+    detachSecondChannel();
+    relay.stop();
     dspVFO->stop();
     gui::waterfall.vfos.erase(name);
     if (gui::waterfall.selectedVFO == name) {
@@ -27,9 +41,41 @@ VFOManager::VFO::~VFO() {
     delete wtfVFO;
 }
 
+void VFOManager::VFO::attachSecondChannel() {
+    if (decorr || !sigpath::iqFrontEnd.hasSecondChannel()) { return; }
+
+    dspVFOb = sigpath::iqFrontEnd.addVFO(name + "$b", _sampleRate, _bandwidth, wtfVFO->centerOffset, true);
+    if (!dspVFOb) { return; }
+    dspVFOb->setPassband(dspVFO->getPassbandLo(), dspVFO->getPassbandHi());
+
+    decorr = new dsp::combine::Phaser();
+    decorr->init(&dspVFO->out, &dspVFOb->out);
+    decorr->setMode(dsp::combine::Phaser::MODE_A_ONLY); // off by default -- bit-identical to channel A
+    decorr->setSampleRate(_sampleRate);
+    decorr->reset();
+
+    // Retarget the relay off channel A *before* the phaser starts reading it -- a
+    // dsp::stream has single-reader semantics -- then start the phaser.
+    relay.setInput(&decorr->out);
+    decorr->start();
+}
+
+void VFOManager::VFO::detachSecondChannel() {
+    if (!decorr) { return; }
+    // Stop the phaser first so it is no longer a reader of channel A, then point the relay
+    // straight back at channel A.
+    decorr->stop();
+    relay.setInput(&dspVFO->out);
+    delete decorr;
+    decorr = NULL;
+    sigpath::iqFrontEnd.removeVFO(name + "$b");
+    dspVFOb = NULL;
+}
+
 void VFOManager::VFO::setOffset(double offset) {
     wtfVFO->setOffset(offset);
     dspVFO->setOffset(wtfVFO->centerOffset);
+    if (dspVFOb) { dspVFOb->setOffset(wtfVFO->centerOffset); }
 }
 
 double VFOManager::VFO::getOffset() {
@@ -39,6 +85,7 @@ double VFOManager::VFO::getOffset() {
 void VFOManager::VFO::setCenterOffset(double offset) {
     wtfVFO->setCenterOffset(offset);
     dspVFO->setOffset(offset);
+    if (dspVFOb) { dspVFOb->setOffset(offset); }
 }
 
 void VFOManager::VFO::setBandwidth(double bandwidth, bool updateWaterfall) {
@@ -59,12 +106,15 @@ void VFOManager::VFO::setBandwidth(double bandwidth, bool updateWaterfall) {
         // through here, which is what actually exposed this. For REF_CENTER VFOs (AM, SAM, ...)
         // this is a no-op change, matching setOffset()'s own idempotent-for-REF_CENTER shape.
         dspVFO->setOffset(wtfVFO->centerOffset);
+        if (dspVFOb) { dspVFOb->setOffset(wtfVFO->centerOffset); }
     }
     dspVFO->setBandwidth(bandwidth);
+    if (dspVFOb) { dspVFOb->setBandwidth(bandwidth); }
 }
 
 void VFOManager::VFO::setPassband(double lo, double hi) {
     dspVFO->setPassband(lo, hi);
+    if (dspVFOb) { dspVFOb->setPassband(lo, hi); }
 }
 
 double VFOManager::VFO::getPassbandLo() {
@@ -76,7 +126,10 @@ double VFOManager::VFO::getPassbandHi() {
 }
 
 void VFOManager::VFO::setSampleRate(double sampleRate, double bandwidth) {
+    _sampleRate = sampleRate;
     dspVFO->setOutSamplerate(sampleRate, bandwidth);
+    if (dspVFOb) { dspVFOb->setOutSamplerate(sampleRate, bandwidth); }
+    if (decorr) { decorr->setSampleRate(sampleRate); }
     wtfVFO->setBandwidth(bandwidth);
     // Same missing-resync gap as setBandwidth() above (see its own comment) -- wtfVFO->
     // setBandwidth() can move centerOffset for REF_LOWER/REF_UPPER VFOs, and nothing here
@@ -86,6 +139,7 @@ void VFOManager::VFO::setSampleRate(double sampleRate, double bandwidth) {
     // identical latent bug, so fixing it here too rather than leaving a known duplicate in
     // place.
     dspVFO->setOffset(wtfVFO->centerOffset);
+    if (dspVFOb) { dspVFOb->setOffset(wtfVFO->centerOffset); }
 }
 
 void VFOManager::VFO::setReference(int ref) {
@@ -240,6 +294,15 @@ void VFOManager::updateFromWaterfall(ImGui::WaterFall* wtf) {
         if (vfo->wtfVFO->centerOffsetChanged) {
             vfo->wtfVFO->centerOffsetChanged = false;
             vfo->dspVFO->setOffset(vfo->wtfVFO->centerOffset);
+            if (vfo->dspVFOb) { vfo->dspVFOb->setOffset(vfo->wtfVFO->centerOffset); }
         }
+    }
+}
+
+void VFOManager::refreshSecondChannels() {
+    const bool have = sigpath::iqFrontEnd.hasSecondChannel();
+    for (auto const& [name, vfo] : vfos) {
+        if (have) { vfo->attachSecondChannel(); }
+        else { vfo->detachSecondChannel(); }
     }
 }

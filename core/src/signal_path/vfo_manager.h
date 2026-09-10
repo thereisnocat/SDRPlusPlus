@@ -1,7 +1,10 @@
 #pragma once
 #include "../dsp/channel/rx_vfo.h"
+#include "../dsp/routing/splitter.h"
 #include <gui/widgets/waterfall.h>
 #include <utils/event.h>
+
+namespace dsp { namespace combine { class Phaser; } }
 
 class VFOManager {
 public:
@@ -34,16 +37,35 @@ public:
         void setColor(ImU32 color);
         std::string getName();
 
+        // Per-VFO decorrelation, when the source offers a second coherent channel
+        // (PHASING_PLAN.md 2.6e). attach/detachSecondChannel are driven by VFOManager on
+        // channel-set changes; the phaser (`decorr`) sits after both channelizers and its
+        // output feeds a stable relay, so `output` never changes identity under a
+        // consumer. In MODE_A_ONLY it is a bit-identical passthrough of channel A.
+        void attachSecondChannel();
+        void detachSecondChannel();
+        bool hasSecondChannel() { return decorr != NULL; }
+        dsp::combine::Phaser* decorrelator() { return decorr; }
+
         dsp::stream<dsp::complex_t>* output;
 
         friend class VFOManager;
 
         dsp::channel::RxVFO* dspVFO;
+        dsp::channel::RxVFO* dspVFOb = NULL;
+        dsp::combine::Phaser* decorr = NULL;
         ImGui::WaterfallVFO* wtfVFO;
 
     private:
         std::string name;
         double _bandwidth;
+        double _sampleRate;
+        double _offset;
+        // Stable output: consumers read `relayOut` for the life of the VFO; `relay`'s
+        // input is retargeted (channel-A channelizer <-> phaser output) as the second
+        // channel attaches and detaches.
+        dsp::stream<dsp::complex_t> relayOut;
+        dsp::routing::Splitter<dsp::complex_t> relay;
 
     };
 
@@ -63,6 +85,10 @@ public:
     std::string getName();
     int getReference(std::string name);
     bool vfoExists(std::string name);
+
+    // Attach or detach the second coherent channel on every VFO to match the currently
+    // selected source. Called from source.cpp when the channel set changes.
+    void refreshSecondChannels();
 
     void updateFromWaterfall(ImGui::WaterFall* wtf);
 
