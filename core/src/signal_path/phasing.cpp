@@ -204,6 +204,8 @@ void Phasing::captureNoise(double seconds) { phaser.captureNoise(seconds); }
 bool Phasing::isCapturingNoise() { return phaser.isCapturingNoise(); }
 bool Phasing::hasNoiseReference() { return phaser.hasNoiseReference(); }
 void Phasing::clearNoiseReference() { phaser.clearNoiseReference(); }
+bool Phasing::getWhitening(dsp::combine::Matrix2& out) { return phaser.getWhitening(out); }
+void Phasing::setWhitening(const dsp::combine::Matrix2& w) { phaser.setWhitening(w); }
 void Phasing::setWhiteningEnabled(bool enabled) { phaser.setWhiteningEnabled(enabled); }
 bool Phasing::getWhiteningEnabled() { return phaser.getWhiteningEnabled(); }
 float Phasing::getCoherence() { return phaser.getCoherence(); }

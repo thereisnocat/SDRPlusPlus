@@ -393,6 +393,23 @@ namespace dsp::combine {
             _whitening = Matrix2();
         }
 
+        // The whitening transform itself, so a caller can cache it to disk and restore it
+        // next session rather than re-running "Measure noise" every time -- a receive-chain
+        // property, not a per-tune one (PHASING_PLAN.md 2.6d #3). getWhitening returns
+        // false when there is no reference to hand out.
+        bool getWhitening(Matrix2& out) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            if (!_haveWhitening) { return false; }
+            out = _whitening;
+            return true;
+        }
+
+        void setWhitening(const Matrix2& w) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _whitening = w;
+            _haveWhitening = true;
+        }
+
         // How strongly the two channels agree, 0 to 1. Near 1 means there is a dominant
         // arrival worth separating; low values mean a diffuse mixture and nothing to null.
         float getCoherence() { return coherenceValue.load(std::memory_order_relaxed); }

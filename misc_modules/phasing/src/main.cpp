@@ -26,6 +26,33 @@ ConfigManager config;
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
+// The whitening transform is a receive-chain property, cached per source rather than
+// re-measured every tune (PHASING_PLAN.md 2.6d #3). Stored as a flat array of 8 doubles:
+// [re00, im00, re01, im01, re10, im10, re11, im11].
+static json whiteningToJson(const dsp::combine::Matrix2& w) {
+    json a = json::array();
+    for (int r = 0; r < 2; r++) {
+        for (int c = 0; c < 2; c++) {
+            a.push_back(w.m[r][c].real());
+            a.push_back(w.m[r][c].imag());
+        }
+    }
+    return a;
+}
+
+static bool whiteningFromJson(const json& a, dsp::combine::Matrix2& w) {
+    if (!a.is_array() || a.size() != 8) { return false; }
+    int k = 0;
+    for (int r = 0; r < 2; r++) {
+        for (int c = 0; c < 2; c++) {
+            const double re = a[k++].get<double>();
+            const double im = a[k++].get<double>();
+            w.m[r][c] = std::complex<double>(re, im);
+        }
+    }
+    return true;
+}
+
 // Controls for combining two coherent receive channels: Y = A - w*B. See PHASING_PLAN.md
 // section 2.3.
 //
@@ -276,6 +303,11 @@ private:
         if (c.contains("wideband")) { wideband = c["wideband"]; }
         if (c.contains("wbTaps")) { wbTaps = c["wbTaps"]; }
 
+        whiteningEnabled = c.value("whiteningEnabled", false);
+        dsp::combine::Matrix2 loadedWhitening;
+        bool haveLoadedWhitening = c.contains("whitening") &&
+                                   whiteningFromJson(c["whitening"], loadedWhitening);
+
         memories.clear();
         if (c.contains("memories")) {
             for (auto& m : c["memories"]) {
@@ -291,6 +323,16 @@ private:
             }
         }
         config.release();
+
+        // Restore a cached noise reference for this source before applyToPhaser() pushes
+        // the enabled flag at the phaser.
+        if (haveLoadedWhitening) {
+            sigpath::phasing.setWhitening(loadedWhitening);
+        }
+        else {
+            sigpath::phasing.clearNoiseReference();
+            whiteningEnabled = false;
+        }
 
         gainFine = 0.0f;
         phaseFine = 0.0f;
@@ -314,6 +356,16 @@ private:
         c["refWidth"] = refWidth;
         c["wideband"] = wideband;
         c["wbTaps"] = wbTaps;
+
+        c["whiteningEnabled"] = whiteningEnabled;
+        dsp::combine::Matrix2 w;
+        if (sigpath::phasing.getWhitening(w)) {
+            c["whitening"] = whiteningToJson(w);
+        }
+        else {
+            c.erase("whitening");
+        }
+
         json mems = json::array();
         for (const auto& m : memories) {
             json j;
@@ -343,6 +395,9 @@ private:
         sigpath::phasing.setDelay(delay);
         sigpath::phasing.setAdaptRate(adaptRate);
         sigpath::phasing.setCovarianceEstimator(covSettle, covForget, covSettleSeconds);
+        if (sigpath::phasing.hasNoiseReference()) {
+            sigpath::phasing.setWhiteningEnabled(whiteningEnabled);
+        }
         sigpath::phasing.setWideband(wideband, wbTaps);
         applyReferenceBand();
     }
@@ -381,6 +436,15 @@ private:
             _this->loadSettings();
             _this->wasActive = true;
         }
+
+        // Persist a freshly measured noise reference the instant its capture completes,
+        // so it survives a restart without another measurement.
+        const bool capturingNoise = sigpath::phasing.isCapturingNoise();
+        if (_this->wasCapturingNoise && !capturingNoise && sigpath::phasing.hasNoiseReference()) {
+            _this->whiteningEnabled = sigpath::phasing.getWhiteningEnabled();
+            _this->saveSettings();
+        }
+        _this->wasCapturingNoise = capturingNoise;
 
         int chA = 0, chB = 1;
         sigpath::phasing.getChannelPair(chA, chB);
@@ -725,21 +789,36 @@ private:
             }
 
             // Whitening, so that peaking the strongest arrival maximises signal to noise
-            // rather than merely power. Meaningless without a noise-only measurement.
+            // rather than merely power. It is a receive-chain property, not a per-tune
+            // one: measured once and cached to config, restored next session. See
+            // PHASING_PLAN.md 2.6d #3.
+            const bool haveRef = sigpath::phasing.hasNoiseReference();
             if (sigpath::phasing.isCapturingNoise()) {
                 ImGui::TextWrapped("Measuring noise...");
             }
-            else if (ImGui::Button(CONCAT("Measure noise##_phasing_noise_", _this->name))) {
+            else if (ImGui::Button(CONCAT(haveRef ? "Re-measure noise##_phasing_noise_"
+                                                  : "Measure noise##_phasing_noise_",
+                                          _this->name))) {
                 sigpath::phasing.captureNoise(1.0);
             }
-            if (sigpath::phasing.hasNoiseReference()) {
+            if (haveRef) {
                 ImGui::SameLine();
                 bool w = sigpath::phasing.getWhiteningEnabled();
                 if (ImGui::Checkbox(CONCAT("Use it##_phasing_white_", _this->name), &w)) {
                     sigpath::phasing.setWhiteningEnabled(w);
+                    _this->whiteningEnabled = w;
+                    _this->saveSettings();
                 }
-                ImGui::TextWrapped("Tune to a clear channel before measuring: whatever is "
-                                   "on the air becomes the noise reference.");
+                ImGui::SameLine();
+                if (ImGui::Button(CONCAT("Forget##_phasing_noiseforget_", _this->name))) {
+                    sigpath::phasing.clearNoiseReference();
+                    _this->whiteningEnabled = false;
+                    _this->saveSettings();
+                }
+                ImGui::TextWrapped("Cached for this source. Re-measure only if the "
+                                   "receive chain changes (different antennas, preamp, "
+                                   "gain). Tune to a clear channel first: whatever is on "
+                                   "the air becomes the reference.");
             }
         }
 
@@ -952,6 +1031,8 @@ private:
     bool covSettle = true;
     float covForget = 0.02f;
     float covSettleSeconds = 2.0f;
+    bool whiteningEnabled = false;
+    bool wasCapturingNoise = false;
     bool refEnabled = false;
     double refOffset = 0.0;
     double refWidth = 20000.0;

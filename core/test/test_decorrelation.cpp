@@ -220,6 +220,32 @@ int main() {
     }
 
     // -----------------------------------------------------------------
+    // PHASING_PLAN.md 2.6d #3: the whitening transform is a receive-chain property, so
+    // the phaser must let a caller read it out to cache and put an identical one back.
+    printf("\nWhitening can be read out, cached and restored\n");
+    {
+        Covariance noise;
+        noise.raa = 1e-6; noise.rbb = 4e-6; noise.rab = { 2e-7, 1e-7 };
+        const Matrix2 w = inverseSqrt(noise);
+
+        dsp::stream<dsp::complex_t> a, b;
+        Phaser ph;
+        ph.init(&a, &b);
+
+        Matrix2 out;
+        check(!ph.getWhitening(out), "a phaser with no reference hands out nothing");
+        ph.setWhitening(w);
+        check(ph.getWhitening(out) && ph.hasNoiseReference(), "after setWhitening it has one");
+        double diff = 0.0;
+        for (int r = 0; r < 2; r++) {
+            for (int c = 0; c < 2; c++) { diff += std::abs(out.m[r][c] - w.m[r][c]); }
+        }
+        check(diff < 1e-12, "and hands back the exact matrix it was given");
+        ph.clearNoiseReference();
+        check(!ph.getWhitening(out), "clearNoiseReference drops it");
+    }
+
+    // -----------------------------------------------------------------
     printf("\nThrough the Phaser, end to end\n");
     {
         auto run = [](Phaser::Mode mode, double* localOut, double* dxOut) {

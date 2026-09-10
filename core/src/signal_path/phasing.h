@@ -87,6 +87,8 @@ public:
     bool isCapturingNoise();
     bool hasNoiseReference();
     void clearNoiseReference();
+    bool getWhitening(dsp::combine::Matrix2& out);
+    void setWhitening(const dsp::combine::Matrix2& w);
     void setWhiteningEnabled(bool enabled);
     bool getWhiteningEnabled();
     float getCoherence();
