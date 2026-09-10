@@ -651,6 +651,83 @@ problem**, so the comparison stays honest:
    tune (workflow, matches how the Perseus22's own Noise function is used — see §2.6);
 4. a designed filter on the reference-band path, only if #1 is not done.
 
+### 2.6e Implementing the three: status and the per-VFO restructure plan
+
+On branch `decorrelation-improvements`, off `working`.
+
+**#2 and #3 are done** (`4cd3bf77`, `d3726ebf`): `sdrpp_core` + `phasing` build clean, all
+16 test suites pass, with new `test_decorrelation.cpp` coverage for freeze / hold-through-
+scene-change / re-solve and the whitening read-out/restore round trip.
+
+- **#2** — `Phaser::setCovarianceEstimator(settle, forgetting, settleSeconds)`. `settle`
+  (default) accumulates an equal-weight running mean of the covariance for `settleSeconds`
+  of material, matching the reference-band term rate, then **freezes** it; unfreezes on
+  `resolveCovariance()` or an automatic coherence collapse vs. the peak seen while filling.
+  `!settle` is exponential forgetting at its own rate. `adaptRate` is decoupled — it now
+  only feeds the scalar Wiener `MODE_AUTO` weight step. UI: the decorrelation "Rate"
+  slider is replaced by "Settle & hold" + a window slider + a "settling NN% / settled"
+  readout + a "Re-solve" button; `covarianceFillFraction()` / `isCovarianceSettled()`
+  drive it. Persisted per source.
+- **#3** — `Phaser::getWhitening(Matrix2&)` / `setWhitening(const Matrix2&)`, plumbed
+  through `Phasing`. The phasing module serialises the 8-double matrix plus the enabled
+  flag into the per-source config, restores it in `loadSettings()`, and persists a fresh
+  one the frame its capture completes. "Measure noise" becomes "Re-measure noise" once a
+  reference exists, with a "Forget" button; the help text frames it as a cached RX-chain
+  property.
+
+**#1 — per-VFO decorrelation, post-channelisation.** Greenlit as a full signal-path
+restructure. Design settled after reading the whole path; not yet implemented — it is a
+staged core change and wants building against real hardware between stages.
+
+*Two structural constraints found while tracing it:*
+
+- **`VFOManager::VFO::dspVFO` is a raw `dsp::channel::RxVFO*` many places call directly**
+  (`->setOffset`, `->setBandwidth`, `->setPassband`, `->setOutSamplerate`, `->out`).
+  Changing its type ripples through the Radio module and every decoder. The main-demod
+  path only reaches it through `VFOManager::VFO`'s own wrapper methods, though —
+  `spectrum_preview.h` / `carrier_zoom.h` call `iqFrontEnd.addVFO()` themselves for their
+  own preview VFOs and need no decorrelation — so the wrapper is the seam.
+- **VFOs outlive sources.** A VFO is created once by the Radio module and persists across
+  source switches; it cannot be "a decorrelating VFO" or not by construction at creation
+  time. The B-side has to attach/detach live, driven by
+  `sourceManager.onChannelsRegistered` / `onChannelsUnregistered`.
+
+*Plan:*
+
+1. **`IQFrontEnd` second-channel path.** `inBuf2` → `preproc2` (its own `decim2` /
+   `dcBlock2` / `conjugate2`, enabled identically to the primary so relative phase
+   survives) → `split2`. Built lazily, only while a second input is set. New
+   `setSecondInput(stream*)` / `clearSecondInput()`, `bool hasSecondChannel()`, and
+   `addVFO` / `removeVFO` gain a `secondChannel` bool (bind to `split2` instead of
+   `split`). `setSampleRate` / `setDecimation` / `setDCBlocking` / `setInvertIQ` fan to
+   both preprocs; `start` / `stop` cover both.
+2. **`VFOManager::VFO` composite.** Keep `dspVFO` (channel A, unchanged — preview VFOs and
+   any stray access still work). Add `dspVFOb` (channel B) and a `dsp::combine::Phaser
+   phaser` when the source has a channel set: `phaser.init(&dspVFO->out, &dspVFOb->out)`,
+   `output = &phaser.out`. `MODE_A_ONLY` is "decorrelation off" — bit-identical to channel
+   A, exactly the `Phasing` bypass semantics. Wrapper setters (`setOffset`, `setBandwidth`,
+   `setPassband`, `setSampleRate`) fan to both `dspVFO` and `dspVFOb`. New
+   `VFOManager::VFO` methods forward decorrelation controls to `phaser`. `attachSecondChannel()`
+   / `detachSecondChannel()` build/tear the B-side + phaser live; `VFOManager` subscribes
+   to the channel-set events and calls them on every VFO.
+3. **`source.cpp::updateInput()`** stops routing through `phasing.getOutput()`. Both
+   antenna streams go to `IQFrontEnd` directly: channel A → `setInput` (feeds the
+   waterfall FFT and every VFO's A side), channel B → `setSecondInput`.
+4. **`Phasing`** keeps its per-channel `Splitter`s (the recorder still taps raw channels
+   upstream, §4.1) but its `Phaser` drops the combining role — it becomes a pure fan-out
+   to the front end. The misc-module UI's global weight/mode controls move to the Radio
+   module as per-VFO controls (decorrelation is now a property of the VFO you are hearing);
+   what stays global (channel pair selection, the recorder tap wiring) stays in the misc
+   module.
+5. **Radio module** grows a per-VFO "Decorrelate" section: on/off (phaser mode
+   `A_ONLY` ↔ `DECORR_MIN`), Cancel/Combine, the #2 settle controls, the #3 whitening
+   controls, and the reference band (which now defaults to the VFO's own passband, since
+   the VFO *is* the channel).
+
+Each numbered step compiles and runs on its own (step 1 with nothing calling
+`setSecondInput` is inert; step 2's composite with `MODE_A_ONLY` is bit-identical to
+today). Build order 1 → 2 → 3 → 4 → 5, hardware A/B between 3 and 5.
+
 ### 2.5 Wideband nulling (the honest limitation)
 
 A scalar `w` produces a deep null only over the bandwidth where the two antenna+feedline
