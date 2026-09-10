@@ -28,6 +28,16 @@ public:
     void setSampleRate(double sampleRate);
     inline double getSampleRate() { return _sampleRate / _decimRatio; }
 
+    // Second coherent antenna channel, for per-VFO decorrelation (PHASING_PLAN.md 2.6e).
+    // While a second input is set, a parallel pre-processing chain runs it through the
+    // *identical* decimation / DC-block / conjugate as channel A (so their relative phase
+    // is untouched) and fans it out on its own splitter. VFOs created with
+    // secondChannel=true bind to that splitter; a VFOManager::VFO composite pairs one of
+    // each and combines them. With no second input this is entirely inert.
+    void setSecondInput(dsp::stream<dsp::complex_t>* in);
+    void clearSecondInput();
+    bool hasSecondChannel() { return _hasCh2; }
+
     void setBuffering(bool enabled);
     void setDecimation(int ratio);
     void setInvertIQ(bool enabled);
@@ -69,7 +79,7 @@ public:
     void bindRawIQStream(dsp::stream<dsp::complex_t>* stream);
     void unbindRawIQStream(dsp::stream<dsp::complex_t>* stream);
 
-    dsp::channel::RxVFO* addVFO(std::string name, double sampleRate, double bandwidth, double offset);
+    dsp::channel::RxVFO* addVFO(std::string name, double sampleRate, double bandwidth, double offset, bool secondChannel = false);
     void removeVFO(std::string name);
 
     void setFFTSize(int size);
@@ -105,6 +115,20 @@ protected:
     dsp::math::Conjugate conjugate;
     dsp::correction::DCBlocker<dsp::complex_t> dcBlock;
     dsp::chain<dsp::complex_t> preproc;
+
+    // Second coherent channel: a parallel copy of the pre-processing chain, mirroring the
+    // primary block-for-block so relative phase is preserved. Idle (stopped, no input)
+    // unless setSecondInput() has been called. See setSecondInput().
+    dsp::buffer::SampleFrameBuffer<dsp::complex_t> inBuf2;
+    dsp::multirate::PowerDecimator<dsp::complex_t> decim2;
+    dsp::math::Conjugate conjugate2;
+    dsp::correction::DCBlocker<dsp::complex_t> dcBlock2;
+    dsp::chain<dsp::complex_t> preproc2;
+    dsp::routing::Splitter<dsp::complex_t> split2;
+    bool _hasCh2 = false;
+    bool _dcBlocking = false;
+    bool _invertIQ = false;
+    std::map<std::string, bool> vfoOnCh2;
 
     // Splitting. split normally reads preproc's output directly, same as always. rawSplit and
     // mainStream only come into play while bindRawIQStream() has at least one consumer bound

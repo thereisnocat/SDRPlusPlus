@@ -37,12 +37,28 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     preproc.addBlock(&decim, _decimRatio > 1);
     preproc.addBlock(&dcBlock, dcBlocking);
     preproc.addBlock(&conjugate, false); // TODO: Replace by parameter
+    _dcBlocking = dcBlocking;
+    _invertIQ = false;
 
     // split reads preproc's output directly, same as always -- see iq_frontend.h's
     // bindRawIQStream() comment for why rawSplit isn't wired in here unconditionally.
     split.init(preproc.out);
     rawSplit.init(preproc.out);
     currentPreprocOut = preproc.out;
+
+    // Second-channel pre-processing chain: a block-for-block mirror of the primary,
+    // starting idle. It gets a real input, and starts, only when setSecondInput() is
+    // called (a dual-channel source selected). See iq_frontend.h.
+    inBuf2.init(NULL);
+    inBuf2.bypass = !buffering;
+    decim2.init(NULL, _decimRatio);
+    dcBlock2.init(NULL, genDCBlockRate(effectiveSr));
+    conjugate2.init(NULL);
+    preproc2.init(&inBuf2.out);
+    preproc2.addBlock(&decim2, _decimRatio > 1);
+    preproc2.addBlock(&dcBlock2, dcBlocking);
+    preproc2.addBlock(&conjugate2, false);
+    split2.init(preproc2.out);
 
     // TODO: Do something to avoid basically repeating this code twice
     int skip;
@@ -80,9 +96,38 @@ void IQFrontEnd::setInput(dsp::stream<dsp::complex_t>* in) {
     inBuf.setInput(in);
 }
 
+void IQFrontEnd::setSecondInput(dsp::stream<dsp::complex_t>* in) {
+    inBuf2.setInput(in);
+    if (_hasCh2) { return; }
+    _hasCh2 = true;
+    // Bring the mirror chain up to the primary's current decim / dc-block / invert state,
+    // then start it. (start()/stop() below only touch ch2 while _hasCh2 is set, so a
+    // later front-end restart keeps it in step.)
+    inBuf2.bypass = inBuf.bypass;
+    if (_decimRatio > 1) { decim2.setRatio(_decimRatio); }
+    dcBlock2.setRate(genDCBlockRate(effectiveSr));
+    preproc2.setBlockEnabled(&decim2, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); });
+    preproc2.setBlockEnabled(&dcBlock2, _dcBlocking, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); });
+    preproc2.setBlockEnabled(&conjugate2, _invertIQ, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); });
+    preproc2.start();
+    split2.start();
+    inBuf2.start();
+}
+
+void IQFrontEnd::clearSecondInput() {
+    if (!_hasCh2) { return; }
+    _hasCh2 = false;
+    inBuf2.stop();
+    split2.stop();
+    preproc2.stop();
+    // The stale input pointer is harmless while stopped; the next setSecondInput()
+    // replaces it before anything reads it again.
+}
+
 void IQFrontEnd::setSampleRate(double sampleRate) {
     // Temp stop the necessary blocks
     dcBlock.tempStop();
+    if (_hasCh2) { dcBlock2.tempStop(); }
     for (auto& [name, vfo] : vfos) {
         vfo->tempStop();
     }
@@ -91,6 +136,7 @@ void IQFrontEnd::setSampleRate(double sampleRate) {
     _sampleRate = sampleRate;
     effectiveSr = _sampleRate / _decimRatio;
     dcBlock.setRate(genDCBlockRate(effectiveSr));
+    if (_hasCh2) { dcBlock2.setRate(genDCBlockRate(effectiveSr)); }
     for (auto& [name, vfo] : vfos) {
         vfo->setInSamplerate(effectiveSr);
     }
@@ -100,6 +146,7 @@ void IQFrontEnd::setSampleRate(double sampleRate) {
 
     // Restart blocks
     dcBlock.tempStart();
+    if (_hasCh2) { dcBlock2.tempStart(); }
     for (auto& [name, vfo] : vfos) {
         vfo->tempStart();
     }
@@ -118,27 +165,35 @@ void IQFrontEnd::setDecimation(int ratio) {
     // Temp stop the decimator
     decim.tempStop();
 
+    if (_hasCh2) { decim2.tempStop(); }
+
     // Update the decimation ratio
     _decimRatio = ratio;
-    if (_decimRatio > 1) { decim.setRatio(_decimRatio); }
+    if (_decimRatio > 1) { decim.setRatio(_decimRatio); if (_hasCh2) { decim2.setRatio(_decimRatio); } }
     setSampleRate(_sampleRate);
 
     // Restart the decimator if it was running
     decim.tempStart();
+    if (_hasCh2) { decim2.tempStart(); }
 
     // Enable or disable in the chain
     preproc.setBlockEnabled(&decim, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
+    preproc2.setBlockEnabled(&decim2, _decimRatio > 1, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); });
 
     // Update the DSP sample rate (TODO: Find a way to get rid of this)
     core::setInputSampleRate(_sampleRate);
 }
 
 void IQFrontEnd::setDCBlocking(bool enabled) {
+    _dcBlocking = enabled;
     preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
+    if (_hasCh2) { preproc2.setBlockEnabled(&dcBlock2, enabled, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); }); }
 }
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
+    _invertIQ = enabled;
     preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ currentPreprocOut = out; rawSplit.setInput(out); if (rawStreams.empty()) { split.setInput(out); } });
+    if (_hasCh2) { preproc2.setBlockEnabled(&conjugate2, enabled, [=](dsp::stream<dsp::complex_t>* out){ split2.setInput(out); }); }
 }
 
 void IQFrontEnd::bindIQStream(dsp::stream<dsp::complex_t>* stream) {
@@ -193,10 +248,14 @@ void IQFrontEnd::unbindRawIQStream(dsp::stream<dsp::complex_t>* stream) {
     }
 }
 
-dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, double bandwidth, double offset) {
+dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, double bandwidth, double offset, bool secondChannel) {
     // Make sure no other VFO with that name already exists
     if (vfos.find(name) != vfos.end()) {
         flog::error("[IQFrontEnd] Tried to add VFO with existing name.");
+        return NULL;
+    }
+    if (secondChannel && !_hasCh2) {
+        flog::error("[IQFrontEnd] Tried to add a second-channel VFO with no second channel.");
         return NULL;
     }
 
@@ -207,7 +266,9 @@ dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, dou
     // Register them
     vfoStreams[name] = vfoIn;
     vfos[name] = vfo;
-    bindIQStream(vfoIn);
+    vfoOnCh2[name] = secondChannel;
+    if (secondChannel) { split2.bindStream(vfoIn); }
+    else { bindIQStream(vfoIn); }
 
     // Start VFO
     vfo->start();
@@ -229,7 +290,9 @@ void IQFrontEnd::removeVFO(std::string name) {
     // Stop the VFO
     vfo->stop();
 
-    unbindIQStream(vfoIn);
+    if (vfoOnCh2.count(name) && vfoOnCh2[name]) { split2.unbindStream(vfoIn); }
+    else { unbindIQStream(vfoIn); }
+    vfoOnCh2.erase(name);
     vfoStreams.erase(name);
     vfos.erase(name);
 
@@ -264,6 +327,13 @@ void IQFrontEnd::start() {
     // Start pre-proc chain (automatically start all bound blocks)
     preproc.start();
 
+    // Second-channel chain, only if a second input is currently set.
+    if (_hasCh2) {
+        inBuf2.start();
+        preproc2.start();
+        split2.start();
+    }
+
     // Only if a raw consumer was already bound going into this start() (e.g. the front end
     // was restarted -- a source switch -- while a recording was active): restore rawSplit's
     // insertion. The ordinary case is rawStreams empty here, in which case rawSplit stays
@@ -289,6 +359,12 @@ void IQFrontEnd::stop() {
 
     // Stop pre-proc chain (automatically start all bound blocks)
     preproc.stop();
+
+    if (_hasCh2) {
+        inBuf2.stop();
+        preproc2.stop();
+        split2.stop();
+    }
 
     // Only stop rawSplit if it's actually running (a raw consumer currently bound) -- see
     // start()'s matching comment.
