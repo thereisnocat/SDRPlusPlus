@@ -265,6 +265,9 @@ private:
         if (c.contains("phaseDeg")) { phaseCoarse = c["phaseDeg"]; }
         if (c.contains("delay")) { delay = c["delay"]; }
         if (c.contains("adaptRate")) { adaptRate = c["adaptRate"]; }
+        if (c.contains("covSettle")) { covSettle = c["covSettle"]; }
+        if (c.contains("covForget")) { covForget = c["covForget"]; }
+        if (c.contains("covSettleSeconds")) { covSettleSeconds = c["covSettleSeconds"]; }
         if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
         // refOffset is deliberately not loaded -- it now always tracks the current VFO,
         // set fresh every frame in menuHandler. Restoring a stale saved value here would
@@ -303,6 +306,9 @@ private:
         c["phaseDeg"] = phaseCoarse;
         c["delay"] = delay;
         c["adaptRate"] = adaptRate;
+        c["covSettle"] = covSettle;
+        c["covForget"] = covForget;
+        c["covSettleSeconds"] = covSettleSeconds;
         c["refEnabled"] = refEnabled;
         // refOffset is not persisted -- see loadSettings().
         c["refWidth"] = refWidth;
@@ -336,6 +342,7 @@ private:
         }
         sigpath::phasing.setDelay(delay);
         sigpath::phasing.setAdaptRate(adaptRate);
+        sigpath::phasing.setCovarianceEstimator(covSettle, covForget, covSettleSeconds);
         sigpath::phasing.setWideband(wideband, wbTaps);
         applyReferenceBand();
     }
@@ -614,11 +621,39 @@ private:
                                    "Reference band below and narrow it onto one carrier.");
             }
 
-            ImGui::LeftLabel("Rate");
-            ImGui::FillWidth();
-            if (ImGui::SliderFloat(CONCAT("##_phasing_drate_", _this->name), &_this->adaptRate, 0.001f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic)) {
-                sigpath::phasing.setAdaptRate(_this->adaptRate);
+            // Covariance estimator for the eigen split (PHASING_PLAN.md 2.6d). Its own
+            // control, independent of the scalar Wiener rate: "Settle & hold" accumulates
+            // an equal-weight running mean for `window` seconds and then freezes it,
+            // giving a stationary, low-variance estimate and a null that does not wander.
+            if (ImGui::Checkbox(CONCAT("Settle & hold##_phasing_covsettle_", _this->name), &_this->covSettle)) {
+                sigpath::phasing.setCovarianceEstimator(_this->covSettle, _this->covForget, _this->covSettleSeconds);
                 _this->saveSettings();
+            }
+            if (_this->covSettle) {
+                ImGui::LeftLabel("  window (s)");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(CONCAT("##_phasing_covwin_", _this->name), &_this->covSettleSeconds, 0.25f, 8.0f, "%.2f")) {
+                    sigpath::phasing.setCovarianceEstimator(_this->covSettle, _this->covForget, _this->covSettleSeconds);
+                    _this->saveSettings();
+                }
+                if (ImGui::Button(CONCAT("Re-solve##_phasing_covresolve_", _this->name))) {
+                    sigpath::phasing.resolveCovariance();
+                }
+                ImGui::SameLine();
+                if (sigpath::phasing.isCovarianceSettled()) {
+                    ImGui::TextUnformatted("settled");
+                }
+                else {
+                    ImGui::Text("settling %.0f%%", 100.0f * sigpath::phasing.covarianceFillFraction());
+                }
+            }
+            else {
+                ImGui::LeftLabel("  forgetting");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(CONCAT("##_phasing_covforget_", _this->name), &_this->covForget, 0.0005f, 0.2f, "%.4f", ImGuiSliderFlags_Logarithmic)) {
+                    sigpath::phasing.setCovarianceEstimator(_this->covSettle, _this->covForget, _this->covSettleSeconds);
+                    _this->saveSettings();
+                }
             }
 
             // Solves the same eigen split independently per FFT bin instead of once for
@@ -914,6 +949,9 @@ private:
     float delay = 0.0f;
     float peakDepth = 0.0f;
     float adaptRate = 0.05f;
+    bool covSettle = true;
+    float covForget = 0.02f;
+    float covSettleSeconds = 2.0f;
     bool refEnabled = false;
     double refOffset = 0.0;
     double refWidth = 20000.0;

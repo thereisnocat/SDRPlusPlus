@@ -222,6 +222,58 @@ namespace dsp::combine {
             return _adaptRate;
         }
 
+        // Covariance estimator for the DECORRELATION eigen path -- separate from
+        // setAdaptRate(), which is only the scalar Wiener (MODE_AUTO) weight step. See
+        // PHASING_PLAN.md section 2.6d.
+        //
+        //  - settle == true (default): accumulate an equal-weight running mean of the
+        //    covariance for `settleSeconds` of material, then FREEZE it -- a stationary,
+        //    low-variance estimate that gives a steady eigenvector instead of one that
+        //    jitters with a short forgetting window. Frozen until resolveCovariance(), or
+        //    until this block's own coherence collapses well below the peak seen while
+        //    filling (the scene changed under the solve).
+        //  - settle == false: exponential forgetting at `forgetting` per accumulated term.
+        void setCovarianceEstimator(bool settle, float forgetting, double settleSeconds) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _covSettle = settle;
+            _covForget = (std::min)(1.0f, (std::max)(1.0e-5f, forgetting));
+            _covSettleSeconds = (std::min)(60.0, (std::max)(0.1, settleSeconds));
+            _covSettleTermsWanted = 0.0; // recompute against the new window / rate
+        }
+
+        void getCovarianceEstimator(bool& settle, float& forgetting, double& settleSeconds) {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            settle = _covSettle;
+            forgetting = _covForget;
+            settleSeconds = _covSettleSeconds;
+        }
+
+        // Restart the accumulate-and-settle cycle from empty. Safe from any thread:
+        // every touch of _cov is already under paramMtx.
+        void resolveCovariance() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            _cov = Covariance();
+            _covTerms = 0.0;
+            _covFrozen = false;
+            _covPeakCoherence = 0.0f;
+            _covSettleTermsWanted = 0.0;
+        }
+
+        bool isCovarianceSettled() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            return _covSettle && _covFrozen;
+        }
+
+        // 0..1 progress while the settle window is filling; 1 once frozen or when
+        // exponential forgetting is in use.
+        float covarianceFillFraction() {
+            std::lock_guard<std::mutex> lck(paramMtx);
+            if (!_covSettle) { return 1.0f; }
+            if (_covFrozen) { return 1.0f; }
+            if (_covSettleTermsWanted <= 0.0) { return 0.0f; }
+            return (float)std::clamp(_covTerms / _covSettleTermsWanted, 0.0, 1.0);
+        }
+
         // Solve a multi-tap weight instead of a single complex one, so the null can vary
         // across the band. Only meaningful while adapting -- nobody hand-tunes 32 taps --
         // so it applies to MODE_AUTO and MODE_HOLD and is ignored in MODE_MANUAL.
@@ -269,6 +321,7 @@ namespace dsp::combine {
         // Needed only by the reference band, to place its mixer.
         void setSampleRate(double sampleRate) {
             std::lock_guard<std::mutex> lck(paramMtx);
+            if (sampleRate != _sampleRate) { _covSettleTermsWanted = 0.0; }
             _sampleRate = sampleRate;
             _refDirty = true;
         }
@@ -278,6 +331,7 @@ namespace dsp::combine {
         // peaks is the wanted signal.
         void setReferenceBand(bool enabled, double offsetHz, double widthHz) {
             std::lock_guard<std::mutex> lck(paramMtx);
+            if (enabled != _refEnabled || widthHz != _refWidth) { _covSettleTermsWanted = 0.0; }
             _refEnabled = enabled;
             _refOffset = offsetHz;
             _refWidth = widthHz;
@@ -415,6 +469,12 @@ namespace dsp::combine {
                 std::lock_guard<std::mutex> lck2(paramMtx);
                 _current = _target;
                 _delayCurrent = _delay;
+                // A fresh channel pairing / rate is a fresh scene: restart the settle cycle.
+                _cov = Covariance();
+                _covTerms = 0.0;
+                _covFrozen = false;
+                _covPeakCoherence = 0.0f;
+                _covSettleTermsWanted = 0.0;
             }
             tempStart();
         }
@@ -715,10 +775,54 @@ namespace dsp::combine {
                 }
             }
 
-            const double lambda = (std::min)(1.0, (std::max)(0.001, (double)adaptRate));
-            _cov.raa = _cov.raa * (1.0 - lambda) + raa * lambda;
-            _cov.rbb = _cov.rbb * (1.0 - lambda) + rbb * lambda;
-            _cov.rab = _cov.rab * (1.0 - lambda) + rab * lambda;
+            // Covariance estimator for the decorrelation eigen path -- its own controls,
+            // independent of adaptRate (the scalar Wiener step). See setCovarianceEstimator()
+            // and PHASING_PLAN.md 2.6d. adaptRate is intentionally no longer read here.
+            (void)adaptRate;
+
+            if (_covSettle) {
+                if (_covSettleTermsWanted <= 0.0) {
+                    // Match the term rate of whichever accumulator ran this block: the
+                    // reference-band path yields far fewer terms than samples fed in.
+                    const double termsPerSample = refEnabled
+                        ? 1.0 / (double)(std::max)(refBand.decimation(), 1)
+                        : 1.0;
+                    _covSettleTermsWanted =
+                        (std::max)(1.0, _covSettleSeconds * _sampleRate * termsPerSample);
+                }
+
+                if (_covFrozen) {
+                    // The scene may change under a frozen solve. If this block's own
+                    // coherence has fallen well below the best seen while filling, the
+                    // dominant arrival is no longer what we solved against -- start over.
+                    const Covariance blk{ raa, rbb, rab };
+                    if (_covPeakCoherence > 0.3f &&
+                        (float)coherence(blk) < _covPeakCoherence - COV_AUTO_RESOLVE_DROP) {
+                        _cov = Covariance();
+                        _covTerms = 0.0;
+                        _covFrozen = false;
+                        _covPeakCoherence = 0.0f;
+                    }
+                }
+
+                if (!_covFrozen) {
+                    const double m = _covTerms + (double)terms;
+                    _cov.raa = (_cov.raa * _covTerms + raa * (double)terms) / m;
+                    _cov.rbb = (_cov.rbb * _covTerms + rbb * (double)terms) / m;
+                    _cov.rab = (_cov.rab * _covTerms + rab * (double)terms) / m;
+                    _covTerms = m;
+                    _covPeakCoherence =
+                        (std::max)(_covPeakCoherence, (float)coherence(_cov));
+                    if (_covTerms >= _covSettleTermsWanted) { _covFrozen = true; }
+                }
+            }
+            else {
+                const double lambda =
+                    (std::min)(1.0, (std::max)(1.0e-5, (double)_covForget));
+                _cov.raa = _cov.raa * (1.0 - lambda) + raa * lambda;
+                _cov.rbb = _cov.rbb * (1.0 - lambda) + rbb * lambda;
+                _cov.rab = _cov.rab * (1.0 - lambda) + rab * lambda;
+            }
         }
 
         void applyDecorrelation(int count, const complex_t* a, const complex_t* b,
@@ -822,6 +926,16 @@ namespace dsp::combine {
         bool _capturingNoise = false;
         bool _haveWhitening = false;
         bool _whiteningEnabled = false;
+
+        // Decorrelation covariance estimator (see setCovarianceEstimator / 2.6d).
+        bool _covSettle = true;
+        float _covForget = 0.02f;        // only when !_covSettle
+        double _covSettleSeconds = 2.0;
+        double _covTerms = 0.0;
+        double _covSettleTermsWanted = 0.0;
+        bool _covFrozen = false;
+        float _covPeakCoherence = 0.0f;
+        static constexpr float COV_AUTO_RESOLVE_DROP = 0.2f;
         bool _wideband = false;
         int _wbTaps = 32;
         bool _wbDirty = true;

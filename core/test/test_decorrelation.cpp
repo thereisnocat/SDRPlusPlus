@@ -281,6 +281,119 @@ int main() {
         check(powerA > powerMin + 20.0, "and Min is well below plain channel A");
     }
 
+    // -----------------------------------------------------------------
+    // PHASING_PLAN.md 2.6d: the covariance estimator can accumulate an equal-weight
+    // window and then FREEZE, so the eigenvector stops moving with the noise. A frozen
+    // solve holds through a changed scene until resolveCovariance() (or a coherence
+    // collapse) restarts it.
+    printf("\nSettle-and-hold covariance freezes the eigen solve\n");
+    {
+        dsp::stream<dsp::complex_t> a, b;
+        Phaser ph;
+        ph.init(&a, &b);
+        ph.setSampleRate(100000.0);                 // so a short window fills fast
+        ph.setCovarianceEstimator(true, 0.02f, 0.25); // settle over 0.25 s = 25000 terms
+        ph.setMode(Phaser::MODE_DECORR_MIN);
+        ph.reset();
+        ph.start();
+
+        std::thread rd([&] {
+            while (true) {
+                int c = ph.out.read();
+                if (c < 0) { break; }
+                ph.out.flush();
+            }
+        });
+
+        auto feed = [&](Scene& sc, int blocks) {
+            const int N = 8192;
+            for (int k = 0; k < blocks; k++) {
+                sc.fill(a.writeBuf, b.writeBuf, N);
+                a.swap(N);
+                b.swap(N);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        };
+
+        Scene s1;
+        feed(s1, 20); // ~164k samples: well past the 25k-term settle target
+        check(ph.isCovarianceSettled(), "the estimator reports settled after its window");
+        check(ph.covarianceFillFraction() >= 0.999f, "and fill fraction has reached 1");
+
+        dsp::complex_t k0a, k1a, k0b, k1b;
+        ph.getCombineCoefficients(k0a, k1a);
+
+        // A completely different scene: swap which arrival dominates and its ratios.
+        Scene s2;
+        s2.localB = { 0.4f * std::cos(-1.1), 0.4f * std::sin(-1.1) };
+        s2.dxB = { 1.8f * std::cos(2.0), 1.8f * std::sin(2.0) };
+        s2.localAmp = 0.05; s2.dxAmp = 1.0;
+        feed(s2, 20);
+        ph.getCombineCoefficients(k0b, k1b);
+        const double drift = std::hypot(k0b.re - k0a.re, k0b.im - k0a.im) +
+                             std::hypot(k1b.re - k1a.re, k1b.im - k1a.im);
+        printf("        coefficient drift while frozen: %.5f\n", drift);
+        check(drift < 0.05, "a frozen solve holds through a changed scene");
+
+        // Now explicitly re-solve against the new scene; the coefficients must move.
+        ph.resolveCovariance();
+        check(!ph.isCovarianceSettled(), "re-solve clears the settled flag");
+        feed(s2, 20);
+        dsp::complex_t k0c, k1c;
+        ph.getCombineCoefficients(k0c, k1c);
+        const double moved = std::hypot(k0c.re - k0a.re, k0c.im - k0a.im) +
+                             std::hypot(k1c.re - k1a.re, k1c.im - k1a.im);
+        printf("        coefficient move after re-solve: %.5f\n", moved);
+        check(moved > 0.1, "and re-solving adapts to the new scene");
+        check(ph.isCovarianceSettled(), "then settles again");
+
+        ph.stop();
+        ph.out.stopReader();
+        rd.join();
+        ph.out.clearReadStop();
+    }
+
+    // Exponential-forgetting mode still tracks a changing scene rather than freezing.
+    printf("\nForgetting mode keeps tracking\n");
+    {
+        dsp::stream<dsp::complex_t> a, b;
+        Phaser ph;
+        ph.init(&a, &b);
+        ph.setSampleRate(100000.0);
+        ph.setCovarianceEstimator(false, 0.05f, 2.0); // exponential forgetting, no freeze
+        ph.setMode(Phaser::MODE_DECORR_MIN);
+        ph.reset();
+        ph.start();
+
+        std::thread rd([&] {
+            while (true) { int c = ph.out.read(); if (c < 0) { break; } ph.out.flush(); }
+        });
+        auto feed = [&](Scene& sc, int blocks) {
+            const int N = 8192;
+            for (int k = 0; k < blocks; k++) { sc.fill(a.writeBuf, b.writeBuf, N); a.swap(N); b.swap(N); }
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        };
+
+        Scene s1; feed(s1, 15);
+        check(!ph.isCovarianceSettled(), "forgetting mode never reports settled");
+        dsp::complex_t k0a, k1a; ph.getCombineCoefficients(k0a, k1a);
+        Scene s2;
+        s2.localB = { 0.4f * std::cos(-1.1), 0.4f * std::sin(-1.1) };
+        s2.dxB = { 1.8f * std::cos(2.0), 1.8f * std::sin(2.0) };
+        s2.localAmp = 0.05; s2.dxAmp = 1.0;
+        feed(s2, 25);
+        dsp::complex_t k0b, k1b; ph.getCombineCoefficients(k0b, k1b);
+        const double moved = std::hypot(k0b.re - k0a.re, k0b.im - k0a.im) +
+                             std::hypot(k1b.re - k1a.re, k1b.im - k1a.im);
+        printf("        coefficient move while forgetting: %.5f\n", moved);
+        check(moved > 0.1, "forgetting mode follows the scene without a re-solve");
+
+        ph.stop();
+        ph.out.stopReader();
+        rd.join();
+        ph.out.clearReadStop();
+    }
+
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

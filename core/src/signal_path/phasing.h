@@ -67,6 +67,11 @@ public:
     float getDelay();
     void setAdaptRate(float rate);
     float getAdaptRate();
+    void setCovarianceEstimator(bool settle, float forgetting, double settleSeconds);
+    void getCovarianceEstimator(bool& settle, float& forgetting, double& settleSeconds);
+    void resolveCovariance();
+    bool isCovarianceSettled();
+    float covarianceFillFraction();
     void setSampleRate(double sampleRate);
     void setWideband(bool enabled, int taps);
     void getWideband(bool& enabled, int& taps);

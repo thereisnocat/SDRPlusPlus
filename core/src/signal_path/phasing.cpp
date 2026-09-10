@@ -186,6 +186,11 @@ void Phasing::setDelay(float samples) { phaser.setDelay(samples); }
 float Phasing::getDelay() { return phaser.getDelay(); }
 void Phasing::setAdaptRate(float rate) { phaser.setAdaptRate(rate); }
 float Phasing::getAdaptRate() { return phaser.getAdaptRate(); }
+void Phasing::setCovarianceEstimator(bool settle, float forgetting, double settleSeconds) { phaser.setCovarianceEstimator(settle, forgetting, settleSeconds); }
+void Phasing::getCovarianceEstimator(bool& settle, float& forgetting, double& settleSeconds) { phaser.getCovarianceEstimator(settle, forgetting, settleSeconds); }
+void Phasing::resolveCovariance() { phaser.resolveCovariance(); }
+bool Phasing::isCovarianceSettled() { return phaser.isCovarianceSettled(); }
+float Phasing::covarianceFillFraction() { return phaser.covarianceFillFraction(); }
 void Phasing::setSampleRate(double sampleRate) { phaser.setSampleRate(sampleRate); }
 void Phasing::setWideband(bool enabled, int taps) { phaser.setWideband(enabled, taps); }
 void Phasing::getWideband(bool& enabled, int& taps) { phaser.getWideband(enabled, taps); }
