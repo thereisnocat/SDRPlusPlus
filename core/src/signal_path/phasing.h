@@ -41,8 +41,21 @@ public:
     // True when a usable (2 or more channel) set is attached and the graph is live.
     bool isActive();
 
-    // The combined output, to be handed to the IQ front end. Only meaningful while active.
+    // The combined output, to be handed to the IQ front end. Only meaningful while active
+    // and NOT in per-VFO mode (see setPerVfoMode).
     dsp::stream<dsp::complex_t>* getOutput();
+
+    // Per-VFO decorrelation mode (PHASING_PLAN.md 2.6e). When on, this class stops
+    // combining: build() leaves the internal Phaser dormant and each of the two selected
+    // channels is exposed raw via getChannelOutput() for the IQ front end to run its own
+    // per-VFO combiner on. Set before setChannelSet().
+    void setPerVfoMode(bool on) { _perVfo = on; }
+    bool isPerVfoMode() { return _perVfo; }
+
+    // Raw output of one of the two selected channels (which = 0 -> chA, 1 -> chB), tapped
+    // off that channel's splitter downstream of the recorder taps. NULL unless active.
+    // Only meaningful in per-VFO mode.
+    dsp::stream<dsp::complex_t>* getChannelOutput(int which);
 
     int getChannelCount();
     std::string getChannelName(int channel);
@@ -126,4 +139,5 @@ private:
     int chB = 1;
     bool built = false;
     bool _init = false;
+    bool _perVfo = false;
 };

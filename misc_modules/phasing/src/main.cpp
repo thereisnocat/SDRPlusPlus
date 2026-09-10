@@ -461,6 +461,16 @@ private:
             sigpath::phasing.setChannelPair(chB, chA);
         }
 
+        // In per-VFO mode (the GUI default now, PHASING_PLAN.md 2.6e) the combining
+        // happens inside each VFO -- the controls below are the old global upstream
+        // combiner and do nothing. Channel selection above still applies.
+        if (sigpath::phasing.isPerVfoMode()) {
+            ImGui::TextWrapped("Decorrelation is per-VFO now: open the Radio panel and use "
+                               "its \"Decorrelate\" section. The controls below are the "
+                               "old global combiner and are inactive.");
+            style::beginDisabled();
+        }
+
         // -- Output ------------------------------------------------------------
         // Mode and monitor are one control: there is a single output stream, so choosing
         // what to listen to and choosing what the combiner does are the same choice.
@@ -1013,6 +1023,8 @@ private:
             ImGui::TextWrapped("This source does not guarantee phase coherence across a "
                                "restart, so a recalled setting may need re-trimming.");
         }
+
+        if (sigpath::phasing.isPerVfoMode()) { style::endDisabled(); }
     }
 
     std::string name;

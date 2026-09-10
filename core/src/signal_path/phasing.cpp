@@ -52,15 +52,19 @@ void Phasing::build() {
     splitters[chB]->bindStream(&feedB);
     applyTaps();
 
-    // The reference band mixer needs to know the rate it is working at.
-    phaser.setSampleRate(sigpath::iqFrontEnd.getSampleRate());
-
-    phaser.reset();
-    phaser.start();
+    if (!_perVfo) {
+        // Global-combiner mode: the internal Phaser reads feedA/feedB and its output
+        // (getOutput()) goes to the front end. In per-VFO mode it stays dormant -- the
+        // front end reads feedA/feedB raw via getChannelOutput() and combines per VFO.
+        phaser.setSampleRate(sigpath::iqFrontEnd.getSampleRate());
+        phaser.reset();
+        phaser.start();
+    }
     for (int i = 0; i < n; i++) { splitters[i]->start(); }
 
     built = true;
-    flog::info("[Phasing] Built graph for {0} channels, combining {1} and {2}", n, chA, chB);
+    flog::info("[Phasing] Built graph for {0} channels ({1} mode), pair {2}/{3}", n,
+               _perVfo ? "per-VFO" : "global-combiner", chA, chB);
 }
 
 void Phasing::teardown() {
@@ -92,6 +96,12 @@ void Phasing::applyTaps() {
 bool Phasing::isActive() {
     std::lock_guard<std::recursive_mutex> lck(mtx);
     return built;
+}
+
+dsp::stream<dsp::complex_t>* Phasing::getChannelOutput(int which) {
+    std::lock_guard<std::recursive_mutex> lck(mtx);
+    if (!built) { return NULL; }
+    return which ? &feedB : &feedA;
 }
 
 dsp::stream<dsp::complex_t>* Phasing::getOutput() {
@@ -158,7 +168,7 @@ void Phasing::setChannelPair(int a, int b) {
     // Rebinding has to happen with the graph stopped: the splitters and the phaser are
     // running threads blocked on these very streams.
     for (auto& s : splitters) { s->stop(); }
-    phaser.stop();
+    if (!_perVfo) { phaser.stop(); }
 
     splitters[chA]->unbindStream(&feedA);
     splitters[chB]->unbindStream(&feedB);
@@ -167,8 +177,10 @@ void Phasing::setChannelPair(int a, int b) {
     splitters[chA]->bindStream(&feedA);
     splitters[chB]->bindStream(&feedB);
 
-    phaser.reset();
-    phaser.start();
+    if (!_perVfo) {
+        phaser.reset();
+        phaser.start();
+    }
     for (auto& s : splitters) { s->start(); }
 }
 

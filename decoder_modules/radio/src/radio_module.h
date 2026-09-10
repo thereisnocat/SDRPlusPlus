@@ -14,6 +14,7 @@
 #include <dsp/filter/deephasis.h>
 #include <dsp/filter/tube_warmth.h>
 #include <dsp/filter/parametric_eq.h>
+#include <dsp/combine/phaser.h>
 #include <core.h>
 #include <stdint.h>
 #include <algorithm>
@@ -91,6 +92,15 @@ public:
             created = true;
         }
         selectedDemodID = config.conf[name]["selectedDemodId"];
+        if (config.conf[name].contains("decorr")) {
+            const json& d = config.conf[name]["decorr"];
+            decorrOn = d.value("on", false);
+            decorrCancel = d.value("cancel", true);
+            decorrSettle = d.value("settle", true);
+            decorrSettleSeconds = d.value("settleSeconds", 2.0f);
+            decorrRefBand = d.value("refBand", false);
+            decorrRefWidthHz = d.value("refWidthHz", 3000.0f);
+        }
         config.release(created);
 
         // Initialize the VFO
@@ -509,6 +519,106 @@ private:
         }
         gEqualizerWindow.draw(_this->name);
 
+        // Decorrelate -- per-VFO, when the source offers a second coherent channel
+        // (PHASING_PLAN.md 2.6e). This runs on the VFO's already-narrowed channel, where a
+        // single complex weight is the correct model, so the null goes deep.
+        if (_this->vfo && _this->vfo->hasSecondChannel()) {
+            dsp::combine::Phaser* dec = _this->vfo->decorrelator();
+            // A freshly attached phaser starts in MODE_A_ONLY -- push the saved state onto it.
+            if (dec != _this->lastDecorr) {
+                _this->applyDecorrToPhaser(dec);
+                _this->lastDecorr = dec;
+            }
+
+            bool on = (dec->getMode() != dsp::combine::Phaser::MODE_A_ONLY);
+            if (ImGui::Checkbox(("Decorrelate##_radio_decorr_" + _this->name).c_str(), &on)) {
+                _this->decorrOn = on;
+                dec->setMode(!on ? dsp::combine::Phaser::MODE_A_ONLY
+                             : (_this->decorrCancel ? dsp::combine::Phaser::MODE_DECORR_MIN
+                                                    : dsp::combine::Phaser::MODE_DECORR_MAX));
+                _this->saveDecorr();
+            }
+
+            if (on) {
+                ImGui::Indent();
+
+                int cc = _this->decorrCancel ? 0 : 1;
+                ImGui::LeftLabel("Mode");
+                ImGui::FillWidth();
+                if (ImGui::Combo(("##_radio_decorr_cc_" + _this->name).c_str(), &cc,
+                                 "Cancel (null strongest)\0Combine (peak strongest)\0")) {
+                    _this->decorrCancel = (cc == 0);
+                    dec->setMode(_this->decorrCancel ? dsp::combine::Phaser::MODE_DECORR_MIN
+                                                     : dsp::combine::Phaser::MODE_DECORR_MAX);
+                    _this->saveDecorr();
+                }
+
+                bool settle; float forget; double secs;
+                dec->getCovarianceEstimator(settle, forget, secs);
+                if (ImGui::Checkbox(("Settle & hold##_radio_decorr_settle_" + _this->name).c_str(), &settle)) {
+                    dec->setCovarianceEstimator(settle, forget, secs);
+                    _this->decorrSettle = settle;
+                    _this->saveDecorr();
+                }
+                if (settle) {
+                    float w = (float)secs;
+                    ImGui::LeftLabel("Window (s)");
+                    ImGui::FillWidth();
+                    if (ImGui::SliderFloat(("##_radio_decorr_win_" + _this->name).c_str(), &w, 0.25f, 8.0f, "%.2f")) {
+                        dec->setCovarianceEstimator(settle, forget, w);
+                        _this->decorrSettleSeconds = w;
+                        _this->saveDecorr();
+                    }
+                    if (ImGui::Button(("Re-solve##_radio_decorr_resolve_" + _this->name).c_str())) {
+                        dec->resolveCovariance();
+                    }
+                    ImGui::SameLine();
+                    if (dec->isCovarianceSettled()) { ImGui::TextUnformatted("settled"); }
+                    else { ImGui::Text("settling %.0f%%", 100.0f * dec->covarianceFillFraction()); }
+                }
+
+                bool rbEnabled; double rbOff, rbW;
+                dec->getReferenceBand(rbEnabled, rbOff, rbW);
+                if (ImGui::Checkbox(("Reference band##_radio_decorr_rb_" + _this->name).c_str(), &rbEnabled)) {
+                    _this->decorrRefBand = rbEnabled;
+                    dec->setReferenceBand(rbEnabled, 0.0, _this->decorrRefWidthHz);
+                    _this->saveDecorr();
+                }
+                if (rbEnabled) {
+                    float rw = _this->decorrRefWidthHz;
+                    ImGui::LeftLabel("Width (Hz)");
+                    ImGui::FillWidth();
+                    if (ImGui::SliderFloat(("##_radio_decorr_rbw_" + _this->name).c_str(), &rw, 200.0f, 8000.0f, "%.0f")) {
+                        _this->decorrRefWidthHz = rw;
+                        dec->setReferenceBand(true, 0.0, rw);
+                        _this->saveDecorr();
+                    }
+                }
+
+                if (dec->isCapturingNoise()) {
+                    ImGui::TextUnformatted("Measuring noise...");
+                }
+                else if (ImGui::Button(((dec->hasNoiseReference()
+                                             ? "Re-measure noise##_radio_decorr_noise_"
+                                             : "Measure noise##_radio_decorr_noise_") + _this->name).c_str())) {
+                    dec->captureNoise(1.0);
+                }
+                if (dec->hasNoiseReference()) {
+                    ImGui::SameLine();
+                    bool wht = dec->getWhiteningEnabled();
+                    if (ImGui::Checkbox(("Whiten##_radio_decorr_wht_" + _this->name).c_str(), &wht)) {
+                        dec->setWhiteningEnabled(wht);
+                    }
+                }
+
+                ImGui::Text("Coherence %.3f   Null %.1f dB", dec->getCoherence(), dec->getNullDepth());
+                ImGui::Unindent();
+            }
+        }
+        else {
+            _this->lastDecorr = NULL;
+        }
+
         // Demodulator specific menu
         _this->selectedDemod->showMenu();
 
@@ -550,6 +660,28 @@ private:
         }
 
         if (!_this->enabled) { style::endDisabled(); }
+    }
+
+    void saveDecorr() {
+        config.acquire();
+        json& d = config.conf[name]["decorr"];
+        d["on"] = decorrOn;
+        d["cancel"] = decorrCancel;
+        d["settle"] = decorrSettle;
+        d["settleSeconds"] = decorrSettleSeconds;
+        d["refBand"] = decorrRefBand;
+        d["refWidthHz"] = decorrRefWidthHz;
+        config.release(true);
+    }
+
+    // Push the persisted decorrelation state onto a (freshly attached) per-VFO Phaser.
+    void applyDecorrToPhaser(dsp::combine::Phaser* dec) {
+        if (!dec) { return; }
+        dec->setCovarianceEstimator(decorrSettle, 0.02f, decorrSettleSeconds);
+        dec->setReferenceBand(decorrRefBand, 0.0, decorrRefWidthHz);
+        dec->setMode(!decorrOn ? dsp::combine::Phaser::MODE_A_ONLY
+                     : (decorrCancel ? dsp::combine::Phaser::MODE_DECORR_MIN
+                                     : dsp::combine::Phaser::MODE_DECORR_MAX));
     }
 
     demod::Demodulator* instantiateDemod(DemodID id) {
@@ -1459,6 +1591,19 @@ private:
 
     bool highPass = false;
     bool highPassAllowed = false;
+
+    // Per-VFO decorrelation (PHASING_PLAN.md 2.6e). Only visible when the selected source
+    // offers a second coherent channel. State is mirrored here for persistence; the
+    // authoritative live object is this VFO's dsp::combine::Phaser (vfo->decorrelator()),
+    // which VFOManager recreates whenever the second channel attaches -- lastDecorr tracks
+    // it so saved settings are re-applied to a fresh one.
+    bool decorrOn = false;
+    bool decorrCancel = true;
+    bool decorrSettle = true;
+    float decorrSettleSeconds = 2.0f;
+    bool decorrRefBand = false;
+    float decorrRefWidthHz = 3000.0f;
+    void* lastDecorr = NULL;
 
     // Tube Warmth: simulates the sound of an old tube radio (core/src/dsp/filter/tube_warmth.h
     // has the actual DSP and the design reasoning). Deliberately reuses highPassAllowed rather

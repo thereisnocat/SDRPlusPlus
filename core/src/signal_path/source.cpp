@@ -71,14 +71,24 @@ ChannelSet* SourceManager::getChannels(const std::string& name) {
 
 void SourceManager::updateInput() {
     // No lock here -- always called from a method that already holds `mtx` (see source.h).
+    const bool serverMode = core::args["server"].b();
+
+    // GUI mode combines per VFO (PHASING_PLAN.md 2.6e); server mode has no VFO manager, so
+    // it keeps the global upstream combiner. Set before setChannelSet(), which builds the
+    // graph.
+    sigpath::phasing.setPerVfoMode(!serverMode);
+
     ChannelSet* set = getChannels(selectedName);
     sigpath::phasing.setChannelSet(set);
 
+    const bool dual = sigpath::phasing.isActive();
+
     dsp::stream<dsp::complex_t>* input;
-    if (sigpath::phasing.isActive()) {
-        // The source is writing to its channel streams; the combined result is what the
-        // rest of the application sees. Bypass is Phaser::MODE_A_ONLY, not a rewiring.
-        input = sigpath::phasing.getOutput();
+    if (dual && serverMode) {
+        input = sigpath::phasing.getOutput();      // global combiner
+    }
+    else if (dual) {
+        input = sigpath::phasing.getChannelOutput(0); // channel A; B goes to the front end below
     }
     else if (selectedHandler != NULL) {
         input = selectedHandler->stream;
@@ -87,12 +97,21 @@ void SourceManager::updateInput() {
         input = &nullSource;
     }
 
-    if (core::args["server"].b()) {
+    if (serverMode) {
         server::setInput(input);
+        return;
+    }
+
+    // Second coherent channel first, so hasSecondChannel() is already true when the VFOs
+    // refresh and when setInput() runs.
+    if (dual) {
+        sigpath::iqFrontEnd.setSecondInput(sigpath::phasing.getChannelOutput(1));
     }
     else {
-        sigpath::iqFrontEnd.setInput(input);
+        sigpath::iqFrontEnd.clearSecondInput();
     }
+    sigpath::iqFrontEnd.setInput(input);
+    sigpath::vfoManager.refreshSecondChannels();
 }
 
 std::vector<std::string> SourceManager::getSourceNames() {
