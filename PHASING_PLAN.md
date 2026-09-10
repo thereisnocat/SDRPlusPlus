@@ -747,16 +747,28 @@ today). Build order 1 → 2 → 3 → 4 → 5, hardware A/B between 3 and 5.
   attach/detach across every VFO. Offset / bandwidth / passband / samplerate setters and
   `updateFromWaterfall` fan to the channel-B channelizer. `phaser.h` forward-declared in
   `vfo_manager.h`; included in the `.cpp`. Still inert — nothing calls `setSecondInput`.
-- **Steps 3–5 remain.** Step 3: `source.cpp::updateInput()` feeds the two coherent
-  channels (via `Phasing`'s per-channel splitters, so the recorder tap of §4.1 still
-  works) to `iqFrontEnd.setInput` / `setSecondInput`, then calls
-  `vfoManager.refreshSecondChannels()`; the server path needs the same. Step 4: `Phasing`
-  drops the global `Phaser` (its splitters stay for the recorder + now feed the front
-  end); the misc `phasing` module's combiner controls (weight / mode / decorrelate /
-  whitening / ref-band) leave it. Step 5: those controls reappear in the Radio module as
-  a per-VFO "Decorrelate" section driving `VFOManager::VFO::decorrelator()`, ref band
-  defaulting to the VFO's own passband. Between 4 and 5 the global combiner is gone and
-  per-VFO has no UI yet, so keep 4 and 5 close together (or fold them).
+- **Steps 3–5 done** (`787e45ed`). Step 3 — `source.cpp::updateInput()`: GUI mode sets
+  `phasing.setPerVfoMode(true)`; channel A → `iqFrontEnd.setInput`, channel B (via
+  `Phasing`'s splitter, recorder tap of §4.1 intact) → `setSecondInput`, then
+  `vfoManager.refreshSecondChannels()`. Server mode keeps the global combiner. Step 4 —
+  `Phasing` per-VFO mode: internal `Phaser` left dormant, `getChannelOutput(0/1)` exposes
+  each selected channel raw; splitters still run. `getOutput()` and `test_phasing`
+  unchanged (global-combiner path preserved for server / tests). Step 5 — Radio module
+  "Decorrelate" section, shown when `vfo->hasSecondChannel()`, driving
+  `vfo->decorrelator()`: on/off (`MODE_A_ONLY` ↔ `MODE_DECORR_MIN`), Cancel/Combine, the
+  #2 settle controls + Re-solve + `settling NN% / settled`, an optional reference band
+  (offset 0, width slider), noise measure + whiten, coherence / null-depth readout.
+  Persisted under `config.conf[name]["decorr"]`; re-applied to a freshly attached phaser
+  via a `lastDecorr` pointer check. The misc `phasing` module greys its now-inert global
+  controls with a note pointing at the Radio panel.
+
+**Everything builds** (`sdrpp_core`, `phasing`, `radio`, `file_source`, `network_source`,
+`sdrpp`) and all 16 suites pass. `rtl_sdr_source` and the other libusb hardware modules
+fail to link on a stale `/opt/homebrew/Cellar/libusb/1.0.27` path — pre-existing env
+issue, unrelated. Not yet exercised on real dual-channel hardware / recordings: the
+things to watch are the two mirrored pre-proc chains staying sample-locked (trap (a)),
+the relay-retarget ordering under a live source switch, and per-VFO CPU with several VFOs
+open.
 
 ### 2.5 Wideband nulling (the honest limitation)
 
