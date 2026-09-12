@@ -612,6 +612,12 @@ private:
                 }
 
                 ImGui::Text("Coherence %.3f   Null %.1f dB", dec->getCoherence(), dec->getNullDepth());
+                // Diagnostic (2026-09 real-hardware regression investigation, PHASING_PLAN
+                // 2.6e): whether the two independently-channelized A/B paths feeding this
+                // combiner are actually sample-aligned. 0 samples / corr near 1.0 is healthy;
+                // a nonzero or unsteady lag confirms a real timing-skew bug upstream of here.
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Align lag %d smp (corr %.3f)",
+                                   dec->getAlignmentLag(), dec->getAlignmentLagCorr());
                 ImGui::Unindent();
             }
         }

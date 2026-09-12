@@ -229,9 +229,11 @@ namespace dsp::combine {
         //  - settle == true (default): accumulate an equal-weight running mean of the
         //    covariance for `settleSeconds` of material, then FREEZE it -- a stationary,
         //    low-variance estimate that gives a steady eigenvector instead of one that
-        //    jitters with a short forgetting window. Frozen until resolveCovariance(), or
-        //    until this block's own coherence collapses well below the peak seen while
-        //    filling (the scene changed under the solve).
+        //    jitters with a short forgetting window. Frozen until resolveCovariance()
+        //    explicitly restarts it -- the "scene changed, start over" call is left to the
+        //    operator, not guessed from a single block's own noisy instantaneous coherence
+        //    (an earlier version tried that and reset itself many times a minute on real
+        //    modulated audio; see resolveCovariance()'s own doc).
         //  - settle == false: exponential forgetting at `forgetting` per accumulated term.
         void setCovarianceEstimator(bool settle, float forgetting, double settleSeconds) {
             std::lock_guard<std::mutex> lck(paramMtx);
@@ -255,7 +257,6 @@ namespace dsp::combine {
             _cov = Covariance();
             _covTerms = 0.0;
             _covFrozen = false;
-            _covPeakCoherence = 0.0f;
             _covSettleTermsWanted = 0.0;
         }
 
@@ -472,6 +473,17 @@ namespace dsp::combine {
         // channels are badly out of step, not merely block-misaligned.
         uint64_t getDiscardCount() { return sync.discardCount(); }
 
+        // Diagnostic added investigating the 2026-09 real-RSR200 regression on the per-VFO
+        // restructure (PHASING_PLAN.md 2.6e). Reports the best integer-sample lag between A
+        // and B over a short recent window, and the (magnitude) correlation achieved at that
+        // lag. A persistently nonzero -- or unstable -- lag means the two independently
+        // channelized paths feeding this combiner have drifted out of *sample* alignment
+        // upstream, something ChannelSync (which only matches block *counts*, not absolute
+        // sample position) cannot detect or correct. A lag that sits at 0 with a corr near
+        // 1.0 rules that out. Only updated while decorrelating; negligible cost either way.
+        int getAlignmentLag() { return alignLag.load(std::memory_order_relaxed); }
+        float getAlignmentLagCorr() { return alignLagCorr.load(std::memory_order_relaxed); }
+
         // Only safe while the block is stopped, or from inside tempStop/tempStart.
         void reset() {
             assert(_block_init);
@@ -490,7 +502,6 @@ namespace dsp::combine {
                 _cov = Covariance();
                 _covTerms = 0.0;
                 _covFrozen = false;
-                _covPeakCoherence = 0.0f;
                 _covSettleTermsWanted = 0.0;
             }
             tempStart();
@@ -808,28 +819,26 @@ namespace dsp::combine {
                         (std::max)(1.0, _covSettleSeconds * _sampleRate * termsPerSample);
                 }
 
-                if (_covFrozen) {
-                    // The scene may change under a frozen solve. If this block's own
-                    // coherence has fallen well below the best seen while filling, the
-                    // dominant arrival is no longer what we solved against -- start over.
-                    const Covariance blk{ raa, rbb, rab };
-                    if (_covPeakCoherence > 0.3f &&
-                        (float)coherence(blk) < _covPeakCoherence - COV_AUTO_RESOLVE_DROP) {
-                        _cov = Covariance();
-                        _covTerms = 0.0;
-                        _covFrozen = false;
-                        _covPeakCoherence = 0.0f;
-                    }
-                }
-
+                // Deliberately no automatic "scene changed, start over" heuristic here
+                // anymore. An earlier version compared this *single block's* own
+                // instantaneous coherence against the best seen while filling, and reset
+                // the whole settle cycle on a large-enough drop -- but a single block's
+                // raw/rbb/rab (already averaged over only that block's own `terms`, which
+                // can be a few dozen for a decimated reference band) is a genuinely noisy
+                // estimate for real modulated audio: ordinary program-content power
+                // swings tripped it many times a minute on real air, so the covariance
+                // essentially never got to finish converging before being wiped -- found
+                // 2026-09-11 testing a real RSR200 recording, where it explained both the
+                // shallower-than-expected null and its instability. resolveCovariance()
+                // (the UI's "Re-solve" button) is the correct way to say "the scene
+                // changed, start over" -- it's an explicit operator judgement, not a
+                // twitchy per-block guess.
                 if (!_covFrozen) {
                     const double m = _covTerms + (double)terms;
                     _cov.raa = (_cov.raa * _covTerms + raa * (double)terms) / m;
                     _cov.rbb = (_cov.rbb * _covTerms + rbb * (double)terms) / m;
                     _cov.rab = (_cov.rab * _covTerms + rab * (double)terms) / m;
                     _covTerms = m;
-                    _covPeakCoherence =
-                        (std::max)(_covPeakCoherence, (float)coherence(_cov));
                     if (_covTerms >= _covSettleTermsWanted) { _covFrozen = true; }
                 }
             }
@@ -842,8 +851,60 @@ namespace dsp::combine {
             }
         }
 
+        // See getAlignmentLag()'s own doc. +/-32 samples is generous for what a resampler
+        // warm-up / independent-buffering skew could plausibly introduce; a real RF/feedline
+        // delay would show here too, but that's what the (separate) manual delay control is
+        // for -- this diagnostic doesn't distinguish the two, it just reports whether *some*
+        // lag, from any cause, is present.
+        static const int ALIGN_MAX_LAG = 32;
+        static const int ALIGN_WINDOW = 4096;
+
+        void feedAlignmentProbe(const complex_t* a, const complex_t* b, int count) {
+            if (alignBufA.empty()) {
+                alignBufA.assign(ALIGN_WINDOW + 2 * ALIGN_MAX_LAG, complex_t{ 0.0f, 0.0f });
+                alignBufB.assign(ALIGN_WINDOW + 2 * ALIGN_MAX_LAG, complex_t{ 0.0f, 0.0f });
+            }
+            int need = (int)alignBufA.size() - alignFill;
+            int take = (std::min)(need, count);
+            if (take > 0) {
+                memcpy(alignBufA.data() + alignFill, a, take * sizeof(complex_t));
+                memcpy(alignBufB.data() + alignFill, b, take * sizeof(complex_t));
+                alignFill += take;
+            }
+            if (alignFill >= (int)alignBufA.size()) {
+                runAlignmentProbe();
+                alignFill = 0;
+            }
+        }
+
+        void runAlignmentProbe() {
+            double bestCorr = -1.0;
+            int bestLag = 0;
+            for (int lag = -ALIGN_MAX_LAG; lag <= ALIGN_MAX_LAG; lag++) {
+                std::complex<double> acc(0.0, 0.0);
+                double pa = 0.0, pb = 0.0;
+                for (int i = 0; i < ALIGN_WINDOW; i++) {
+                    const complex_t& av = alignBufA[ALIGN_MAX_LAG + i];
+                    const complex_t& bv = alignBufB[ALIGN_MAX_LAG + i + lag];
+                    acc += std::complex<double>(av.re, av.im) * std::conj(std::complex<double>(bv.re, bv.im));
+                    pa += (double)av.re * av.re + (double)av.im * av.im;
+                    pb += (double)bv.re * bv.re + (double)bv.im * bv.im;
+                }
+                const double denom = std::sqrt(pa * pb);
+                const double corr = (denom > 1e-20) ? std::abs(acc) / denom : 0.0;
+                if (corr > bestCorr) {
+                    bestCorr = corr;
+                    bestLag = lag;
+                }
+            }
+            alignLag.store(bestLag, std::memory_order_relaxed);
+            alignLagCorr.store((float)bestCorr, std::memory_order_relaxed);
+        }
+
         void applyDecorrelation(int count, const complex_t* a, const complex_t* b,
                                 complex_t* outBuf, Mode mode) {
+            feedAlignmentProbe(a, b, count);
+
             Covariance cov;
             Matrix2 whitening;
             bool whitened = false;
@@ -951,8 +1012,6 @@ namespace dsp::combine {
         double _covTerms = 0.0;
         double _covSettleTermsWanted = 0.0;
         bool _covFrozen = false;
-        float _covPeakCoherence = 0.0f;
-        static constexpr float COV_AUTO_RESOLVE_DROP = 0.2f;
         bool _wideband = false;
         int _wbTaps = 32;
         bool _wbDirty = true;
@@ -974,5 +1033,11 @@ namespace dsp::combine {
         std::atomic<float> wbDecorrCoherence{ 0.0f };
         std::atomic<int> wbDecorrActiveBins{ 0 };
         std::atomic<int> wbDecorrTotalBins{ 1 };
+
+        // Alignment-lag diagnostic (worker-thread only; see getAlignmentLag()'s doc).
+        std::vector<complex_t> alignBufA, alignBufB;
+        int alignFill = 0;
+        std::atomic<int> alignLag{ 0 };
+        std::atomic<float> alignLagCorr{ 0.0f };
     };
 }
