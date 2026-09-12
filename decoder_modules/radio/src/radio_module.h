@@ -53,6 +53,27 @@ std::map<IFNRPreset, double> ifnrTaps = {
     { IFNR_PRESET_BROADCAST, 32 }
 };
 
+// Holds a live value still long enough to read. getNullDepth()'s band-limited path
+// recomputes an unsmoothed per-block power ratio every call, so real modulation-driven
+// power swings show up directly in the raw figure even once the applied weight is
+// genuinely stable (settled) -- this doesn't touch the decorrelation itself, only how
+// often the displayed number is allowed to change. Same pattern misc_modules/phasing
+// already uses for its own meters/readouts.
+template <typename T>
+struct Damped {
+    T value{};
+    double last = -1e18;
+
+    T sample(T fresh, double period = 1.0) {
+        const double now = ImGui::GetTime();
+        if (now - last >= period) {
+            value = fresh;
+            last = now;
+        }
+        return value;
+    }
+};
+
 class RadioModule : public ModuleManager::Instance, public EqualizerHost {
 public:
     RadioModule(std::string name) {
@@ -611,7 +632,8 @@ private:
                     }
                 }
 
-                ImGui::Text("Coherence %.3f   Null %.1f dB", dec->getCoherence(), dec->getNullDepth());
+                const float nullDepth = _this->dampNullDepth.sample(dec->getNullDepth(), 0.5);
+                ImGui::Text("Coherence %.3f   Null %.1f dB", dec->getCoherence(), nullDepth);
                 // Diagnostic (2026-09 real-hardware regression investigation, PHASING_PLAN
                 // 2.6e): whether the two independently-channelized A/B paths feeding this
                 // combiner are actually sample-aligned. 0 samples / corr near 1.0 is healthy;
@@ -1610,6 +1632,7 @@ private:
     bool decorrRefBand = false;
     float decorrRefWidthHz = 3000.0f;
     void* lastDecorr = NULL;
+    Damped<float> dampNullDepth; // display-only smoothing for the Null dB readout
 
     // Tube Warmth: simulates the sound of an old tube radio (core/src/dsp/filter/tube_warmth.h
     // has the actual DSP and the design reasoning). Deliberately reuses highPassAllowed rather
