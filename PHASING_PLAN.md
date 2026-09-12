@@ -765,10 +765,62 @@ today). Build order 1 → 2 → 3 → 4 → 5, hardware A/B between 3 and 5.
 **Everything builds** (`sdrpp_core`, `phasing`, `radio`, `file_source`, `network_source`,
 `sdrpp`) and all 16 suites pass. `rtl_sdr_source` and the other libusb hardware modules
 fail to link on a stale `/opt/homebrew/Cellar/libusb/1.0.27` path — pre-existing env
-issue, unrelated. Not yet exercised on real dual-channel hardware / recordings: the
-things to watch are the two mirrored pre-proc chains staying sample-locked (trap (a)),
-the relay-retarget ordering under a live source switch, and per-VFO CPU with several VFOs
-open.
+issue, unrelated.
+
+### 2.6f Real-hardware regression, root cause, and confirmed fix (2026-09-11)
+
+First real RSR200 test of the per-VFO restructure, on 970 kHz: worse than both the old
+global combiner and carrierhound — null 15–20 dB, changing multiple times a second, the
+dominant station still dominant, where the old code (upstream, wideband) read 45–50 dB
+(but revealed nothing) and carrierhound read 20–25 dB (and did reveal the station
+underneath). Ready to be called a failure. Chased and ruled out, in order, each with a
+targeted diagnostic rather than a guess:
+
+- **Sample-alignment skew between the two independently-channelized paths** — the
+  structural risk named in 2.6e's "things to watch." Added a cross-correlation
+  alignment-lag probe to `Phaser` (`getAlignmentLag()`/`getAlignmentLagCorr()`, ±32
+  samples, exposed in the Radio panel). Read 0 samples, corr 0.997–0.999, rock steady.
+  Ruled out — the two channelizer paths are, in fact, sample-locked.
+- **Whitening measured on a live channel instead of a blank one** — a real gap in the
+  Radio-panel port of this UI (it dropped the old panel's "tune to a clear channel
+  first" warning). Tested with Whiten off: null unchanged (11.9–21.3 dB, same range).
+  Ruled out.
+- **Reference-band selectivity** — the `RefBand` boxcar decimator, designed for the old
+  code's high pre-VFO sample rate, gets far fewer taps for the same target width at a
+  VFO's own (much lower) output rate, plausibly diluting the covariance with sideband
+  energy. Tested with the reference band off entirely (whole-channel covariance, no
+  decimator at all): coherence 0.990, null 18.6 dB — no meaningfully better than with it
+  on. Looked like another dead end.
+
+**The real cause, found from an offhand remark ("it resettles on its own multiple times
+a minute")**: the "settle & hold" covariance estimator (2.6d #2) carried a safety net —
+if a single block's own instantaneous coherence fell more than 0.2 below the best seen
+while filling, treat it as "the scene changed" and restart the accumulate cycle
+automatically. A single block's raw/rbb/rab (especially decimated through a narrow
+reference band, sometimes only a few dozen terms) is a genuinely noisy coherence
+estimate for real modulated broadcast audio — ordinary program-content power swings
+tripped the reset many times a minute, so the low-variance settled estimate the whole
+feature exists to produce almost never survived long enough to be used. This explains
+both symptoms at once: shallow null (mostly measured against an incompletely-filled,
+still-converging estimate) and instability (constant silent resets), and it has nothing
+to do with the per-VFO architecture, alignment, whitening, or reference-band scope —
+all four of which had already been independently confirmed innocent by that point.
+
+**Fix**: removed the automatic reset outright (`9f331007`). `resolveCovariance()` (the
+"Re-solve" button) is now the *only* way to restart the cycle — a deliberate operator
+call, not a per-block guess. `_covPeakCoherence` and the threshold constant went with it.
+
+**Confirmed fixed, same station, same hardware**: null 33.4 dB, coherence 0.999, and —
+the actual point of all of this — Cancel audibly nulled the dominant station and
+revealed a genuinely different one underneath, cross-checked by switching to Combine and
+back. The per-VFO restructure works and does what carrierhound already showed was
+possible; the earlier real-hardware failure was entirely this one heuristic, not the
+architecture. The displayed Null figure still swings block to block even now — expected,
+since `getNullDepth()`'s band-limited path recomputes an unsmoothed per-block power
+ratio every call, so real modulation-driven power variation shows up in the readout even
+though the applied weight is genuinely stable; a `Damped<float>` on the display (the
+misc phasing module already uses this pattern for its own meters) would fix the
+*readout* without touching the actual decorrelation, if wanted.
 
 ### 2.5 Wideband nulling (the honest limitation)
 
