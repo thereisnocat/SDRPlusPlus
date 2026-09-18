@@ -287,40 +287,55 @@ private:
         const std::string key = settingsKey();
         config.acquire();
         json& c = config.conf["sources"][key];
-        if (c.contains("mode")) { mode = c["mode"]; }
-        if (c.contains("gainDb")) { gainCoarse = c["gainDb"]; }
-        if (c.contains("phaseDeg")) { phaseCoarse = c["phaseDeg"]; }
-        if (c.contains("delay")) { delay = c["delay"]; }
-        if (c.contains("adaptRate")) { adaptRate = c["adaptRate"]; }
-        if (c.contains("covSettle")) { covSettle = c["covSettle"]; }
-        if (c.contains("covForget")) { covForget = c["covForget"]; }
-        if (c.contains("covSettleSeconds")) { covSettleSeconds = c["covSettleSeconds"]; }
-        if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
-        // refOffset is deliberately not loaded -- it now always tracks the current VFO,
-        // set fresh every frame in menuHandler. Restoring a stale saved value here would
-        // just show it for one frame before being overwritten anyway.
-        if (c.contains("refWidth")) { refWidth = c["refWidth"]; }
-        if (c.contains("wideband")) { wideband = c["wideband"]; }
-        if (c.contains("wbTaps")) { wbTaps = c["wbTaps"]; }
 
-        whiteningEnabled = c.value("whiteningEnabled", false);
+        // A stored value with an unexpected type -- a stale config from before some field
+        // existed, a hand edit, a field whose type changed across a version -- must never
+        // take the whole app down. Ralph hit exactly this on Windows: an uncaught
+        // json::type_error thrown from in here (nothing upstream of loadSettings() catches
+        // json exceptions) propagated all the way up through Menu::draw and crashed
+        // instantly the first time this source's settings were ever loaded. Anything not
+        // applied before the throw simply keeps its already-set default.
         dsp::combine::Matrix2 loadedWhitening;
-        bool haveLoadedWhitening = c.contains("whitening") &&
+        bool haveLoadedWhitening = false;
+        try {
+            if (c.contains("mode")) { mode = c["mode"]; }
+            if (c.contains("gainDb")) { gainCoarse = c["gainDb"]; }
+            if (c.contains("phaseDeg")) { phaseCoarse = c["phaseDeg"]; }
+            if (c.contains("delay")) { delay = c["delay"]; }
+            if (c.contains("adaptRate")) { adaptRate = c["adaptRate"]; }
+            if (c.contains("covSettle")) { covSettle = c["covSettle"]; }
+            if (c.contains("covForget")) { covForget = c["covForget"]; }
+            if (c.contains("covSettleSeconds")) { covSettleSeconds = c["covSettleSeconds"]; }
+            if (c.contains("refEnabled")) { refEnabled = c["refEnabled"]; }
+            // refOffset is deliberately not loaded -- it now always tracks the current VFO,
+            // set fresh every frame in menuHandler. Restoring a stale saved value here would
+            // just show it for one frame before being overwritten anyway.
+            if (c.contains("refWidth")) { refWidth = c["refWidth"]; }
+            if (c.contains("wideband")) { wideband = c["wideband"]; }
+            if (c.contains("wbTaps")) { wbTaps = c["wbTaps"]; }
+
+            whiteningEnabled = c.value("whiteningEnabled", false);
+            haveLoadedWhitening = c.contains("whitening") &&
                                    whiteningFromJson(c["whitening"], loadedWhitening);
 
-        memories.clear();
-        if (c.contains("memories")) {
-            for (auto& m : c["memories"]) {
-                Memory mem;
-                mem.frequency = m.value("frequency", 0.0);
-                mem.mode = m.value("mode", 0);
-                mem.gainDb = m.value("gainDb", 0.0f);
-                mem.phaseDeg = m.value("phaseDeg", 0.0f);
-                mem.delay = m.value("delay", 0.0f);
-                mem.chA = m.value("chA", 0);
-                mem.chB = m.value("chB", 1);
-                memories.push_back(mem);
+            memories.clear();
+            if (c.contains("memories")) {
+                for (auto& m : c["memories"]) {
+                    Memory mem;
+                    mem.frequency = m.value("frequency", 0.0);
+                    mem.mode = m.value("mode", 0);
+                    mem.gainDb = m.value("gainDb", 0.0f);
+                    mem.phaseDeg = m.value("phaseDeg", 0.0f);
+                    mem.delay = m.value("delay", 0.0f);
+                    mem.chA = m.value("chA", 0);
+                    mem.chB = m.value("chB", 1);
+                    memories.push_back(mem);
+                }
             }
+        }
+        catch (const std::exception& e) {
+            flog::error("[Phasing] Couldn't load settings for '{0}': {1} -- using defaults "
+                        "for whatever wasn't already read", key, e.what());
         }
         config.release();
 
