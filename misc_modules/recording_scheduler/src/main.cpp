@@ -490,6 +490,23 @@ private:
             gui::mainWindow.setPlayState(false);
             sigpath::sourceManager.selectSource(e.sourceName);
         }
+        else if (!e.sourceConfigSnapshot.empty() && gui::mainWindow.sdrIsRunning() &&
+                 sigpath::sourceManager.captureSourceConfig(e.sourceName) != e.sourceConfigSnapshot) {
+            // The radio is already streaming with different settings than this entry wants --
+            // the normal case for a back-to-back entry on the same radio (stopEntryNow()
+            // deliberately leaves the source running afterward), or the user simply having it
+            // on. Stop it first so start() below is what programs the hardware from the
+            // snapshot. applyConfigHandler only updates a module's own fields (and, for most,
+            // core::setInputSampleRate()); anything a module only programs in start() -- the
+            // RSR200's ADC clock and decimation, Perseus/RTL-SDR/SDRplay's sample rate -- is
+            // NOT pushed to a radio that's already running. Applying to a running radio left
+            // core (and so the Recorder's own file metadata) believing in the *new* sample
+            // rate while the hardware kept streaming at the old one: every carrier in the
+            // recording sat at the wrong frequency. Found by the user from real, quietly
+            // mis-scaled scheduled recordings. Skipped when the live settings already match,
+            // so an already-correct radio isn't needlessly bounced.
+            gui::mainWindow.setPlayState(false);
+        }
         if (!e.sourceConfigSnapshot.empty()) {
             sigpath::sourceManager.applySourceConfig(e.sourceName, e.sourceConfigSnapshot);
         }

@@ -1054,7 +1054,16 @@ private:
         // scheduled apply may target a radio that isn't active right now) -- setInputSampleRate
         // affects whatever source *is* selected, so only touch it when that's actually this one,
         // matching every other rate-affecting control in menuHandler below.
-        if (sigpath::sourceManager.getSelectedName() == "RSR200") {
+        //
+        // And only when it isn't streaming: the ADC clock and decimation are programmed into
+        // the hardware in start() and nowhere else (every rate-affecting menu control is
+        // disabled while running for the same reason), so on a running radio the fields just
+        // updated above are *not* what the hardware is doing. Telling core the new rate then
+        // desyncs it from the actual stream -- the Recorder stamps the new rate into a file
+        // whose samples are still at the old one, and every carrier lands at the wrong
+        // frequency. The saved fields still take effect at the next start(), which is where
+        // the scheduler (fireEntry()) now makes sure a differing snapshot goes through.
+        if (sigpath::sourceManager.getSelectedName() == "RSR200" && !_this->running) {
             core::setInputSampleRate(_this->buildConfig().sampleRateHz());
         }
     }
