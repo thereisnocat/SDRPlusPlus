@@ -245,6 +245,21 @@ namespace rsr200 {
 
             cfg = next;
 
+            // Over USB the first command sent after a (re)open is swallowed: no confirmation,
+            // no effect. Since this is the first command out of a fresh open, it used to be
+            // the ADC clock -- so a stop/start cycle silently kept the previous clock while
+            // core, and so the Recorder's file header, were told the new one (found from
+            // scheduled back-to-back recordings at different clocks: every later file was
+            // stamped with its snapshot's rate but sampled at the first one's; confirmed on
+            // hardware with test/test_clock_change.cpp -- the clock stuck on every cycle with
+            // a throwaway command sent first, and never did without one; a delay after open
+            // did not help). The first start in a process is unaffected, which is why this
+            // hid so well. Read Version is harmless and unacknowledged-by-design here (its
+            // reply is picked up like any other embedded one), so it takes the hit instead.
+            if (!configuredOnce && !transport->isLan()) {
+                if (!send(cmdReadVersion(nextNumber(), false), nowMs, false)) { return false; }
+            }
+
             if (clockChanged || !configuredOnce) {
                 if (!send(cmdSetAdcClock(nextNumber(), transport->isLan(),
                                          cfg.adcClockHz, cfg.gpsDiscipline), nowMs, true)) {
