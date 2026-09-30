@@ -327,6 +327,18 @@ One worker thread, started in `postInit()`/module-enable and joined on disable/d
    saved frequency. Then locate the target Recorder instance, push the entry's
    `recorderConfigSnapshot` via `RECORDER_IFACE_CMD_SET_CONFIG`, and `RECORDER_IFACE_CMD_START`.
    Mark `status = "running"`.
+
+   **The target already being the selected+running source is not a free pass** (this case was
+   left unspecified originally, and step 3's "leave the source live for a back-to-back entry"
+   makes it the *normal* case for consecutive entries on one radio). If its live settings
+   differ from the entry's snapshot, the source must be stopped before `applyConfigHandler` and
+   started after, exactly as in the not-running case: `applyConfigHandler` only updates a
+   module's own fields, and anything the module programs solely in `start()` (RSR200 ADC clock
+   and decimation, the other radios' sample rate) is not pushed to a running radio — applying
+   anyway left core/the Recorder believing the new sample rate while the hardware streamed at
+   the old one, so recordings came out with every carrier at the wrong frequency (found
+   2026-09, from real scheduled RSR200 recordings). If the live settings already match the
+   snapshot, leave the radio alone.
 3. **Stop sequence**, at the entry's stop time: `RECORDER_IFACE_CMD_STOP` on the target Recorder.
    Recommend *not* auto-stopping the source itself (leaves it live for the user or a
    back-to-back entry) — flagged as a v1 default, easy to make configurable later if it turns out
