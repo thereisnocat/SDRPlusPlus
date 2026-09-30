@@ -551,6 +551,83 @@ int main() {
         check(gap, "a jump in the USB packet counter is reported as lost data");
     }
 
+    // -----------------------------------------------------------------
+    // Over USB the first command after a (re)open is swallowed -- no confirmation, no effect
+    // (measured on hardware with test_clock_change.cpp; a delay after open does not help).
+    // Device::applyConfig() therefore sends a disposable Read Version first, so the ADC clock
+    // is never the command that gets lost. Without it, a stop/start in one process kept the
+    // previous clock while core -- and so the Recorder's file header -- was told the new one:
+    // scheduled back-to-back recordings at different clocks were stamped with the right rate
+    // and sampled at the first one. The first start per process is unaffected, which is why it
+    // hid; everything below is about the *second* attach.
+    printf("\nUSB: the first command after an open is disposable\n");
+    {
+        // A fresh USB attach: Read Version leads, exactly once, and the clock still goes out
+        // after it rather than being displaced.
+        FakeTransport t;
+        t._kind = Transport::KIND_USB;
+        Device d;
+        d.setTransport(&t);
+        Config c;
+        check(d.applyConfig(c, 0), "the first configuration over USB succeeds");
+        const std::vector<uint8_t> ins = t.instructions();
+        check(!ins.empty() && ins.front() == instr::READ_VERSION,
+              "Read Version is the very first command sent");
+        check(t.countOf(instr::READ_VERSION) == 1, "and it is sent exactly once");
+        check(t.countOf(instr::SET_ADC_CLOCK) == 1 && t.indexOf(instr::SET_ADC_CLOCK) > 0,
+              "the ADC clock is still sent, but never first");
+
+        // The extra command takes part in numbering like any other: never zero (the radio
+        // treats it specially), strictly ascending.
+        bool anyZero = false, ascending = true;
+        for (const auto& cmd : t.sent) { if (readU32(cmd.data()) == 0) { anyZero = true; } }
+        for (size_t i = 1; i < t.sent.size(); i++) {
+            if (readU32(t.sent[i].data()) <= readU32(t.sent[i - 1].data())) { ascending = false; }
+        }
+        check(!anyZero && ascending, "command numbers stay non-zero and ascending across it");
+
+        // Same attach, later reconfiguration (a clock change while the radio stays open):
+        // the endpoint is already live, so nothing is swallowed and no decoy is needed.
+        t.sent.clear();
+        c.adcClockHz = 98.4e6;
+        d.applyConfig(c, 1000);
+        check(t.countOf(instr::READ_VERSION) == 0, "no Read Version on a reconfigure of an open attach");
+        check(t.countOf(instr::SET_ADC_CLOCK) == 1, "the changed ADC clock is sent");
+
+        // The real bug scenario: stop closes the endpoint (transport detached), the next Start
+        // attaches again and reconfigures from scratch to a different clock. That is a fresh
+        // open, so the decoy must lead again.
+        d.setTransport(nullptr);
+        FakeTransport t2;
+        t2._kind = Transport::KIND_USB;
+        d.setTransport(&t2);
+        c.adcClockHz = 104.9e6;
+        check(d.applyConfig(c, 2000), "reconfiguring after a reopen succeeds");
+        const std::vector<uint8_t> ins2 = t2.instructions();
+        check(!ins2.empty() && ins2.front() == instr::READ_VERSION,
+              "after a reopen Read Version leads again");
+        check(t2.countOf(instr::READ_VERSION) == 1, "exactly once on the reopen too");
+        check(t2.countOf(instr::SET_ADC_CLOCK) == 1 && t2.indexOf(instr::SET_ADC_CLOCK) > 0,
+              "the new clock goes out after the decoy, not as the swallowed first command");
+    }
+
+    // LAN has no such loss and its Read Version reply is handled separately (Transport::
+    // readPacket), so it must not be sent here: it would only add a command with no purpose.
+    printf("\nLAN: no decoy command\n");
+    for (Transport::Kind kind : { Transport::KIND_LAN_TCP, Transport::KIND_LAN_UDP }) {
+        FakeTransport t;
+        t._kind = kind;
+        Device d;
+        d.setTransport(&t);
+        Config c;
+        d.applyConfig(c, 0);
+        check(t.countOf(instr::READ_VERSION) == 0,
+              kind == Transport::KIND_LAN_TCP ? "TCP: Read Version is not sent by applyConfig"
+                                              : "UDP: Read Version is not sent by applyConfig");
+        check(!t.sent.empty() && t.instructions().front() != instr::READ_VERSION,
+              "and the first command is a real configuration command");
+    }
+
     printf("\n%s (%d failure%s)\n\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

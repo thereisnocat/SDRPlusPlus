@@ -73,7 +73,12 @@ public:
         // isn't active right now), so implementations must not assume they can safely touch
         // anything beyond their own live fields and config file -- e.g. not call
         // core::setInputSampleRate() unless first confirming they're actually the selected
-        // source.
+        // source, *and* not currently running: a setting the module only programs into the
+        // hardware in its own start() (sample rate / ADC clock / decimation) is not changed by
+        // an apply to a running source, so telling core the new rate then desyncs it from the
+        // real stream (mis-stamped recordings). A caller that needs such a setting to take
+        // effect must stop the source before applying and start it after -- the recording
+        // scheduler's fireEntry() does exactly that.
         nlohmann::json (*captureConfigHandler)(void* ctx) = nullptr;
         void (*applyConfigHandler)(const nlohmann::json& cfg, void* ctx) = nullptr;
 
