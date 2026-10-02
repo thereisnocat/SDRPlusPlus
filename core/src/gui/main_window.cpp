@@ -645,6 +645,20 @@ void MainWindow::draw() {
             ImGui::Text("Framerate: %.1f FPS", ImGui::GetIO().Framerate);
             ImGui::Text("Center Frequency: %.0f Hz", gui::waterfall.getCenterFrequency());
             ImGui::Text("Source name: %s", sourceName.c_str());
+            {
+                // The spectrum feed's health -- see IQFrontEnd::FFTFeedStats. "Late" is the
+                // share of frames that arrived while the display thread was a whole frame
+                // behind; the old single-slot hand-off lost every one of those, now they
+                // are buffered. "Lost" can only be non-zero if the display stalled for
+                // longer than the ring holds.
+                const auto fs = sigpath::iqFrontEnd.getFFTFeedStats();
+                ImGui::Text("Spectrum feed: %llu frames, %llu late (%.2f%%), %llu lost",
+                            (unsigned long long)fs.blocks, (unsigned long long)fs.behind,
+                            fs.blocks ? (100.0 * (double)fs.behind / (double)fs.blocks) : 0.0,
+                            (unsigned long long)fs.dropped);
+                ImGui::Text("Spectrum feed: worst lag %.2f ms", fs.maxBacklogMs);
+                if (ImGui::Button("Reset spectrum feed stats")) { sigpath::iqFrontEnd.resetFFTFeedStats(); }
+            }
             ImGui::Checkbox("Show demo window", &demoWindow);
             ImGui::Text("ImGui version: %s", ImGui::GetVersion());
 

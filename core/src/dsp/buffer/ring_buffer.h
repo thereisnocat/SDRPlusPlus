@@ -159,6 +159,33 @@ namespace dsp::buffer {
             return len;
         }
 
+        // Non-blocking, all-or-nothing write: stores all of `data` and returns true, or --
+        // if there isn't room for the whole thing under the current maxLatency -- stores
+        // nothing and returns false. For a producer that must never wait (see
+        // Reshaper::tryFeed). Single producer only: the room check and the write aren't
+        // atomic together, which is safe because a concurrent reader can only add room.
+        bool tryWrite(T* data, int len) {
+            assert(_init);
+            if (_stopWriter) { return false; }
+            if (getWritable() < len) { return false; }
+            return write(data, len) == len;
+        }
+
+        // Forget everything buffered. Only while neither a reader nor a writer is active.
+        void clear() {
+            assert(_init);
+            _readable_mtx.lock();
+            readable = 0;
+            _readable_mtx.unlock();
+            _writable_mtx.lock();
+            writable = size;
+            _writable_mtx.unlock();
+            readc = 0;
+            writec = 0;
+        }
+
+        int capacity() const { return size; }
+
         int waitUntilwritable() {
             assert(_init);
             if (_stopWriter) { return -1; }

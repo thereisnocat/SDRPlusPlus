@@ -1,6 +1,8 @@
 #pragma once
 #include "../block.h"
 #include "ring_buffer.h"
+#include <atomic>
+#include <mutex>
 
 // IMPORTANT: THIS IS TRASH AND MUST BE REWRITTEN IN THE FUTURE
 
@@ -46,8 +48,58 @@ namespace dsp::buffer {
             std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
             base_type::tempStop();
             _keep = keep;
-            ringBuf.setMaxLatency(keep * 2);
+            ringBuf.setMaxLatency(maxLatencyFor(keep));
             base_type::tempStart();
+        }
+
+        // Direct-feed mode: instead of reading `in` on a thread of its own, the ring buffer
+        // is filled by whoever calls tryFeed() -- in practice a Splitter tap running on the
+        // source's own thread. Nothing is ever handed across a thread boundary one block at
+        // a time, so a reader that is late to wake costs latency (buffered in the ring, which
+        // is sized to hold well over a hundred milliseconds) instead of lost samples; and a
+        // producer that must not wait never does. Call before start().
+        void enableDirectFeed() {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            _directFeed = true;
+            ringBuf.setMaxLatency(maxLatencyFor(_keep));
+        }
+
+        // Feed statistics (direct-feed mode), cumulative since the last resetFeedStats().
+        struct FeedStats {
+            uint64_t blocks = 0;     // blocks offered
+            uint64_t behind = 0;     // blocks that arrived with at least a whole block of the
+                                     // previous data still unread -- i.e. the reader was late
+                                     // enough that a single-slot hand-off would have lost one
+            uint64_t dropped = 0;    // blocks refused for lack of room (the reader was stalled
+                                     // for longer than the ring's whole headroom)
+            int maxBacklog = 0;      // most samples ever waiting unread
+        };
+
+        FeedStats getFeedStats() {
+            std::lock_guard<std::mutex> lck(feedMtx);
+            return feedStats;
+        }
+
+        void resetFeedStats() {
+            std::lock_guard<std::mutex> lck(feedMtx);
+            feedStats = FeedStats();
+        }
+
+        // Non-blocking. Returns false (and counts a drop) if there was no room, or if the
+        // reshaper isn't running -- in which case the block is simply not wanted.
+        bool tryFeed(const T* data, int count) {
+            std::lock_guard<std::mutex> lck(feedMtx);
+            if (!feeding) { return false; }
+            feedStats.blocks++;
+            const int backlog = ringBuf.getReadable();
+            if (backlog >= count) { feedStats.behind++; }
+            if (backlog > feedStats.maxBacklog) { feedStats.maxBacklog = backlog; }
+            if (!ringBuf.tryWrite(const_cast<T*>(data), count)) {
+                feedStats.dropped++;
+                return false;
+            }
+            return true;
         }
 
         void setSkip(int skip) {
@@ -70,6 +122,15 @@ namespace dsp::buffer {
 
     private:
         void doStart() override {
+            if (_directFeed) {
+                // Start from an empty ring so a restart (an FFT size or rate change)
+                // never splices old samples to new ones, then open the feed.
+                std::lock_guard<std::mutex> lck(feedMtx);
+                ringBuf.clear();
+                bufferWorkerThread = std::thread(&Reshaper<T>::bufferWorker, this);
+                feeding = true;
+                return;
+            }
             workThread = std::thread(&Reshaper<T>::loop, this);
             bufferWorkerThread = std::thread(&Reshaper<T>::bufferWorker, this);
         }
@@ -80,6 +141,10 @@ namespace dsp::buffer {
         }
 
         void doStop() override {
+            if (_directFeed) {
+                std::lock_guard<std::mutex> lck(feedMtx);
+                feeding = false;
+            }
             _in->stopReader();
             ringBuf.stopReader();
             out.stopWriter();
@@ -127,9 +192,22 @@ namespace dsp::buffer {
             delete[] buf;
         }
 
+        // Ring headroom for a given window size. The classic mode keeps it at two windows;
+        // direct-feed mode wants far more, since it is the only buffering between a
+        // producer that can never wait and a reader that is allowed to be late: about a
+        // quarter second at typical rates, bounded by the ring's own capacity.
+        int maxLatencyFor(int keep) {
+            if (!_directFeed) { return keep * 2; }
+            return std::min<int>(std::max<int>(keep * 4, 262144), ringBuf.capacity() - 4096);
+        }
+
         stream<T>* _in;
         int _outBlockSize;
         RingBuffer<T> ringBuf;
+        bool _directFeed = false;
+        std::mutex feedMtx;
+        bool feeding = false;
+        FeedStats feedStats;
         std::thread bufferWorkerThread;
         std::thread workThread;
         int _keep, _skip;
