@@ -68,10 +68,16 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     // Clear the rest of the FFT input buffer
     dsp::buffer::clear(fftInBuf, _fftSize - _nzFFTSize, _nzFFTSize);
 
-    // Low-priority: a slow spectrum/waterfall FFT must never make VFOs or the recorder
-    // wait behind it for their own copy of a frame -- see splitter.h's bindStream() doc
-    // and RECORDING_PERFORMANCE_PLAN.md section 2.1.
-    split.bindStream(&fftIn, true);
+    // The spectrum/waterfall feed is a tap on split, not a bound stream. A slow FFT must
+    // never make VFOs or the recorder wait (the reason this used to be a low-priority
+    // stream -- see RECORDING_PERFORMANCE_PLAN.md section 2.1), but a skipped frame is
+    // also a hole in the sample sequence, and an FFT window stitched across holes
+    // splatters every strong carrier into a skirt tens of kHz wide that is not in the
+    // signal. The tap copies each frame straight into the reshaper's ring buffer on
+    // split's own thread (see Splitter::bindTap and Reshaper::tryFeed): nobody waits,
+    // and no sample is lost unless the display stalls for longer than the ring holds.
+    reshape.enableDirectFeed();
+    split.bindTap(fftTap, this);
 
     _init = true;
 }
@@ -309,6 +315,24 @@ void IQFrontEnd::stop() {
 
 double IQFrontEnd::getEffectiveSamplerate() {
     return effectiveSr;
+}
+
+void IQFrontEnd::fftTap(const dsp::complex_t* data, int count, void* ctx) {
+    ((IQFrontEnd*)ctx)->reshape.tryFeed(data, count);
+}
+
+IQFrontEnd::FFTFeedStats IQFrontEnd::getFFTFeedStats() {
+    const auto s = reshape.getFeedStats();
+    FFTFeedStats out;
+    out.blocks = s.blocks;
+    out.behind = s.behind;
+    out.dropped = s.dropped;
+    out.maxBacklogMs = (effectiveSr > 0.0) ? (1000.0 * s.maxBacklog / effectiveSr) : 0.0;
+    return out;
+}
+
+void IQFrontEnd::resetFFTFeedStats() {
+    reshape.resetFeedStats();
 }
 
 void IQFrontEnd::handler(dsp::complex_t* data, int count, void* ctx) {

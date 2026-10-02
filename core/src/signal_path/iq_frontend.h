@@ -78,6 +78,22 @@ public:
 
     void flushInputBuffer();
 
+    // How the spectrum feed is keeping up, for the Debug panel. `blocks` is how many
+    // frames the feed was offered; `behind` how many arrived while the display thread
+    // still hadn't read a whole frame's worth of the one before (what would have been a
+    // lost frame under the old single-slot hand-off); `dropped` how many were refused
+    // outright because the display stalled past the ring's headroom -- the only case in
+    // which a spectrum window can still contain a hole; `maxBacklogMs` the longest the
+    // display thread has ever lagged.
+    struct FFTFeedStats {
+        uint64_t blocks = 0;
+        uint64_t behind = 0;
+        uint64_t dropped = 0;
+        double maxBacklogMs = 0.0;
+    };
+    FFTFeedStats getFFTFeedStats();
+    void resetFFTFeedStats();
+
     void start();
     void stop();
 
@@ -85,6 +101,7 @@ public:
 
 protected:
     static void handler(dsp::complex_t* data, int count, void* ctx);
+    static void fftTap(const dsp::complex_t* data, int count, void* ctx);
     void updateFFTPath(bool updateWaterfall = false);
 
     static inline double genDCBlockRate(double sampleRate) {
@@ -118,7 +135,8 @@ protected:
     // Sink<T>/block for a protected member (_in) that nothing else needs exposed.
     dsp::stream<dsp::complex_t>* currentPreprocOut = NULL;
 
-    // FFT
+    // FFT. fftIn is only the reshaper's (unused) input placeholder -- the reshaper is in
+    // direct-feed mode and is filled by fftTap() on split's thread; see init().
     dsp::stream<dsp::complex_t> fftIn;
     dsp::buffer::Reshaper<dsp::complex_t> reshape;
     dsp::sink::Handler<dsp::complex_t> fftSink;
