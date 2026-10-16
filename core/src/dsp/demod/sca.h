@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 #include <fftw3.h>
@@ -164,9 +166,9 @@ namespace dsp::demod {
             }
             std::vector<float> out(POINTS);
             for (int k = 0; k < POINTS; k++) {
-                const int lo = k * top / POINTS, hi = std::max(lo + 1, (k + 1) * top / POINTS);
+                const int lo = k * top / POINTS, hi = (std::max)(lo + 1, (k + 1) * top / POINTS);
                 float m = 0.0f;
-                for (int i = lo; i < hi; i++) { m = std::max(m, power[i]); }
+                for (int i = lo; i < hi; i++) { m = (std::max)(m, power[i]); }
                 out[k] = 10.0f * log10f(m + 1e-20f);
             }
             std::lock_guard<std::mutex> lck(mtx);

@@ -388,7 +388,7 @@ namespace demod {
             std::vector<float> sorted(db.begin() + db.size() / 4, db.end());
             std::sort(sorted.begin(), sorted.end());
             const float lo = sorted[sorted.size() / 10] - 6.0f;
-            const float hi = std::max(*std::max_element(db.begin() + 3, db.end()) + 2.0f, lo + 30.0f);
+            const float hi = (std::max)(*std::max_element(db.begin() + 3, db.end()) + 2.0f, lo + 30.0f);
             struct Mark { float khz; const char* text; ImU32 col; };
             const Mark marks[] = { {19.0f, "19", IM_COL32(120, 200, 120, 255)}, {38.0f, "L-R", IM_COL32(120, 160, 220, 255)}, {57.0f, "RDS", IM_COL32(230, 180, 90, 255)},
                                    {67.0f, "67", IM_COL32(230, 110, 110, 255)}, {92.0f, "92", IM_COL32(230, 110, 110, 255)} };
