@@ -59,6 +59,18 @@ namespace demod {
             if (config->conf[name][getName()].contains("rdsInfo")) {
                 _rdsInfo = config->conf[name][getName()]["rdsInfo"];
             }
+            if (config->conf[name][getName()].contains("sca")) {
+                _sca = config->conf[name][getName()]["sca"];
+            }
+            if (config->conf[name][getName()].contains("scaKHz")) {
+                _scaKHz = config->conf[name][getName()]["scaKHz"];
+            }
+            if (config->conf[name][getName()].contains("scaGainDb")) {
+                _scaGainDb = config->conf[name][getName()]["scaGainDb"];
+            }
+            if (config->conf[name][getName()].contains("showMultiplex")) {
+                _showMux = config->conf[name][getName()]["showMultiplex"];
+            }
             if (config->conf[name][getName()].contains("rdsRegion")) {
                 rdsRegionStr = config->conf[name][getName()]["rdsRegion"];
             }
@@ -76,6 +88,9 @@ namespace demod {
 
             // Init DSP
             demod.init(input, bandwidth / 2.0f, getIFSampleRate(), _stereo, _lowPass, _rds);
+            _bandwidth = bandwidth;
+            applySca();
+            demod.setMultiplexEnabled(_showMux);
             rdsDemod.init(&demod.rdsOut, _rdsInfo);
             hs.init(&rdsDemod.out, rdsHandler, this);
             reshape.init(&rdsDemod.soft, 4096, (1187 / 30) - 4096);
@@ -121,6 +136,61 @@ namespace demod {
                 _config->conf[name][getName()]["rds"] = _rds;
                 _config->release(true);
             }
+
+            // SCA: subsidiary audio services on subcarriers above the RDS (67 kHz and 92 kHz are the usual ones)
+            if (ImGui::Checkbox(("SCA subcarrier##_radio_wfm_sca_" + name).c_str(), &_sca)) {
+                applySca();
+                _config->acquire();
+                _config->conf[name][getName()]["sca"] = _sca;
+                _config->release(true);
+            }
+            if (_sca) {
+                bool changed = false;
+                const float presets[] = { 67.0f, 92.0f, 41.0f, 76.0f };
+                for (int i = 0; i < 4; i++) {
+                    if (i) { ImGui::SameLine(); }
+                    char label[32];
+                    snprintf(label, sizeof(label), "%.0f##_radio_wfm_sca_p%d_%s", presets[i], i, name.c_str());
+                    const bool on = fabsf(_scaKHz - presets[i]) < 0.05f;
+                    if (on) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)); }
+                    if (ImGui::Button(label, ImVec2(ImGui::GetFrameHeight() * 1.6f, 0))) { _scaKHz = presets[i]; changed = true; }
+                    if (on) { ImGui::PopStyleColor(); }
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted("kHz");
+                ImGui::LeftLabel("Frequency");
+                ImGui::FillWidth();
+                if (ImGui::InputFloat(("##_radio_wfm_sca_khz_" + name).c_str(), &_scaKHz, 0.1f, 1.0f, "%.1f kHz")) {
+                    _scaKHz = std::clamp(_scaKHz, 20.0f, 100.0f);
+                    changed = true;
+                }
+                ImGui::LeftLabel("Gain");
+                ImGui::FillWidth();
+                if (ImGui::SliderFloat(("##_radio_wfm_sca_gain_" + name).c_str(), &_scaGainDb, -20.0f, 30.0f, "%.0f dB")) {
+                    demod.setSCAGain(0.5f * powf(10.0f, _scaGainDb / 20.0f));
+                    _config->acquire();
+                    _config->conf[name][getName()]["scaGainDb"] = _scaGainDb;
+                    _config->release(true);
+                }
+                // The subcarrier and its sidebands have to fit inside the channel (the bandwidth), or there is nothing to hear
+                const double need = 2.0 * (_scaKHz * 1000.0 + 13000.0);
+                if (_bandwidth < need) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Widen the bandwidth to at least %.0f kHz to hear %.0f kHz.", need / 1000.0, _scaKHz);
+                }
+                if (changed) {
+                    applySca();
+                    _config->acquire();
+                    _config->conf[name][getName()]["scaKHz"] = _scaKHz;
+                    _config->release(true);
+                }
+            }
+            if (ImGui::Checkbox(("Show multiplex##_radio_wfm_mux_" + name).c_str(), &_showMux)) {
+                demod.setMultiplexEnabled(_showMux);
+                _config->acquire();
+                _config->conf[name][getName()]["showMultiplex"] = _showMux;
+                _config->release(true);
+            }
+            if (_showMux) { drawMultiplex(); }
 
             // TODO: This might break when the entire radio module is disabled
             if (_rds) {
@@ -253,6 +323,7 @@ namespace demod {
         }
 
         void setBandwidth(double bandwidth) {
+            _bandwidth = bandwidth;
             demod.setDeviation(bandwidth / 2.0f);
         }
 
@@ -295,6 +366,66 @@ namespace demod {
         }
 
     private:
+        void applySca() {
+            demod.setSCAGain(0.5f * powf(10.0f, _scaGainDb / 20.0f));
+            demod.setSCA(_sca ? (double)_scaKHz * 1000.0 : 0.0);
+        }
+
+        // The composite from 0 to 100 kHz: the pilot, the stereo difference, RDS and any subcarriers show as humps. Click one to listen to it.
+        void drawMultiplex() {
+            std::vector<float> db;
+            const float w = ImGui::GetContentRegionAvail().x;
+            const float h = 90.0f * style::uiScale;
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton(("##_radio_wfm_mux_plot_" + name).c_str(), ImVec2(w, h));
+            const bool hovered = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(14, 16, 22, 255));
+            if (!demod.getMultiplex(db) || db.size() < 8) {
+                dl->AddText(ImVec2(p0.x + 6, p0.y + 6), IM_COL32(180, 180, 180, 255), "Waiting for a signal...");
+                return;
+            }
+            std::vector<float> sorted(db.begin() + db.size() / 4, db.end());
+            std::sort(sorted.begin(), sorted.end());
+            const float lo = sorted[sorted.size() / 10] - 6.0f;
+            const float hi = std::max(*std::max_element(db.begin() + 3, db.end()) + 2.0f, lo + 30.0f);
+            struct Mark { float khz; const char* text; ImU32 col; };
+            const Mark marks[] = { {19.0f, "19", IM_COL32(120, 200, 120, 255)}, {38.0f, "L-R", IM_COL32(120, 160, 220, 255)}, {57.0f, "RDS", IM_COL32(230, 180, 90, 255)},
+                                   {67.0f, "67", IM_COL32(230, 110, 110, 255)}, {92.0f, "92", IM_COL32(230, 110, 110, 255)} };
+            for (const Mark& m : marks) {
+                const float x = p0.x + w * m.khz / 100.0f;
+                dl->AddLine(ImVec2(x, p0.y + 12), ImVec2(x, p0.y + h), (m.col & 0x00FFFFFF) | 0x60000000);
+                dl->AddText(ImVec2(x - 6, p0.y + 1), m.col, m.text);
+            }
+            if (_sca) {
+                const float x = p0.x + w * _scaKHz / 100.0f;
+                dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p0.y + h), IM_COL32(255, 255, 255, 255), 2.0f);
+            }
+            ImVec2 prev;
+            for (size_t k = 0; k < db.size(); k++) {
+                const float x = p0.x + w * (float)k / (float)(db.size() - 1);
+                const float y = p0.y + h - std::clamp((db[k] - lo) / (hi - lo), 0.0f, 1.0f) * (h - 2.0f) - 1.0f;
+                if (k) { dl->AddLine(prev, ImVec2(x, y), IM_COL32(110, 210, 255, 255)); }
+                prev = ImVec2(x, y);
+            }
+            if (hovered) {
+                const float khz = (ImGui::GetIO().MousePos.x - p0.x) / w * 100.0f;
+                char t[32];
+                snprintf(t, sizeof(t), "%.1f kHz", khz);
+                dl->AddText(ImVec2(p0.x + w - 70.0f * style::uiScale, p0.y + 12), IM_COL32(220, 220, 220, 255), t);
+                if (ImGui::IsItemClicked() && khz > 30.0f) {
+                    for (float c : { 41.0f, 67.0f, 76.0f, 92.0f }) { if (fabsf(khz - c) < 3.5f) { _scaKHz = c; } }
+                    if (fabsf(_scaKHz - khz) > 3.5f && !(fabsf(khz - 41.0f) < 3.5f || fabsf(khz - 67.0f) < 3.5f || fabsf(khz - 76.0f) < 3.5f || fabsf(khz - 92.0f) < 3.5f)) { _scaKHz = roundf(khz * 10.0f) / 10.0f; }
+                    _sca = true;
+                    applySca();
+                    _config->acquire();
+                    _config->conf[name][getName()]["sca"] = _sca;
+                    _config->conf[name][getName()]["scaKHz"] = _scaKHz;
+                    _config->release(true);
+                }
+            }
+        }
+
         static void rdsHandler(uint8_t* data, int count, void* ctx) {
             WFM* _this = (WFM*)ctx;
             _this->rdsDecode.process(data, count);
@@ -365,6 +496,11 @@ namespace demod {
         bool _rds = false;
         bool _rdsInfo = false;
         bool _rdsIncremental = true;
+        bool _sca = false;
+        bool _showMux = false;
+        float _scaKHz = 67.0f;
+        float _scaGainDb = 0.0f;
+        double _bandwidth = 150000.0;
         float muGain = 0.01;
         float omegaGain = (0.01*0.01)/4.0;
 

@@ -37,6 +37,7 @@ $REPO/core/test/test_parametric_eq.cpp
 $REPO/core/test/test_wav_meta.cpp
 $REPO/core/test/test_wav_roundtrip.cpp
 $REPO/core/test/test_decorrelation.cpp
+$REPO/core/test/test_sca.cpp
 $REPO/core/test/test_wideband_decorrelation.cpp
 $REPO/source_modules/phasing_test_source/test/test_worker.cpp"
 
@@ -86,7 +87,7 @@ done
 for src in $LINKED; do
     name=$(basename "$src" .cpp)
     c++ -std=c++17 -O2 -I"$REPO/core/src" -I"$BREW/include" -o "$OUT/$name" "$src" \
-        -L"$CORE_LIB" -lsdrpp_core -L"$BREW/lib" -lvolk -Wl,-rpath,"$CORE_LIB" \
+        -L"$CORE_LIB" -lsdrpp_core -L"$BREW/lib" -lvolk -lfftw3f -Wl,-rpath,"$CORE_LIB" \
         || { echo "  $name: COMPILE FAILED"; fail=1; continue; }
     run_one "$src"
 done
