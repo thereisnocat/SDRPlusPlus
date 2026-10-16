@@ -1,5 +1,6 @@
 #pragma once
 #include "quadrature.h"
+#include "sca.h"
 #include "../taps/low_pass.h"
 #include "../taps/band_pass.h"
 #include "../filter/fir.h"
@@ -51,6 +52,8 @@ namespace dsp::demod {
             arFir.init(NULL, audioFirTaps);
             xlator.init(NULL, -57000.0, samplerate);
             rdsResamp.init(NULL, samplerate, 5000.0);
+            sca.init(samplerate);
+            mux.init(samplerate);
 
             lmr = buffer::alloc<float>(STREAM_BUFFER_SIZE);
             l = buffer::alloc<float>(STREAM_BUFFER_SIZE);
@@ -95,6 +98,8 @@ namespace dsp::demod {
 
             xlator.setOffset(-57000.0, samplerate);
             rdsResamp.setInSamplerate(samplerate);
+            sca.init(samplerate, _scaCarrier > 0.0 ? _scaCarrier : 67000.0);
+            mux.init(samplerate);
 
             reset();
             base_type::tempStart();
@@ -144,6 +149,18 @@ namespace dsp::demod {
         inline int process(int count, complex_t* in, stereo_t* out, int& rdsOutCount, complex_t* rdsout = NULL) {
             // Demodulate
             demod.process(count, in, demod.out.writeBuf);
+            mux.feed(count, demod.out.writeBuf);
+            if (_scaCarrier > 0.0) {
+                // A subcarrier instead of the programme. RDS keeps running from the same composite.
+                if (_rdsOut) {
+                    rtoc.process(count, demod.out.writeBuf, rtoc.out.writeBuf);
+                    xlator.process(count, rtoc.out.writeBuf, rtoc.out.writeBuf);
+                    rdsOutCount = rdsResamp.process(count, rtoc.out.writeBuf, rdsout);
+                }
+                sca.process(count, demod.out.writeBuf, l);
+                convert::LRToStereo::process(count, l, l, out);
+                return count;
+            }
             if (_stereo) {
                 // Convert to complex
                 rtoc.process(count, demod.out.writeBuf, rtoc.out.writeBuf);
@@ -229,11 +246,27 @@ namespace dsp::demod {
             return count;
         }
 
+        // SCA: listen to a subcarrier (Hz; 0 = the programme). The output is that subcarrier's audio on both channels.
+        void setSCA(double carrier) {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            _scaCarrier = carrier;
+            if (carrier > 0.0) { sca.setCarrier(carrier); sca.reset(); }
+        }
+        double getSCA() const { return _scaCarrier; }
+        void setSCAGain(float gain) { sca.setGain(gain); }
+        // The composite's spectrum from 0 to 100 kHz, for finding subcarriers (only computed while enabled)
+        void setMultiplexEnabled(bool enabled) { mux.setEnabled(enabled); }
+        bool getMultiplex(std::vector<float>& db) { return mux.get(db); }
+
         stream<complex_t> rdsOut;
 
     protected:
         double _deviation;
         double _samplerate;
+        double _scaCarrier = 0.0;
+        SCADemod sca;
+        MultiplexSpectrum mux;
         bool _stereo;
         bool _lowPass;
         bool _rdsOut;
