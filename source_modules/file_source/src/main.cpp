@@ -388,6 +388,19 @@ private:
             volk_32i_s32f_convert_32f(out, (const int32_t*)rawBuf.data(), 2147483647.0f, count);
             break;
         }
+        case 24: {
+            // Packed 24-bit little-endian PCM (3 bytes a value): what FDM-SW2 and Cheetah record. Reading it as 16-bit pulled only 2 of every 3 bytes, so the
+            // file played back slower than real time -- and as noise. Volk has no 24-bit kernel; place the value in the top three bytes of an int32
+            // and let the arithmetic shift sign-extend it.
+            rawBuf.resize((size_t)count * 3);
+            _this->reader->readSamples(rawBuf.data(), rawBuf.size());
+            const uint8_t* p = rawBuf.data();
+            for (int i = 0; i < count; i++, p += 3) {
+                const int32_t v = (int32_t)(((uint32_t)p[0] << 8) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 24)) >> 8;
+                out[i] = (float)v * (1.0f / 8388608.0f);
+            }
+            break;
+        }
         case 8: {
             rawBuf.resize((size_t)count * sizeof(uint8_t));
             _this->reader->readSamples(rawBuf.data(), rawBuf.size());
@@ -679,7 +692,7 @@ private:
     double centerFreq = 100000000;
 
     bool float32Mode = false;
-    int pcmBits = 16;   // 8, 16, or 32 -- which raw PCM width worker()/dualWorker() read
+    int pcmBits = 16;   // 8, 16, 24 or 32 -- which raw PCM width worker()/dualWorker() read
                         // when float32Mode is false. Auto-detected from the file's own
                         // bitDepth field on load; see menuHandler().
 };
